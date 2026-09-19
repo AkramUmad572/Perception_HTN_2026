@@ -79,6 +79,17 @@ else
     TOTAL_FAIL=$((TOTAL_FAIL + 1))
 fi
 
+# Test 6: Interaction math (two-hand, measurement, tape measure)
+echo ""
+echo ">>> Running Interaction Tests..."
+echo ""
+if node web-client/src/interaction/test_interaction.js; then
+    echo "Interaction tests: PASSED"
+else
+    echo "Interaction tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+
 # Final summary
 echo ""
 echo "========================================"
