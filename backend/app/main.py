@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -78,19 +78,23 @@ async def _cleanup_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    """
+    Startup/shutdown for the whole app. Everything that used to hang off
+    @app.on_event lives here: passing `lifespan` to FastAPI makes Starlette
+    ignore on_event handlers entirely, so the shared httpx client has to be
+    closed from this finally block or it never gets closed at all.
+    """
     task = asyncio.create_task(_cleanup_loop())
     try:
         yield
     finally:
         task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        await aclose_http_client()
 
 
 app = FastAPI(title="Perception CAD", version="0.2.0", lifespan=lifespan)
-
-
-@app.on_event("shutdown")
-async def _close_http_client():
-    await aclose_http_client()
 
 app.add_middleware(
     CORSMiddleware,
