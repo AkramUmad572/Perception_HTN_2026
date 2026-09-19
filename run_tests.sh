@@ -57,6 +57,19 @@ else
 fi
 cd ..
 
+# Test 3b: Mesh boolean tests (hole / loop / flat base on sculpts)
+echo ""
+echo ">>> Running Mesh Boolean Tests..."
+echo ""
+cd backend
+if python3 -m mesh.test_boolean; then
+    echo "Mesh boolean tests: PASSED"
+else
+    echo "Mesh boolean tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+cd ..
+
 # Test 4: Client model update tests
 echo ""
 echo ">>> Running Client Model Update Tests..."
