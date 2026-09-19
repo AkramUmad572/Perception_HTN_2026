@@ -23,6 +23,7 @@ from app.models import (
     HistoryRequest,
     PhotoChooseRequest,
     ScriptRequest,
+    Selection,
 )
 from app.pipeline import (
     apply_intent,
@@ -45,6 +46,17 @@ settings = get_settings()
 # Old audio replies, staged photos and abandoned projects are swept on startup
 # and then hourly (app/projects.py:cleanup has the TTLs).
 CLEANUP_INTERVAL_S = 3600
+
+
+def _parse_selection(raw: str | None) -> Selection | None:
+    """A client-sent `selection` field, or None if absent/unparseable. Never raises."""
+    if not raw:
+        return None
+    try:
+        return Selection.model_validate_json(raw)
+    except Exception as exc:
+        logger.info("Ignoring unparseable selection: %s", exc)
+        return None
 
 
 async def _cleanup_loop() -> None:
@@ -222,6 +234,7 @@ async def command(body: CommandRequest):
         current_color=session.color,
         last_backend=session.last_backend,
         last_mesh_prompt=session.last_mesh_prompt,
+        selection=body.selection,
     )
     result = await apply_intent(
         intent,
@@ -408,6 +421,7 @@ async def job_status(job_id: str, session_id: str = "default"):
 async def voice(
     audio: UploadFile = File(...),
     session_id: str = Form("default"),
+    selection: str | None = Form(None),
 ):
     t_all = time.perf_counter()
     session = get_session(session_id)
@@ -446,6 +460,7 @@ async def voice(
             current_color=session.color,
             last_backend=session.last_backend,
             last_mesh_prompt=session.last_mesh_prompt,
+            selection=_parse_selection(selection),
         )
         result = await apply_intent(
             intent,

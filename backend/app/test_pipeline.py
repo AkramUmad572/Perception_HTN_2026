@@ -1470,6 +1470,13 @@ def run_all_tests():
             total_pass += p
             total_fail += f
 
+        # === WS-FG: mesh boolean wiring ===
+        print("\n--- Mesh Boolean Wiring Tests ---")
+        for test in WS_FG_TESTS:
+            p, f = loop.run_until_complete(test())
+            total_pass += p
+            total_fail += f
+
         p, f = loop.run_until_complete(test_absolute_size_sets_longest_edge())
         total_pass += p
         total_fail += f
@@ -1597,6 +1604,186 @@ WS_A_TESTS = [
     test_photo_build_records_project,
     test_undo_redo_restores_session,
     test_save_client_version,
+]
+
+
+# ============================================================================
+# WS-FG: mesh_boolean wiring (hole / loop / flat base)
+# ============================================================================
+
+
+def _boolean_mesh_session(settings, **kw):
+    """A mesh session pointing at a real box GLB in settings.glb_dir/m1.glb."""
+    import trimesh
+
+    trimesh.creation.box(extents=(1.0, 1.0, 1.0)).export(str(Path(settings.glb_dir) / "m1.glb"))
+    base = dict(
+        session_id="ws_fg", last_backend="mesh", model_id="m1",
+        glb_url="/media/glb/m1.glb", base_size_m=0.2, scale=1.0,
+    )
+    base.update(kw)
+    return SessionState(**base)
+
+
+async def _run_boolean(intent, session, settings):
+    with patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+         patch("app.pipeline.save_session"):
+        return await apply_intent(intent, session, settings, transcript="mesh boolean")
+
+
+async def test_mesh_boolean_hole_drills_through():
+    print("\n=== Test: mesh_boolean drills a hole ===")
+    import shutil
+
+    settings, root = _version_settings()
+    try:
+        session = _boolean_mesh_session(settings)
+        intent = Intent(
+            action="mesh_boolean", backend="mesh",
+            params={"op": "hole", "center": [0.5, 0.0, 0.0], "normal": [1.0, 0.0, 0.0]},
+            reply="Drilling that hole.",
+        )
+        result = await _run_boolean(intent, session, settings)
+        errors = []
+        if not result.rebuilt or not result.ok:
+            errors.append(f"rebuilt={result.rebuilt} ok={result.ok} error={result.error}")
+        if result.backend != "mesh":
+            errors.append(f"backend {result.backend}")
+        if result.model_id is None or result.model_id == "m1":
+            errors.append(f"model_id did not change: {result.model_id}")
+        if result.reply != "Drilled it.":
+            errors.append(f"reply {result.reply!r}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("mesh_boolean drills a hole", errors)
+
+
+async def test_mesh_boolean_flat_base_needs_no_selection():
+    print("\n=== Test: mesh_boolean flattens the base with no selection ===")
+    import shutil
+
+    settings, root = _version_settings()
+    try:
+        session = _boolean_mesh_session(settings)
+        intent = Intent(action="mesh_boolean", backend="mesh", params={"op": "flat_base"}, reply="Flattening the base.")
+        result = await _run_boolean(intent, session, settings)
+        errors = []
+        if not result.rebuilt or not result.ok:
+            errors.append(f"rebuilt={result.rebuilt} ok={result.ok} error={result.error}")
+        if result.reply != "Flattened the base.":
+            errors.append(f"reply {result.reply!r}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("mesh_boolean flattens the base", errors)
+
+
+async def test_mesh_boolean_error_leaves_model_unchanged():
+    print("\n=== Test: a BooleanError leaves the model unchanged ===")
+    import shutil
+
+    settings, root = _version_settings()
+    try:
+        session = _boolean_mesh_session(settings)
+        # diameter_mm=0 is invalid (mesh/boolean.py: MSG_HOLE_SIZE) and never reaches manifold.
+        intent = Intent(
+            action="mesh_boolean", backend="mesh",
+            params={"op": "hole", "center": [0.5, 0.0, 0.0], "normal": [1.0, 0.0, 0.0], "diameter_mm": 0},
+            reply="Drilling that hole.",
+        )
+        result = await _run_boolean(intent, session, settings)
+        errors = []
+        if result.rebuilt or result.ok or result.action != "clarify":
+            errors.append(f"rebuilt={result.rebuilt} ok={result.ok} action={result.action}")
+        if "bigger than zero" not in (result.reply or ""):
+            errors.append(f"reply not the boolean error: {result.reply!r}")
+        if session.model_id != "m1" or session.glb_url != "/media/glb/m1.glb":
+            errors.append(f"session moved on failure: {session.model_id} {session.glb_url}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("BooleanError leaves the model unchanged", errors)
+
+
+async def test_mesh_boolean_requires_mesh_session():
+    print("\n=== Test: mesh_boolean refuses a CAD session ===")
+    import shutil
+
+    settings, root = _version_settings()
+    try:
+        session = _boolean_mesh_session(settings, last_backend="cad", last_script="result = 1")
+        intent = Intent(action="mesh_boolean", backend="mesh", params={"op": "flat_base"}, reply="Flattening the base.")
+        result = await _run_boolean(intent, session, settings)
+        errors = []
+        if result.rebuilt or result.action != "clarify" or "no sculpt" not in (result.reply or "").lower():
+            errors.append(f"rebuilt={result.rebuilt} action={result.action} reply={result.reply!r}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("mesh_boolean refuses a CAD session", errors)
+
+
+async def test_mesh_boolean_missing_glb_clarifies():
+    print("\n=== Test: mesh_boolean with no GLB on disk clarifies ===")
+    import shutil
+
+    settings, root = _version_settings()
+    try:
+        session = SessionState(
+            session_id="ws_fg", last_backend="mesh", model_id="ghost",
+            glb_url="/media/glb/ghost.glb", base_size_m=0.2, scale=1.0,
+        )
+        intent = Intent(action="mesh_boolean", backend="mesh", params={"op": "flat_base"}, reply="Flattening the base.")
+        result = await _run_boolean(intent, session, settings)
+        errors = []
+        if result.rebuilt or result.action != "clarify":
+            errors.append(f"rebuilt={result.rebuilt} action={result.action}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("mesh_boolean with missing GLB clarifies", errors)
+
+
+async def test_mesh_boolean_records_project_version():
+    print("\n=== Test: mesh_boolean appends a project version op=boolean ===")
+    import shutil
+    from app import projects
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        import trimesh
+
+        from app.pipeline import restore_version
+
+        v1_src = settings.ref_dir / "seed.glb"
+        trimesh.creation.box(extents=(1.0, 1.0, 1.0)).export(str(v1_src))
+        info = projects.create_project(
+            settings, "mesh", v1_src, op="generate", summary="A sculpt.",
+            mesh_prompt="a cube", color="#FFFFFF", base_size_m=0.2,
+        )
+        session = SessionState(session_id="ws_fg")
+        with patch("app.pipeline.save_session"):
+            restore_version(session, info)
+
+        intent = Intent(action="mesh_boolean", backend="mesh", params={"op": "flat_base"}, reply="Flattening the base.")
+        result = await _run_boolean(intent, session, settings)
+        if not result.rebuilt or not result.ok:
+            errors.append(f"rebuilt={result.rebuilt} ok={result.ok} error={result.error}")
+        pid = session.project_id
+        v2 = projects.get_version(settings, pid, 2) if pid else None
+        if not v2 or v2.op != "boolean":
+            errors.append(f"v2 {v2}")
+        if result.model_id != f"{pid}-v2":
+            errors.append(f"model_id {result.model_id} != {pid}-v2")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("mesh_boolean appends a project version", errors)
+
+
+WS_FG_TESTS = [
+    test_mesh_boolean_hole_drills_through,
+    test_mesh_boolean_flat_base_needs_no_selection,
+    test_mesh_boolean_error_leaves_model_unchanged,
+    test_mesh_boolean_requires_mesh_session,
+    test_mesh_boolean_missing_glb_clarifies,
+    test_mesh_boolean_records_project_version,
 ]
 
 

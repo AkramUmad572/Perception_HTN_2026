@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +87,17 @@ _VERSION_OPS = {
     "execute_script": "script",
     "create": "generate",
     "modify": "generate",
+    "mesh_boolean": "boolean",
+}
+
+# mesh/boolean.py default hole diameter when the utterance names no size.
+DEFAULT_HOLE_DIAMETER_MM = 4.0
+_NO_SCULPT_REPLY = "There's no sculpt to edit yet."
+_BOOLEAN_FAILED_REPLY = "That edit didn't work. The model is unchanged."
+_BOOLEAN_DONE_REPLY = {
+    "hole": "Drilled it.",
+    "loop": "Added the loop.",
+    "flat_base": "Flattened the base.",
 }
 
 
@@ -453,6 +465,72 @@ async def apply_intent(
                 intent.reply = _SIZE_CLAMPED_REPLY
             response_backend = session.last_backend
             save_session(session)
+
+    elif action == "mesh_boolean":
+        # Drill a hole / add a loop / flatten the base on the current sculpt.
+        # ai/intent.py already resolved the selection into params before this
+        # runs; a BooleanError leaves the model untouched.
+        response_backend = "mesh"
+        op = intent.params.get("op")
+        glb_path = _glb_path_from_url(settings, session.glb_url)
+        if session.last_backend != "mesh" or glb_path is None or not glb_path.is_file():
+            error_msg = _NO_SCULPT_REPLY
+            intent.reply = _NO_SCULPT_REPLY
+            action = "clarify"
+        else:
+            from mesh.boolean import (
+                BooleanError,
+                add_loop,
+                drill_hole,
+                export_glb,
+                flatten_base,
+                load_mesh,
+            )
+
+            try:
+                mesh = load_mesh(glb_path)
+                longest_extent = float(max(mesh.extents)) if len(mesh.vertices) else 0.0
+                real_mm = max(session.base_size_m * session.scale * 1000.0, 1e-9)
+                units_per_mm = longest_extent / real_mm
+
+                raw_diameter = intent.params.get("diameter_mm")
+                if op == "hole":
+                    center = intent.params.get("center")
+                    normal = intent.params.get("normal") or []
+                    direction = [-float(v) for v in normal] if normal else None
+                    diameter_mm = (
+                        float(raw_diameter) if raw_diameter is not None else DEFAULT_HOLE_DIAMETER_MM
+                    )
+                    out_mesh = drill_hole(mesh, center, direction, diameter_mm, units_per_mm)
+                elif op == "loop":
+                    center = intent.params.get("center")
+                    normal = intent.params.get("normal")
+                    loop_kwargs: dict[str, float] = {}
+                    if raw_diameter is not None:
+                        loop_kwargs["outer_d_mm"] = float(raw_diameter)
+                    out_mesh = add_loop(mesh, center, normal, units_per_mm, **loop_kwargs)
+                elif op == "flat_base":
+                    out_mesh = flatten_base(mesh)
+                else:
+                    raise BooleanError(_BOOLEAN_FAILED_REPLY)
+
+                new_model_id = uuid.uuid4().hex[:12]
+                export_glb(out_mesh, Path(settings.glb_dir) / f"{new_model_id}.glb")
+                rebuilt = True
+                result_model_id = new_model_id
+                textured = True
+                intent.reply = _BOOLEAN_DONE_REPLY.get(op, intent.reply)
+                session.last_summary = intent.reply
+                save_session(session)
+            except BooleanError as exc:
+                error_msg = str(exc)
+                intent.reply = str(exc)
+                action = "clarify"
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("mesh_boolean failed: %s", exc)
+                error_msg = str(exc)
+                intent.reply = _BOOLEAN_FAILED_REPLY
+                action = "clarify"
 
     elif action in ("undo", "redo"):
         # History steps reload a stored version through the normal swap path.

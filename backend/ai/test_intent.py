@@ -10,6 +10,7 @@ Tests:
 2. Color-only follow-up: Intent set_material with proper params
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -704,6 +705,136 @@ def test_absolute_size():
     return passed, failed
 
 
+def test_mesh_boolean_rung():
+    """Hole / loop / flat base on a sculpt route to mesh_boolean, not clarify_mesh."""
+    print("\n=== Test: mesh boolean rung (hole / loop / flat base) ===")
+    import asyncio
+    from types import SimpleNamespace
+    from app.models import Selection
+
+    passed = failed = 0
+    settings = SimpleNamespace(
+        meshy_api_key="", nvidia_api_key="", three_ws_enabled=True,
+        gemini_api_key="", openai_api_key="",
+    )
+    sel = Selection(parts=[], center=[0.1, 0.2, 0.3], normal=[0.0, 1.0, 0.0])
+
+    async def _run(text, selection=None):
+        return (
+            await intent_mod.parse_intent(
+                text, settings, None, {},
+                last_backend="mesh", last_mesh_prompt="a corgi",
+                selection=selection,
+            )
+        )[0]
+
+    # No selection: hole / loop clarify and point the user at the model.
+    for text in ("drill a hole here", "add a hanging loop"):
+        got = asyncio.run(_run(text))
+        if got.action == "clarify" and got.backend == "mesh" and "Point at" in got.reply:
+            print(f"  [ok] {text!r} without a selection asks to point")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} → {got.action} {got.reply!r}")
+            failed += 1
+
+    # With a selection: hole becomes mesh_boolean, carrying center/normal.
+    got = asyncio.run(_run("drill a hole", selection=sel))
+    if (
+        got.action == "mesh_boolean"
+        and got.params.get("op") == "hole"
+        and got.params.get("center") == [0.1, 0.2, 0.3]
+        and got.params.get("normal") == [0.0, 1.0, 0.0]
+        and "diameter_mm" not in got.params
+    ):
+        print("  [ok] hole with a selection → mesh_boolean")
+        passed += 1
+    else:
+        print(f"  [FAIL] hole with selection → {got.action} {got.params}")
+        failed += 1
+
+    # A size in the utterance carries through as diameter_mm.
+    got = asyncio.run(_run("drill a 5mm hole", selection=sel))
+    if got.action == "mesh_boolean" and abs(got.params.get("diameter_mm", 0) - 5.0) < 1e-6:
+        print("  [ok] '5mm hole' → diameter_mm=5.0")
+        passed += 1
+    else:
+        print(f"  [FAIL] sized hole → {got.action} {got.params}")
+        failed += 1
+
+    # Loop with a selection.
+    got = asyncio.run(_run("add a loop so I can hang it", selection=sel))
+    if got.action == "mesh_boolean" and got.params.get("op") == "loop":
+        print("  [ok] loop with a selection → mesh_boolean")
+        passed += 1
+    else:
+        print(f"  [FAIL] loop with selection → {got.action} {got.params}")
+        failed += 1
+
+    # Flat base needs no selection at all.
+    got = asyncio.run(_run("flatten the base"))
+    if got.action == "mesh_boolean" and got.params.get("op") == "flat_base":
+        print("  [ok] flat base needs no selection")
+        passed += 1
+    else:
+        print(f"  [FAIL] flat base → {got.action} {got.params}")
+        failed += 1
+
+    # Everything else on a mesh session still gets the generic clarify (not
+    # a new-object request, so it doesn't fall through to codegen instead).
+    got = asyncio.run(_run("add a keychain lug", selection=sel))
+    if got.action == "clarify" and got.backend == "mesh" and "Point at" not in got.reply:
+        print("  [ok] non-boolean CAD vocabulary still clarify_mesh")
+        passed += 1
+    else:
+        print(f"  [FAIL] keychain lug on mesh session → {got.action} {got.reply!r}")
+        failed += 1
+
+    return passed, failed
+
+
+def test_selection_in_codegen_payload():
+    """A CAD-session selection rides along in the codegen payload as English."""
+    print("\n=== Test: selection reaches the codegen payload ===")
+    from app.models import Selection
+
+    passed = failed = 0
+    sel = Selection(parts=["ear_l", "ear_r"], center=[0.012, 0.02, -0.004], normal=[0, 1, 0])
+    desc = intent_mod._describe_selection(sel)
+    if desc == "user pointed at ear_l, ear_r near (12.0, 20.0, -4.0) mm":
+        print(f"  [ok] describe_selection → {desc!r}")
+        passed += 1
+    else:
+        print(f"  [FAIL] describe_selection → {desc!r}")
+        failed += 1
+
+    if intent_mod._describe_selection(None) is None:
+        print("  [ok] no selection → no description")
+        passed += 1
+    else:
+        print("  [FAIL] None selection produced a description")
+        failed += 1
+
+    payload = intent_mod._build_user_payload("make the ears bigger", selection_desc=desc)
+    parsed = json.loads(payload)
+    if parsed.get("selection") == desc:
+        print("  [ok] selection lands in the JSON payload")
+        passed += 1
+    else:
+        print(f"  [FAIL] payload selection: {parsed.get('selection')!r}")
+        failed += 1
+
+    no_sel_payload = json.loads(intent_mod._build_user_payload("make it yellow"))
+    if "selection" not in no_sel_payload:
+        print("  [ok] no selection means no 'selection' key")
+        passed += 1
+    else:
+        print("  [FAIL] empty selection leaked a key")
+        failed += 1
+
+    return passed, failed
+
+
 def test_photo_search_fast_path():
     """'From my photos' must skip CAD/mesh and not fire codegen."""
     print("\n=== Test: photo search fast path ===")
@@ -854,10 +985,18 @@ def run_all_tests():
     ph_pass, ph_fail = test_photo_search_fast_path()
     h_pass, h_fail = test_history_rung()
     a_pass, a_fail = test_absolute_size()
+    mb_pass, mb_fail = test_mesh_boolean_rung()
+    sel_pass, sel_fail = test_selection_in_codegen_payload()
 
-    total_pass = w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass + h_pass + a_pass
-    total_fail = w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail + h_fail + a_fail
-    
+    total_pass = (
+        w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass
+        + h_pass + a_pass + mb_pass + sel_pass
+    )
+    total_fail = (
+        w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail
+        + h_fail + a_fail + mb_fail + sel_fail
+    )
+
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
@@ -871,6 +1010,8 @@ def run_all_tests():
     print(f"Photo search:               {ph_pass}/{ph_pass + ph_fail} passed")
     print(f"Undo/redo rung:             {h_pass}/{h_pass + h_fail} passed")
     print(f"Absolute size:              {a_pass}/{a_pass + a_fail} passed")
+    print(f"Mesh boolean rung:          {mb_pass}/{mb_pass + mb_fail} passed")
+    print(f"Selection in payload:       {sel_pass}/{sel_pass + sel_fail} passed")
     print(f"TOTAL:                      {total_pass}/{total_pass + total_fail} passed")
     
     if total_fail > 0:
