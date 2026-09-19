@@ -233,6 +233,27 @@ export class PercyAssistant {
     }
   }
 
+  /**
+   * Drag-release from the dimension panel: rewrite one or more named PARAMS
+   * on the current CAD project and rerun the sandbox. Silent on purpose —
+   * this can fire on every release, like save_client_version.
+   */
+  async postParamUpdate(projectId, updates) {
+    try {
+      const result = await this._postJson(
+        `${API_BASE}/api/projects/${projectId}/params`,
+        { updates, session_id: SESSION_ID },
+        30000
+      );
+      await this._handleResponse(result);
+      return result;
+    } catch (e) {
+      console.error("[Percy] Param update failed:", e);
+      this.onStatusMessage(`Error: ${e.message}`, false);
+      return null;
+    }
+  }
+
   async _awaitJob(jobId) {
     const url = `${API_BASE}/api/jobs/${jobId}?session_id=${SESSION_ID}`;
     const deadline = Date.now() + JOB_MAX_MS;
