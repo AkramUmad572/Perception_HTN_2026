@@ -67,6 +67,91 @@ def test_models():
     return t
 
 
+# ============================================================================
+# Task 2: create / append / get / current / prune
+# ============================================================================
+
+def test_create_and_append():
+    print("\n=== Test: create_project / append_version ===")
+    import json
+    from app import projects
+
+    s, root = _tmp_settings()
+    t = (0, 0)
+    try:
+        src = _glb(s.glb_dir, "a.glb")
+        v1 = projects.create_project(s, "cad", src, op="generate", script="S1", summary="a box")
+        pid = v1.project_id
+        pdir = s.projects_dir / pid
+        t = _add(t, _check("v1 numbered 1", v1.version == 1 and v1.parent is None))
+        t = _add(t, _check("glb moved", not src.exists() and (pdir / "v1.glb").is_file()))
+        t = _add(t, _check("glb_url", v1.glb_url == f"/media/projects/{pid}/v1.glb", v1.glb_url))
+        t = _add(t, _check("kind/op stored", v1.kind == "cad" and v1.op == "generate"))
+        cur = projects.current_version(s, pid)
+        t = _add(t, _check("current is v1", cur is not None and cur.version == 1))
+        info = json.loads((pdir / "info.json").read_text())
+        t = _add(t, _check(
+            "info.json shape",
+            info["current"] == 1 and info["saved_to_drive"] is False
+            and "touched_at" in info and len(info["versions"]) == 1,
+            info,
+        ))
+
+        v2 = projects.append_version(s, pid, _glb(s.glb_dir, "b.glb"), op="set_material", color="#FF0000")
+        t = _add(t, _check("v2 parent 1", v2.version == 2 and v2.parent == 1))
+        t = _add(t, _check(
+            "v2 inherits unspecified meta",
+            v2.script == "S1" and v2.kind == "cad" and v2.summary == "a box",
+            v2,
+        ))
+        t = _add(t, _check("v2 keeps explicit meta", v2.color == "#FF0000" and v2.op == "set_material"))
+        t = _add(t, _check("current is v2", projects.current_version(s, pid).version == 2))
+        got = projects.get_version(s, pid, 1)
+        t = _add(t, _check("get_version v1", got is not None and got.script == "S1"))
+        t = _add(t, _check("get_version missing", projects.get_version(s, pid, 9) is None))
+
+        v3 = projects.append_version(s, pid, _glb(s.glb_dir, "c.glb"), op="hand_edit", script=None)
+        t = _add(t, _check("explicit None respected", v3.script is None, v3.script))
+
+        try:
+            projects.append_version(s, "nope", _glb(s.glb_dir, "d.glb"), op="hand_edit")
+            t = _add(t, _check("unknown project raises", False))
+        except ValueError:
+            t = _add(t, _check("unknown project raises", True))
+        t = _add(t, _check("unknown current is None", projects.current_version(s, "nope") is None))
+        t = _add(t, _check("path-like pid rejected", projects.current_version(s, "../x") is None))
+        t = _add(t, _check("get_project json", projects.get_project(s, pid)["current"] == 3))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return t
+
+
+def test_prune():
+    print("\n=== Test: prune keeps v1 + newest ===")
+    from app import projects
+
+    s, root = _tmp_settings()
+    t = (0, 0)
+    try:
+        pid = projects.create_project(s, "mesh", _glb(s.glb_dir, "a.glb")).project_id
+        for i in range(24):
+            projects.append_version(s, pid, _glb(s.glb_dir, f"x{i}.glb"), op="hand_edit")
+        info = projects.load_info(s, pid)
+        nums = [v.version for v in info["versions"]]
+        pdir = s.projects_dir / pid
+        t = _add(t, _check("capped at MAX_VERSIONS", len(nums) == projects.MAX_VERSIONS, nums))
+        t = _add(t, _check("v1 kept, newest last", nums[0] == 1 and nums[-1] == 25, nums))
+        t = _add(t, _check("pruned file deleted", not (pdir / "v2.glb").exists()))
+        t = _add(t, _check("kept files present", (pdir / "v1.glb").exists() and (pdir / "v25.glb").exists()))
+        t = _add(t, _check(
+            "one glb per kept version",
+            len(list(pdir.glob("v*.glb"))) == projects.MAX_VERSIONS,
+        ))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return t
+
+
 def run_all_tests():
     print("=" * 60)
     print("PROJECT / VERSION TESTS")
@@ -93,6 +178,8 @@ def run_all_tests():
 
 TESTS = [
     test_models,
+    test_create_and_append,
+    test_prune,
 ]
 
 
