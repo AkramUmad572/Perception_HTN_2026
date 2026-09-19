@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import logging
+import math
+import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
-from ai.intent import extract_named_color
-from app import jobs
+from ai.intent import _is_new_object_request, extract_named_color
+from app import jobs, projects
 from app.config import Settings
-from app.models import CommandResponse, Intent, SessionState
+from app.models import CommandResponse, Intent, SessionState, VersionInfo
 from app.session import save_session
 from cad import DEFAULTS
+from cad.params import ParamError
+from cad.params import extract_params as extract_cad_params
+from cad.params import set_params as set_cad_params
 from cad.sandbox import execute_cadquery_script
 from cad.builder import merge_params, build_model
 from mesh.factory import (
@@ -77,6 +83,158 @@ def _mesh_size_m(size_mm: float | None) -> float:
 
 def _display_size_m(session: SessionState) -> float:
     return _clamp(session.base_size_m * session.scale, SIZE_MIN_M, SIZE_MAX_M)
+
+
+# Which VersionInfo.op a rebuilding action records.
+_VERSION_OPS = {
+    "generate": "generate",
+    "set_material": "set_material",
+    "execute_script": "script",
+    "create": "generate",
+    "modify": "generate",
+    "mesh_boolean": "boolean",
+}
+
+# mesh/boolean.py default hole diameter when the utterance names no size.
+DEFAULT_HOLE_DIAMETER_MM = 4.0
+_NO_SCULPT_REPLY = "There's no sculpt to edit yet."
+_BOOLEAN_FAILED_REPLY = "That edit didn't work. The model is unchanged."
+_BOOLEAN_DONE_REPLY = {
+    "hole": "Drilled it.",
+    "loop": "Added the loop.",
+    "flat_base": "Flattened the base.",
+}
+
+
+def _versioned_model_id(info: VersionInfo) -> str:
+    return f"{info.project_id}-v{info.version}"
+
+
+def _cad_params(session: SessionState) -> dict[str, float]:
+    """The session's current CAD script's named dimensions, for CommandResponse.cad_params."""
+    if session.last_backend != "cad" or not session.last_script:
+        return {}
+    return extract_cad_params(session.last_script)
+
+
+def _record_version(
+    session: SessionState,
+    settings: Settings,
+    model_id: str | None,
+    op: str,
+    new_object: bool = False,
+) -> str | None:
+    """
+    Move a freshly built GLB into the session's project as a new version.
+
+    A new object (or a lane change, or no live project) starts a project;
+    anything else appends. On success the session points at the version file
+    and the versioned model_id is returned — always new, so the client swaps.
+    Best effort: if the GLB is not on disk or anything fails, returns None and
+    the legacy /media/glb URL stays in place.
+    """
+    if not model_id:
+        return None
+    try:
+        src = Path(settings.glb_dir) / f"{model_id}.glb"
+        if not src.is_file():
+            return None
+        kind = session.last_backend if session.last_backend in ("cad", "mesh") else "cad"
+        meta = {
+            "op": op,
+            "summary": session.last_summary,
+            "script": session.last_script if kind == "cad" else None,
+            "params": extract_cad_params(session.last_script) if kind == "cad" and session.last_script else {},
+            "mesh_prompt": session.last_mesh_prompt if kind == "mesh" else None,
+            "color": session.color,
+            "base_size_m": session.base_size_m,
+        }
+        info = None
+        if not new_object and session.project_id:
+            current = projects.current_version(settings, session.project_id)
+            if current is not None and current.kind == kind:
+                info = projects.append_version(settings, session.project_id, src, **meta)
+        if info is None:
+            info = projects.create_project(settings, kind, src, **meta)
+    except Exception as exc:
+        logger.warning("Could not record a version for %s: %s", model_id, exc)
+        return None
+    session.project_id = info.project_id
+    session.version = info.version
+    session.model_id = _versioned_model_id(info)
+    session.glb_url = info.glb_url
+    save_session(session)
+    return session.model_id
+
+
+def restore_version(session: SessionState, info: VersionInfo) -> None:
+    """Point the session at a stored version and restore its follow-up context."""
+    session.project_id = info.project_id
+    session.version = info.version
+    session.model_id = _versioned_model_id(info)
+    session.glb_url = info.glb_url
+    session.template = None
+    session.params = {}
+    session.last_backend = info.kind
+    session.last_script = info.script
+    session.last_summary = info.summary
+    session.last_mesh_prompt = info.mesh_prompt
+    if info.color:
+        session.color = info.color
+    if info.base_size_m:
+        session.base_size_m = info.base_size_m
+    # Every stored version's base_size_m is already its real size; any display
+    # multiplier from an earlier voice resize belongs to a different version.
+    session.scale = 1.0
+    save_session(session)
+
+
+_AXIS_INDEX = {"width": 0, "height": 1, "depth": 2}  # GLB is Y-up
+
+
+def _glb_path_from_url(settings: Settings, glb_url: str | None) -> Path | None:
+    """Local file behind a served GLB URL, or None when it cannot be resolved."""
+    if not glb_url:
+        return None
+    path = glb_url.split("?", 1)[0]
+    if path.startswith("/media/glb/"):
+        return Path(settings.glb_dir) / path[len("/media/glb/"):]
+    projects_dir = getattr(settings, "projects_dir", None)
+    if path.startswith("/media/projects/") and isinstance(projects_dir, Path):
+        return projects_dir / path[len("/media/projects/"):]
+    return None
+
+
+def _axis_fraction(glb_path: Path | None, axis: str | None) -> float:
+    """
+    Extent along `axis` as a fraction of the longest extent (1.0 if unknown).
+
+    base_size_m is the longest edge, so "8 cm tall" on a wide model needs this
+    ratio to land the height, not the width, on 8 cm.
+    """
+    idx = _AXIS_INDEX.get(axis or "")
+    if idx is None or glb_path is None:
+        return 1.0
+    try:
+        import trimesh
+
+        lo, hi = trimesh.load(str(glb_path)).bounds
+        extents = hi - lo
+        longest = float(max(extents))
+        part = float(extents[idx])
+    except Exception as exc:
+        logger.info("Could not measure %s for axis %s: %s", glb_path, axis, exc)
+        return 1.0
+    if longest <= 0 or part <= 0:
+        return 1.0
+    return part / longest
+
+
+_CAD_ABSOLUTE_SIZE_REPLY = (
+    "I keep CAD parts at their real size. Ask me to change the dimension "
+    "and I'll rebuild it."
+)
+_SIZE_CLAMPED_REPLY = "That's outside what I can show, so I went as far as I can."
 
 
 async def _execute_with_retry(
@@ -438,6 +596,11 @@ async def apply_intent(
                 size_mm=intent.size_mm,
             )
 
+    elif action == "ui_mode":
+        # A client UI switch ("select mode", "tape measure", "done") — no
+        # model change, just echoes intent.params["mode"] back on the response.
+        response_backend = session.last_backend
+
     elif action == "set_scale":
         # Resizing a sculpt is a display change, not a reason to spend 90s
         # rebuilding a model that would come back looking different anyway.
@@ -445,14 +608,117 @@ async def apply_intent(
             error_msg = "No model to resize. Build something first."
             intent.reply = error_msg
             action = "clarify"
+        elif intent.params.get("target_m") is not None and session.last_backend != "mesh":
+            # CAD is shown life size; a display scale would make its mm lie.
+            intent.reply = _CAD_ABSOLUTE_SIZE_REPLY
+            action = "clarify"
         else:
-            factor = float(intent.params.get("factor") or 1.0)
-            session.scale = _clamp(
-                session.scale * factor, SIZE_MIN_M / session.base_size_m,
-                SIZE_MAX_M / session.base_size_m,
-            )
+            low = SIZE_MIN_M / session.base_size_m
+            high = SIZE_MAX_M / session.base_size_m
+            target_m = intent.params.get("target_m")
+            if target_m is not None:
+                fraction = _axis_fraction(
+                    _glb_path_from_url(settings, session.glb_url),
+                    intent.params.get("axis"),
+                )
+                wanted = float(target_m) / (session.base_size_m * fraction)
+            else:
+                wanted = session.scale * float(intent.params.get("factor") or 1.0)
+            session.scale = _clamp(wanted, low, high)
+            if target_m is not None and abs(session.scale - wanted) > 1e-9:
+                intent.reply = _SIZE_CLAMPED_REPLY
             response_backend = session.last_backend
             save_session(session)
+
+    elif action == "mesh_boolean":
+        # Drill a hole / add a loop / flatten the base on the current sculpt.
+        # ai/intent.py already resolved the selection into params before this
+        # runs; a BooleanError leaves the model untouched.
+        response_backend = "mesh"
+        op = intent.params.get("op")
+        glb_path = _glb_path_from_url(settings, session.glb_url)
+        if session.last_backend != "mesh" or glb_path is None or not glb_path.is_file():
+            error_msg = _NO_SCULPT_REPLY
+            intent.reply = _NO_SCULPT_REPLY
+            action = "clarify"
+        else:
+            from mesh.boolean import (
+                BooleanError,
+                add_loop,
+                drill_hole,
+                export_glb,
+                flatten_base,
+                load_mesh,
+            )
+
+            try:
+                mesh = load_mesh(glb_path)
+                longest_extent = float(max(mesh.extents)) if len(mesh.vertices) else 0.0
+                real_mm = max(session.base_size_m * session.scale * 1000.0, 1e-9)
+                units_per_mm = longest_extent / real_mm
+
+                raw_diameter = intent.params.get("diameter_mm")
+                if op == "hole":
+                    center = intent.params.get("center")
+                    normal = intent.params.get("normal") or []
+                    direction = [-float(v) for v in normal] if normal else None
+                    diameter_mm = (
+                        float(raw_diameter) if raw_diameter is not None else DEFAULT_HOLE_DIAMETER_MM
+                    )
+                    out_mesh = drill_hole(mesh, center, direction, diameter_mm, units_per_mm)
+                elif op == "loop":
+                    center = intent.params.get("center")
+                    normal = intent.params.get("normal")
+                    loop_kwargs: dict[str, float] = {}
+                    if raw_diameter is not None:
+                        loop_kwargs["outer_d_mm"] = float(raw_diameter)
+                    out_mesh = add_loop(mesh, center, normal, units_per_mm, **loop_kwargs)
+                elif op == "flat_base":
+                    out_mesh = flatten_base(mesh)
+                else:
+                    raise BooleanError(_BOOLEAN_FAILED_REPLY)
+
+                new_model_id = uuid.uuid4().hex[:12]
+                export_glb(out_mesh, Path(settings.glb_dir) / f"{new_model_id}.glb")
+                rebuilt = True
+                result_model_id = new_model_id
+                textured = True
+                intent.reply = _BOOLEAN_DONE_REPLY.get(op, intent.reply)
+                session.last_summary = intent.reply
+                save_session(session)
+            except BooleanError as exc:
+                error_msg = str(exc)
+                intent.reply = str(exc)
+                action = "clarify"
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("mesh_boolean failed: %s", exc)
+                error_msg = str(exc)
+                intent.reply = _BOOLEAN_FAILED_REPLY
+                action = "clarify"
+
+    elif action in ("undo", "redo"):
+        # History steps reload a stored version through the normal swap path.
+        project_id = intent.params.get("project_id") or session.project_id
+        try:
+            steps = max(1, int(intent.params.get("steps") or 1))
+        except (TypeError, ValueError):
+            steps = 1
+        mover = projects.undo if action == "undo" else projects.redo
+        info = mover(settings, project_id, steps) if project_id else None
+        if info is None:
+            if not project_id or projects.current_version(settings, project_id) is None:
+                intent.reply = f"There's nothing to {action} yet."
+            else:
+                intent.reply = f"Nothing to {action}."
+            action = "noop"
+            response_backend = session.last_backend
+        else:
+            restore_version(session, info)
+            rebuilt = True
+            result_model_id = session.model_id
+            response_backend = info.kind
+            textured = info.kind == "mesh"
+            intent.reply = "Undone." if action == "undo" else "Redone."
 
     elif action == "generate":
         if not intent.script:
@@ -625,6 +891,16 @@ async def apply_intent(
 
         save_session(session)
 
+    if rebuilt and result_model_id and action in _VERSION_OPS:
+        new_object = action == "create" or (
+            action == "generate" and _is_new_object_request(transcript or "")
+        )
+        versioned = _record_version(
+            session, settings, result_model_id, _VERSION_OPS[action], new_object=new_object
+        )
+        if versioned:
+            result_model_id = versioned
+
     t0 = time.perf_counter()
     audio_url, tts_ms = await synthesize_speech(intent.reply, settings)
     latency["tts_ms"] = tts_ms if tts_ms else (time.perf_counter() - t0) * 1000
@@ -650,6 +926,309 @@ async def apply_intent(
         backend=response_backend,
         display_size_m=_display_size_m(session),
         candidates=candidates if action in ("find_photos", "browse_photos") else [],
+        cad_params=_cad_params(session),
+        ui_mode=intent.params.get("mode") if action == "ui_mode" else None,
+    )
+
+
+_CLIENT_OPS = {
+    "generate", "set_material", "hand_edit", "param_edit",
+    "boolean", "semantic_edit", "photo", "script",
+}
+_NO_HISTORY_REPLY = "I can't find that model's history."
+
+
+async def history_step(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    direction: str,
+    steps: int = 1,
+) -> CommandResponse:
+    """Undo/redo for a named project (the HTTP route). Voice goes via apply_intent."""
+    if projects.current_version(settings, project_id) is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+    intent = Intent(
+        action="redo" if direction == "redo" else "undo",
+        params={"steps": steps, "project_id": project_id},
+    )
+    return await apply_intent(intent, session, settings)
+
+
+async def save_client_version(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    glb_bytes: bytes,
+    op: str = "hand_edit",
+    summary: str | None = None,
+) -> CommandResponse:
+    """
+    Store a GLB the client already shows (a hand edit) as the next version.
+
+    Returns rebuilt=False with action="version_saved": the client has the
+    geometry already, so it must only move its version pointer, not reload.
+    Silent on purpose — this fires on every drag release.
+    """
+    if projects.current_version(settings, project_id) is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+    if len(glb_bytes) < 12 or glb_bytes[:4] != b"glTF":
+        return CommandResponse(
+            ok=False,
+            reply="That edit didn't save. Try again.",
+            action="clarify",
+            session=session,
+            error="Upload is not a binary glTF (.glb) file",
+        )
+    fd, tmp = tempfile.mkstemp(dir=str(settings.projects_dir), suffix=".glb")
+    try:
+        with open(fd, "wb") as fh:
+            fh.write(glb_bytes)
+        meta: dict = {"op": op if op in _CLIENT_OPS else "hand_edit"}
+        if summary:
+            meta["summary"] = summary
+        info = projects.append_version(settings, project_id, Path(tmp), **meta)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    restore_version(session, info)
+    return CommandResponse(
+        ok=True,
+        reply="Saved.",
+        action="version_saved",
+        rebuilt=False,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=session.model_id,
+        session=session,
+        backend=info.kind,
+        textured=info.kind == "mesh",
+        display_size_m=_display_size_m(session),
+        cad_params=_cad_params(session),
+    )
+
+
+_NO_PARAMS_REPLY = "This model has no named dimensions I can change."
+
+
+async def apply_param_update(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    updates: dict[str, float],
+    op: str = "param_edit",
+    action: str = "param_edit",
+    reply: str = "Updated.",
+) -> CommandResponse:
+    """
+    Rewrite named PARAMS in the project's current CAD script and rerun the
+    sandbox. No LLM involved.
+
+    Drag-release from the client's dimension panel (the default op/action), or
+    a two-hand-stretch resize (apply_resize passes op="resize") — same rewrite
+    path either way, just a different version op and spoken reply.
+
+    Returns rebuilt=True with a fresh model_id/glb_url on success, same
+    contract as any other rebuild. A ParamError (unknown dimension, or a value
+    that isn't a positive number) comes back as a clarify with its message —
+    the model is left untouched.
+    """
+    current = projects.current_version(settings, project_id)
+    if current is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+    if current.kind != "cad" or not current.script:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_PARAMS_REPLY,
+            action="clarify",
+            session=session,
+            error="Not a CAD project, or it has no stored script",
+        )
+
+    try:
+        new_script = set_cad_params(current.script, updates)
+    except ParamError as err:
+        return CommandResponse(
+            ok=False,
+            reply=str(err),
+            action="clarify",
+            session=session,
+            error=str(err),
+        )
+
+    latency: dict[str, float] = {}
+    color = current.color or session.color or "#C0C0C0"
+    t0 = time.perf_counter()
+    result = execute_cadquery_script(
+        script=new_script,
+        output_dir=settings.glb_dir,
+        timeout=45.0,
+        color=color,
+        flatten_color=True,
+    )
+    latency["cad_ms"] = result.get("exec_ms", (time.perf_counter() - t0) * 1000)
+    if not result.get("ok"):
+        return CommandResponse(
+            ok=False,
+            reply="That change didn't build. Try a different value.",
+            action="clarify",
+            session=session,
+            error=result.get("error", "sandbox execution failed"),
+            latency_ms=latency,
+        )
+
+    model_id = result["model_id"]
+    src = Path(settings.glb_dir) / f"{model_id}.glb"
+    new_params = extract_cad_params(new_script)
+    info = projects.append_version(
+        settings,
+        project_id,
+        src,
+        op=op,
+        script=new_script,
+        params=new_params,
+        color=color,
+        base_size_m=_cad_size_m(settings, model_id),
+    )
+    restore_version(session, info)
+    return CommandResponse(
+        ok=True,
+        reply=reply,
+        action=action,
+        rebuilt=True,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=session.model_id,
+        session=session,
+        latency_ms=latency,
+        backend="cad",
+        textured=False,
+        display_size_m=_display_size_m(session),
+        cad_params=new_params,
+    )
+
+
+# A two-hand stretch within this of 1.0x is not a resize (jitter / release wobble).
+RESIZE_NOOP_TOLERANCE = 0.02
+_NO_MM_PARAMS_REPLY = "This model has no measurements I can scale. Ask me to make it bigger instead."
+_RESIZE_NOOP_REPLY = "That's already about that size."
+
+
+async def apply_resize(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    factor: float,
+) -> CommandResponse:
+    """
+    Two-hand-stretch release: change the model's real dimensions, not just the
+    display zoom (the client resets its own zoom to 1 after this succeeds).
+
+    CAD: every PARAMS key ending in "_mm" is multiplied by `factor` and the
+    sandbox reruns — reuses apply_param_update's rewrite path with op="resize".
+    A CAD model with no "_mm" params has nothing to scale and clarifies.
+
+    Mesh: no geometry rebuild — the version's base_size_m absorbs the current
+    display scale times `factor`, and the session's scale resets to 1 so the
+    new version already reads at its full real size.
+
+    Factor <= 0, non-finite, or within ±2% of 1 is a silent no-op: no version,
+    no model change.
+    """
+    if not math.isfinite(factor) or factor <= 0 or abs(factor - 1.0) <= RESIZE_NOOP_TOLERANCE:
+        return CommandResponse(
+            ok=True,
+            reply=_RESIZE_NOOP_REPLY,
+            action="noop",
+            color=session.color,
+            glb_url=session.glb_url,
+            model_id=session.model_id,
+            session=session,
+            backend=session.last_backend,
+            display_size_m=_display_size_m(session),
+            cad_params=_cad_params(session),
+        )
+
+    current = projects.current_version(settings, project_id)
+    if current is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+
+    if current.kind == "cad":
+        params = extract_cad_params(current.script or "")
+        mm_updates = {k: v * factor for k, v in params.items() if k.endswith("_mm")}
+        if not mm_updates:
+            return CommandResponse(
+                ok=False,
+                reply=_NO_MM_PARAMS_REPLY,
+                action="clarify",
+                session=session,
+                error="No _mm params to scale",
+            )
+        return await apply_param_update(
+            session, settings, project_id, mm_updates,
+            op="resize", action="resize", reply="Resized.",
+        )
+
+    # Mesh lane: fold the stretch into the stored real size, no geometry edit.
+    glb_path = _glb_path_from_url(settings, current.glb_url)
+    if glb_path is None or not glb_path.is_file():
+        return CommandResponse(
+            ok=False,
+            reply="I can't find that model to resize.",
+            action="clarify",
+            session=session,
+            error="Missing GLB on disk",
+        )
+
+    new_base_size_m = _clamp(session.base_size_m * session.scale * factor, SIZE_MIN_M, SIZE_MAX_M)
+    fd, tmp = tempfile.mkstemp(dir=str(settings.projects_dir), suffix=".glb")
+    try:
+        with open(fd, "wb") as fh:
+            fh.write(glb_path.read_bytes())
+        info = projects.append_version(
+            settings, project_id, Path(tmp),
+            op="resize", base_size_m=new_base_size_m,
+        )
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+    restore_version(session, info)
+    return CommandResponse(
+        ok=True,
+        reply="Resized.",
+        action="resize",
+        rebuilt=True,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=session.model_id,
+        session=session,
+        backend="mesh",
+        textured=True,
+        display_size_m=_display_size_m(session),
+        cad_params={},
     )
 
 
@@ -739,6 +1318,9 @@ async def build_from_image(
                 text_prompt, session, settings, latency, use_nvidia=False
             )
             if ok:
+                model_id = _record_version(
+                    session, settings, model_id, "photo", new_object=True
+                ) or model_id
                 reply = (
                     "The photo engine was busy, so I sculpted it from "
                     "what I saw in the picture."
@@ -771,6 +1353,9 @@ async def build_from_image(
                 image_path, session, settings, latency, hint=prompt
             )
             if ok:
+                model_id = _record_version(
+                    session, settings, model_id, "photo", new_object=True
+                ) or model_id
                 reply = "The sculptor was down, so I modelled it in CAD instead."
                 audio_url, tts_ms = (
                     await synthesize_speech(reply, settings) if speak else (None, 0)
@@ -819,6 +1404,9 @@ async def build_from_image(
     session.base_size_m = MESH_DEFAULT_M
     session.scale = 1.0
     save_session(session)
+    model_id = _record_version(
+        session, settings, result["model_id"], "photo", new_object=True
+    ) or result["model_id"]
 
     reply = "Built that from your photo."
     audio_url, tts_ms = await synthesize_speech(reply, settings) if speak else (None, 0)
@@ -831,7 +1419,7 @@ async def build_from_image(
         rebuilt=True,
         color=session.color,
         glb_url=session.glb_url,
-        model_id=result["model_id"],
+        model_id=model_id,
         reply_audio_url=audio_url,
         session=session,
         latency_ms=latency,
@@ -963,6 +1551,7 @@ async def execute_script_direct(
     )
 
     if success:
+        model_id = _record_version(session, settings, model_id, "script") or model_id
         return CommandResponse(
             ok=True,
             transcript=None,
@@ -977,6 +1566,7 @@ async def execute_script_direct(
             latency_ms=latency,
             textured=False,
             backend="cad",
+            cad_params=_cad_params(session),
         )
     else:
         return CommandResponse(

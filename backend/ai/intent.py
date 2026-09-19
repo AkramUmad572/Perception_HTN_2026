@@ -10,7 +10,7 @@ from typing import Any
 
 from app.config import Settings
 from app.httpclient import get_http_client
-from app.models import Intent
+from app.models import Intent, Selection
 from photos.search import is_browse_all_query, is_photo_search, photo_query
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ Free-rein: ANY object. No shape whitelist. Prefer TOO MANY named parts over one 
 Always include "backend":"cad" or "backend":"mesh".
 
 CAD geometry (list parts FIRST, then the script):
-{"action":"generate","backend":"cad","parts":[{"name":"head","color":"#FFD700"}],"size_mm":60,"script":"import cadquery as cq\\n...\\nresult = assy","reply":"Short spoken confirmation."}
+{"action":"generate","backend":"cad","parts":[{"name":"head","color":"#FFD700"}],"size_mm":60,"script":"import cadquery as cq\\nPARAMS = {\\"head_radius_mm\\": 16}\\n...\\nresult = assy","reply":"Short spoken confirmation."}
 
 Mesh / sculpted model (NO CadQuery script):
 {"action":"generate","backend":"mesh","mesh_prompt":"short visual English for a 3D model","size_mm":200,"script":null,"reply":"Sculpting that."}
@@ -53,6 +53,15 @@ More than one part → `result` MUST be `cq.Assembly()`, never a single .union()
 assy.add(solid, name="wheels", color=cq.Color("#212121"))
 Use matching names in the parts[] array.
 
+## PARAMS (required)
+Right after the imports, every script declares ONE module-level dict literal holding its dimensions in millimetres:
+PARAMS = {"head_radius_mm": 16, "ear_length_mm": 16, "lug_hole_d_mm": 3.2}
+- Keys are `<part>_<dimension>_mm` in lower_snake_case. <part> is the assy.add name; mirrored or repeated parts use the base name (ear_l and ear_r share "ear_...", wheel_fl..wheel_rr share "wheel_...").
+- Every assy.add part has at least one key.
+- Values are plain positive numbers only. No expressions, names, or calls inside PARAMS.
+- The body reads every size from PARAMS["..."] and derives positions from those values, so changing one number keeps parts attached. Counts (n_teeth, range) are not PARAMS.
+- Helper functions (def) CANNOT see PARAMS or any other top-level name; pass every dimension in as an argument.
+
 ## CadQuery 2 API
 - import cadquery as cq (and math if needed). Valid Python only. Millimeters.
 - .extrude(height) ONLY — never extrude(..., centered=...). .box(l,w,h) may use centered=.
@@ -63,7 +72,7 @@ Use matching names in the parts[] array.
 
 ## Follow-ups
 User JSON may include current_script, last_summary, current_color.
-- Same object: EDIT the Assembly. Keep parts. Change dimensions/colors. NEVER scale loop counts, n_teeth, or range().
+- Same object: EDIT the Assembly. Keep parts and keep PARAMS. Change a size by editing its PARAMS value; add a PARAMS key for a new part or dimension. Never replace PARAMS["..."] reads with raw numbers. If current_script has no PARAMS, add one. NEVER scale loop counts, n_teeth, or range().
 - Different object: new script + new parts list.
 - "make the ears black" / "wheels black": EDIT those parts' cq.Color, action=generate.
 - "make it yellow" with no part name: set_material.
@@ -72,73 +81,119 @@ User JSON may include current_script, last_summary, current_color.
 Character (lofted ears, colored tips) — pattern for any creature:
 ```python
 import cadquery as cq
+PARAMS = {
+    "head_radius_mm": 16,
+    "body_radius_mm": 14,
+    "ear_length_mm": 16,
+    "ear_base_r_mm": 5.5,
+    "ear_top_r_mm": 1.6,
+    "ear_spacing_mm": 20,
+    "tip_length_mm": 7,
+    "tip_base_r_mm": 2.0,
+    "tip_top_r_mm": 0.7,
+    "eye_radius_mm": 2.2,
+    "cheek_radius_mm": 3.8,
+    "lug_radius_mm": 4.5,
+    "lug_thickness_mm": 3,
+    "lug_hole_d_mm": 3.2,
+}
 def loft_ear(x, y, z, r0, r1, h):
     return (cq.Workplane("XY").transformed(offset=(x, y, z))
             .circle(r0).workplane(offset=h).circle(r1).loft())
-head = cq.Workplane("XY").sphere(16)
-body = cq.Workplane("XY").transformed(offset=(0, -18, 0)).sphere(14)
-ear_l = loft_ear(-10, 12, 6, 5.5, 1.6, 16)
-ear_r = loft_ear(10, 12, 6, 5.5, 1.6, 16)
-tip_l = loft_ear(-10, 12, 20, 2.0, 0.7, 7)
-tip_r = loft_ear(10, 12, 20, 2.0, 0.7, 7)
-eye_l = cq.Workplane("XY").transformed(offset=(-5, 2, 13)).sphere(2.2)
-eye_r = cq.Workplane("XY").transformed(offset=(5, 2, 13)).sphere(2.2)
-cheek_l = cq.Workplane("XY").transformed(offset=(-10, -3, 11)).sphere(3.8)
-cheek_r = cq.Workplane("XY").transformed(offset=(10, -3, 11)).sphere(3.8)
-lug = (cq.Workplane("XY").transformed(offset=(0, 22, 4)).circle(4.5).extrude(3)
-       .faces(">Z").workplane().hole(3.2))
+def ball(x, y, z, r):
+    return cq.Workplane("XY").transformed(offset=(x, y, z)).sphere(r)
+R = PARAMS["head_radius_mm"]
+ex, ey, ez = PARAMS["ear_spacing_mm"] / 2, R * 0.75, 6
+tz = ez + PARAMS["ear_length_mm"] - 2
+head = ball(0, 0, 0, R)
+body = ball(0, -(R + 2), 0, PARAMS["body_radius_mm"])
+ear = (PARAMS["ear_base_r_mm"], PARAMS["ear_top_r_mm"], PARAMS["ear_length_mm"])
+tip = (PARAMS["tip_base_r_mm"], PARAMS["tip_top_r_mm"], PARAMS["tip_length_mm"])
+lug = (cq.Workplane("XY").transformed(offset=(0, R + 6, 4))
+       .circle(PARAMS["lug_radius_mm"]).extrude(PARAMS["lug_thickness_mm"])
+       .faces(">Z").workplane().hole(PARAMS["lug_hole_d_mm"]))
 assy = cq.Assembly()
 assy.add(head, name="head", color=cq.Color("#FFD700"))
 assy.add(body, name="body", color=cq.Color("#FFD700"))
-assy.add(ear_l, name="ear_l", color=cq.Color("#FFD700"))
-assy.add(ear_r, name="ear_r", color=cq.Color("#FFD700"))
-assy.add(tip_l, name="tip_l", color=cq.Color("#212121"))
-assy.add(tip_r, name="tip_r", color=cq.Color("#212121"))
-assy.add(eye_l, name="eye_l", color=cq.Color("#212121"))
-assy.add(eye_r, name="eye_r", color=cq.Color("#212121"))
-assy.add(cheek_l, name="cheek_l", color=cq.Color("#E53935"))
-assy.add(cheek_r, name="cheek_r", color=cq.Color("#E53935"))
+assy.add(loft_ear(-ex, ey, ez, *ear), name="ear_l", color=cq.Color("#FFD700"))
+assy.add(loft_ear(ex, ey, ez, *ear), name="ear_r", color=cq.Color("#FFD700"))
+assy.add(loft_ear(-ex, ey, tz, *tip), name="tip_l", color=cq.Color("#212121"))
+assy.add(loft_ear(ex, ey, tz, *tip), name="tip_r", color=cq.Color("#212121"))
+assy.add(ball(-5, 2, R - 3, PARAMS["eye_radius_mm"]), name="eye_l", color=cq.Color("#212121"))
+assy.add(ball(5, 2, R - 3, PARAMS["eye_radius_mm"]), name="eye_r", color=cq.Color("#212121"))
+assy.add(ball(-10, -3, R - 5, PARAMS["cheek_radius_mm"]), name="cheek_l", color=cq.Color("#E53935"))
+assy.add(ball(10, -3, R - 5, PARAMS["cheek_radius_mm"]), name="cheek_r", color=cq.Color("#E53935"))
 assy.add(lug, name="lug", color=cq.Color("#FFD700"))
 result = assy
 ```
 
-Keychain lug + hole:
+Keychain lug + hole (lug sticks out past the plate so the hole is clear):
 ```python
 import cadquery as cq
-plate = cq.Workplane("XY").box(46, 26, 6).edges("|Z").fillet(5)
-charm = plate.faces(">Z").workplane().center(-8, 0).text("Hi", 8, 1.2)
-lug = (cq.Workplane("XY").transformed(offset=(18, 0, 0)).circle(5).extrude(6)
-       .faces(">Z").workplane().hole(3.5))
+PARAMS = {
+    "plate_length_mm": 46,
+    "plate_width_mm": 26,
+    "plate_thickness_mm": 6,
+    "plate_corner_r_mm": 5,
+    "text_size_mm": 8,
+    "text_height_mm": 1.2,
+    "lug_radius_mm": 5,
+    "lug_hole_d_mm": 3.5,
+}
+L, T = PARAMS["plate_length_mm"], PARAMS["plate_thickness_mm"]
+plate = (cq.Workplane("XY").box(L, PARAMS["plate_width_mm"], T)
+         .edges("|Z").fillet(PARAMS["plate_corner_r_mm"]))
+text = (cq.Workplane("XY").workplane(offset=T / 2).center(-L / 6, 0)
+        .text("Hi", PARAMS["text_size_mm"], PARAMS["text_height_mm"]))
+lug = (cq.Workplane("XY").transformed(offset=(L / 2 + PARAMS["lug_radius_mm"] * 0.6, 0, -T / 2))
+       .circle(PARAMS["lug_radius_mm"]).extrude(T)
+       .faces(">Z").workplane().hole(PARAMS["lug_hole_d_mm"]))
 assy = cq.Assembly()
 assy.add(plate, name="plate", color=cq.Color("#FFD700"))
-assy.add(charm, name="text", color=cq.Color("#212121"))
+assy.add(text, name="text", color=cq.Color("#212121"))
 assy.add(lug, name="lug", color=cq.Color("#FFD700"))
 result = assy
 ```
 
-Toy car (cabin, 4 wheels, headlights):
+Toy car (cabin, 4 wheels with hubs, headlights):
 ```python
 import cadquery as cq
-body = cq.Workplane("XY").box(72, 30, 16)
-cabin = cq.Workplane("XY").transformed(offset=(-8, 0, 14)).box(30, 24, 14)
-bumper = cq.Workplane("XY").transformed(offset=(34, 0, -2)).box(8, 28, 8)
-def wheel(x, y):
-    return cq.Workplane("YZ").transformed(offset=(x, y, -8)).circle(7).extrude(6)
-def hub(x, y):
-    return cq.Workplane("YZ").transformed(offset=(x, y, -8)).circle(2.8).extrude(6.5)
-def lamp(x, y, z):
-    return cq.Workplane("XY").transformed(offset=(x, y, z)).sphere(3)
+PARAMS = {
+    "body_length_mm": 72,
+    "body_width_mm": 30,
+    "body_height_mm": 16,
+    "cabin_length_mm": 30,
+    "cabin_width_mm": 24,
+    "cabin_height_mm": 14,
+    "bumper_depth_mm": 8,
+    "wheelbase_mm": 44,
+    "wheel_radius_mm": 7,
+    "wheel_width_mm": 6,
+    "hub_radius_mm": 2.8,
+    "lamp_radius_mm": 3,
+}
+L, W, H = PARAMS["body_length_mm"], PARAMS["body_width_mm"], PARAMS["body_height_mm"]
+WW = PARAMS["wheel_width_mm"]
+body = cq.Workplane("XY").box(L, W, H)
+cabin = (cq.Workplane("XY").transformed(offset=(-L / 9, 0, H / 2 + PARAMS["cabin_height_mm"] / 2 - 1))
+         .box(PARAMS["cabin_length_mm"], PARAMS["cabin_width_mm"], PARAMS["cabin_height_mm"]))
+bumper = (cq.Workplane("XY").transformed(offset=(L / 2, 0, -H / 4))
+          .box(PARAMS["bumper_depth_mm"], W - 2, H / 2))
+def disc(x, y_center, z, r, width):
+    # "XZ" faces -Y: start at the outer face and extrude inwards
+    return cq.Workplane("XZ", origin=(x, y_center + width / 2, z)).circle(r).extrude(width)
+def ball(x, y, z, r):
+    return cq.Workplane("XY").transformed(offset=(x, y, z)).sphere(r)
 assy = cq.Assembly()
 assy.add(body, name="body", color=cq.Color("#E53935"))
 assy.add(cabin, name="cabin", color=cq.Color("#90CAF9"))
 assy.add(bumper, name="bumper", color=cq.Color("#C0C0C0"))
-assy.add(wheel(22, 16), name="wheel_fl", color=cq.Color("#212121"))
-assy.add(wheel(22, -16), name="wheel_fr", color=cq.Color("#212121"))
-assy.add(wheel(-22, 16), name="wheel_rl", color=cq.Color("#212121"))
-assy.add(wheel(-22, -16), name="wheel_rr", color=cq.Color("#212121"))
-assy.add(hub(22, 16), name="hub_fl", color=cq.Color("#C0C0C0"))
-assy.add(lamp(34, 8, 4), name="lamp_l", color=cq.Color("#FFF3E0"))
-assy.add(lamp(34, -8, 4), name="lamp_r", color=cq.Color("#FFF3E0"))
+for tag, sx, sy in (("fl", 1, 1), ("fr", 1, -1), ("rl", -1, 1), ("rr", -1, -1)):
+    x, y = sx * PARAMS["wheelbase_mm"] / 2, sy * (W / 2 + WW / 2)
+    assy.add(disc(x, y, -H / 2, PARAMS["wheel_radius_mm"], WW), name=f"wheel_{tag}", color=cq.Color("#212121"))
+    assy.add(disc(x, y, -H / 2, PARAMS["hub_radius_mm"], WW + 1), name=f"hub_{tag}", color=cq.Color("#C0C0C0"))
+assy.add(ball(L / 2, W / 4, H / 4, PARAMS["lamp_radius_mm"]), name="lamp_l", color=cq.Color("#FFF3E0"))
+assy.add(ball(L / 2, -W / 4, H / 4, PARAMS["lamp_radius_mm"]), name="lamp_r", color=cq.Color("#FFF3E0"))
 result = assy
 ```
 
@@ -159,6 +214,7 @@ Original script:
 ```
 
 Fix THIS script. Keep the Assembly and all named parts. Do NOT replace a detailed assembly with a box/cylinder. Fix only the failing part.
+Keep the top-level PARAMS dict and its keys; helper functions cannot see PARAMS or other top-level names, so pass values in as arguments ("name 'X' is not defined" inside a def means exactly this).
 
 ## If error is SECURITY-related (blocked import, blocked builtin, access denied):
 - Imports: ONLY `import cadquery as cq` and `import math`
@@ -344,7 +400,7 @@ _MESH_UNAVAILABLE_REPLY = (
     "or set NVIDIA_API_KEY / MESHY_API_KEY."
 )
 _MESH_CAD_CLARIFY_REPLY = (
-    "I can't drill a hole in a sculpted mesh like CAD. "
+    "I can't build CAD features like that on a sculpted mesh. "
     "Ask me to build a new CAD part, or keep sculpting this one."
 )
 
@@ -493,19 +549,250 @@ def _check_scale_only(text: str) -> Intent | None:
     return None
 
 
+# Undo / redo over the project's version history (app/projects.py). The whole
+# utterance must be the command, so "go back to the round one" still reaches
+# codegen as a real edit request.
+_HISTORY_NUMS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "twice": 2, "thrice": 3}
+_HISTORY_RE = re.compile(
+    r"^(?:(?:hey\s+)?percy[,.]?\s+)?"
+    r"(?:please\s+)?(?:(?:can|could) you\s+)?"
+    r"(?P<verb>undo|redo|go back|go forward|step back)"
+    r"(?:\s+(?:that|it|this|the last (?:change|edit|step)))?"
+    r"(?:\s+(?P<n>\d+|one|two|three|four|five|twice|thrice)"
+    r"(?:\s+(?:steps?|times|changes?|edits?|versions?))?)?"
+    r"(?:\s+please)?[\s.!?]*$",
+    re.I,
+)
+
+
+def _check_history(text: str) -> Intent | None:
+    """'undo', 'go back two', 'redo' — a history step, no network call."""
+    m = _HISTORY_RE.match(text.strip())
+    if not m:
+        return None
+    verb = m.group("verb").lower()
+    action = "redo" if verb in ("redo", "go forward") else "undo"
+    raw = (m.group("n") or "").lower()
+    steps = int(raw) if raw.isdigit() else _HISTORY_NUMS.get(raw, 1)
+    steps = max(1, min(steps, 20))
+    return Intent(
+        action=action,
+        params={"steps": steps},
+        reply="Undone." if action == "undo" else "Redone.",
+    )
+
+
+# Client UI mode switches ("select mode", "tape measure", "done") — a headset
+# voice shortcut for the same modes the V/T keys and HTML buttons toggle.
+# Whole-utterance match, no network; the client applies `params["mode"]`.
+_UI_MODE_MAP = {
+    "select mode": "lasso",
+    "circle mode": "lasso",
+    "tape measure": "tape",
+    "measure mode": "tape",
+    "done": "none",
+    "cancel": "none",
+    "exit mode": "none",
+    "clear selection": "none",
+}
+_UI_MODE_RE = re.compile(
+    r"^(?:(?:hey\s+)?percy[,.]?\s+)?(?:please\s+)?"
+    r"(?P<phrase>select mode|circle mode|tape measure|measure mode|exit mode|"
+    r"clear selection|done|cancel)"
+    r"(?:\s+please)?[\s.!?]*$",
+    re.I,
+)
+_UI_MODE_REPLIES = {
+    "lasso": "Select mode.",
+    "tape": "Tape measure.",
+    "none": "Okay.",
+}
+
+
+def _check_ui_mode(text: str) -> Intent | None:
+    """'select mode' / 'tape measure' / 'done' — a client UI switch, no network call."""
+    m = _UI_MODE_RE.match(text.strip())
+    if not m:
+        return None
+    mode = _UI_MODE_MAP[m.group("phrase").lower()]
+    return Intent(action="ui_mode", params={"mode": mode}, reply=_UI_MODE_REPLIES[mode])
+
+
+# Absolute size ("make it 8 cm tall"). Sculpts only: a sculpt has no real size,
+# so this sets one. CAD keeps going through codegen, where the millimetres live.
+_SIZE_UNITS: tuple[tuple[str, float, str], ...] = (
+    (r"mm|millimet(?:er|re)s?", 0.001, "millimetres"),
+    (r"cm|centimet(?:er|re)s?", 0.01, "centimetres"),
+    (r"inch(?:es)?", 0.0254, "inches"),
+    (r"m|met(?:er|re)s?", 1.0, "metres"),
+)
+_NUMBER_WORDS: dict[str, float] = {
+    w: float(i)
+    for i, w in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve "
+        "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split()
+    )
+}
+_NUMBER_WORDS.update(
+    {"thirty": 30.0, "forty": 40.0, "fifty": 50.0, "sixty": 60.0,
+     "seventy": 70.0, "eighty": 80.0, "ninety": 90.0, "hundred": 100.0}
+)
+_ABS_SIZE_RE = re.compile(
+    r"\b(?P<num>\d+(?:\.\d+)?|" + "|".join(_NUMBER_WORDS) + r")\s*"
+    r"(?P<unit>" + "|".join(p for p, _m, _w in _SIZE_UNITS) + r")\b"
+    r"(?:\s+(?P<adj>tall|high|wide|across|long|deep|thick))?",
+    re.I,
+)
+_RELATIVE_SIZE_RE = re.compile(
+    r"\b(?:bigger|smaller|larger|longer|shorter|taller|wider|deeper|thicker|"
+    r"thinner|more|less|by)\b",
+    re.I,
+)
+# The size must be about the whole model: "make it 8 cm", "resize it to 10 cm",
+# or the size phrase on its own ("12 cm wide"). "Add a 5 mm hole" is not a resize.
+_RESIZE_CUE_RE = re.compile(
+    r"\b(?:make|makes|resize|scale|size|set)\s+(?:it|this|that|the (?:model|sculpt|whole thing))\b"
+    r"|\bresize\b|\b(?:it|this|that)\s+(?:should|to)\s+be\b",
+    re.I,
+)
+_AXIS_WORDS = {
+    "tall": "height", "high": "height",
+    "wide": "width", "across": "width",
+    "deep": "depth", "thick": "depth",
+    "long": None,
+}
+
+
+def _check_absolute_size(text: str) -> Intent | None:
+    """"Make it 8 cm tall" on a sculpt → set_scale with a real target in metres."""
+    t = text.lower().strip()
+    m = _ABS_SIZE_RE.search(t)
+    if not m or _is_new_object_request(t):
+        return None
+    # "2 cm taller" is a relative amount; "make the ears 2 cm long" is a part edit.
+    if _RELATIVE_SIZE_RE.search(t) or _PART_RE.search(t):
+        return None
+    bare = t.rstrip(" .!?") == m.group(0)
+    if not bare and not _RESIZE_CUE_RE.search(t):
+        return None
+
+    raw = m.group("num")
+    value = _NUMBER_WORDS.get(raw, None)
+    if value is None:
+        value = float(raw)
+    unit = m.group("unit")
+    for pattern, to_m, word in _SIZE_UNITS:
+        if re.fullmatch(pattern, unit, re.I):
+            break
+    else:
+        return None
+    if value <= 0:
+        return None
+
+    adj = (m.group("adj") or "").lower()
+    axis = _AXIS_WORDS.get(adj) if adj else None
+    spoken = f"Made it {value:g} {word}" + (f" {adj}" if adj else "") + "."
+    return Intent(
+        action="set_scale",
+        params={"target_m": round(value * to_m, 6), "axis": axis},
+        reply=spoken,
+    )
+
+
+# Hole / loop / flat-base on an existing sculpt, routed to mesh/boolean.py
+# instead of the generic "I can't do that on a mesh" clarify. Hole and loop
+# need a point on the surface (the client's Selection); flat base does not.
+_HOLE_RE = re.compile(r"\bholes?\b", re.I)
+_LOOP_RE = re.compile(r"\b(?:hanging\s+)?loop\b|\bhanger\b|\bkeyring\s+loop\b", re.I)
+_FLAT_BASE_RE = re.compile(
+    r"\bflat(?:ten)?\s+(?:it\s+|the\s+|its\s+)?(?:base|bottom)\b|\bflat\s+base\b", re.I
+)
+_NO_SELECTION_REPLY = "Point at where you want it first."
+_MM_SIZE_RE = re.compile(
+    r"\b(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>" + "|".join(p for p, _m, _w in _SIZE_UNITS) + r")\b",
+    re.I,
+)
+
+
+def _size_mm_from_text(text: str) -> float | None:
+    """First "<number> <unit>" in the text, converted to millimetres."""
+    m = _MM_SIZE_RE.search(text)
+    if not m:
+        return None
+    for pattern, to_m, _word in _SIZE_UNITS:
+        if re.fullmatch(pattern, m.group("unit"), re.I):
+            return float(m.group("num")) * to_m * 1000.0
+    return None
+
+
+def _check_mesh_boolean(text: str, selection: Selection | None) -> Intent | None:
+    """"Drill a hole" / "add a loop" / "flatten the base" on a sculpt.
+
+    Flat base needs no selection. Hole and loop need a point on the surface;
+    without one they clarify rather than falling through to the generic
+    mesh/CAD mismatch reply.
+    """
+    t = text.lower().strip()
+    if _is_new_object_request(t):
+        return None
+    if _FLAT_BASE_RE.search(t):
+        return Intent(
+            action="mesh_boolean",
+            backend="mesh",
+            params={"op": "flat_base"},
+            reply="Flattening the base.",
+        )
+    is_hole = bool(_HOLE_RE.search(t))
+    is_loop = bool(_LOOP_RE.search(t))
+    if not (is_hole or is_loop):
+        return None
+    has_selection = bool(selection is not None and getattr(selection, "center", None))
+    if not has_selection:
+        return Intent(action="clarify", backend="mesh", reply=_NO_SELECTION_REPLY)
+    op = "hole" if is_hole else "loop"
+    params: dict[str, Any] = {
+        "op": op,
+        "center": list(selection.center),
+        "normal": list(selection.normal),
+    }
+    diameter_mm = _size_mm_from_text(t)
+    if diameter_mm is not None:
+        params["diameter_mm"] = diameter_mm
+    reply = "Drilling that hole." if op == "hole" else "Adding a loop."
+    return Intent(action="mesh_boolean", backend="mesh", params=params, reply=reply)
+
+
+def _describe_selection(selection: Selection | None) -> str | None:
+    """Spoken-free text for the codegen payload: "user pointed at X near (x,y,z) mm"."""
+    if selection is None:
+        return None
+    center = getattr(selection, "center", None)
+    if not center or len(center) != 3:
+        return None
+    parts = getattr(selection, "parts", None) or []
+    parts_txt = ", ".join(parts) if parts else "the model"
+    x, y, z = (round(float(c) * 1000.0, 1) for c in center)
+    return f"user pointed at {parts_txt} near ({x}, {y}, {z}) mm"
+
+
 def _build_user_payload(
     text: str,
     current_script: str | None = None,
     last_summary: str | None = None,
     current_color: str | None = None,
+    selection_desc: str | None = None,
 ) -> str:
     payload: dict[str, Any] = {"utterance": text}
+    if selection_desc:
+        payload["selection"] = selection_desc
     if current_script:
         payload["has_existing_model"] = True
         payload["current_script"] = current_script
         payload["instruction"] = (
             "Edit current_script unless the user asked for a different object. "
             "Keep the Assembly and named parts; change dimensions or cq.Color. "
+            "Keep the PARAMS dict: change a size by editing its PARAMS value, "
+            "add PARAMS keys for new parts, and add PARAMS if the script has none. "
             "Do not scale loop counts or range(). "
             "A part name plus a color means edit those parts, not set_material."
         )
@@ -575,6 +862,7 @@ async def _gemini_codegen(
     last_error: str | None = None,
     last_summary: str | None = None,
     current_color: str | None = None,
+    selection_desc: str | None = None,
 ) -> Intent:
     """Generate CadQuery code via Gemini API."""
 
@@ -586,7 +874,7 @@ async def _gemini_codegen(
         temperature = 0.15
     else:
         user_content = _build_user_payload(
-            text, current_script, last_summary, current_color
+            text, current_script, last_summary, current_color, selection_desc
         )
         temperature = 0.15 if current_script else 0.4
 
@@ -627,6 +915,7 @@ async def _openai_codegen(
     last_error: str | None = None,
     last_summary: str | None = None,
     current_color: str | None = None,
+    selection_desc: str | None = None,
 ) -> Intent:
     """Generate CadQuery code via OpenAI API."""
     from openai import AsyncOpenAI
@@ -638,7 +927,7 @@ async def _openai_codegen(
         temperature = 0.15
     else:
         user_content = _build_user_payload(
-            text, current_script, last_summary, current_color
+            text, current_script, last_summary, current_color, selection_desc
         )
         temperature = 0.15 if current_script else 0.4
 
@@ -819,6 +1108,7 @@ async def generate_code(
     last_error: str | None = None,
     last_summary: str | None = None,
     current_color: str | None = None,
+    selection_desc: str | None = None,
 ) -> Intent:
     """Generate CadQuery code from natural language using LLM."""
     kwargs = {
@@ -828,6 +1118,7 @@ async def generate_code(
         "last_error": last_error,
         "last_summary": last_summary,
         "current_color": current_color,
+        "selection_desc": selection_desc,
     }
     if settings.gemini_api_key:
         try:
@@ -887,6 +1178,7 @@ async def parse_intent(
     current_color: str | None = None,
     last_backend: str | None = None,
     last_mesh_prompt: str | None = None,
+    selection: Selection | None = None,
 ) -> tuple[Intent, float]:
     """
     Parse user utterance into Intent (CadQuery script or mesh prompt).
@@ -897,11 +1189,27 @@ async def parse_intent(
     3. Fast path: named color only on CAD sessions
     4. Mesh: skip sandbox codegen. CAD: LLM script, new object drops current_script.
 
+    `selection` is what the client last pointed at (interaction/selection.js).
+    On a mesh session it can turn "drill a hole" into a mesh_boolean edit
+    instead of a clarify; on a CAD session it rides along in the codegen
+    payload as a hint of which part the user means.
+
     Returns (Intent, latency_ms).
     """
     t0 = time.perf_counter()
     cleaned = _normalize_transcript(text)
     logger.info("Intent parsing: %r", cleaned)
+
+    # Undo / redo sits above every other rung: it never needs the network.
+    history_intent = _check_history(cleaned)
+    if history_intent:
+        logger.info("Fast path: %s x%d", history_intent.action, history_intent.params["steps"])
+        return history_intent, (time.perf_counter() - t0) * 1000
+
+    ui_mode_intent = _check_ui_mode(cleaned)
+    if ui_mode_intent:
+        logger.info("Fast path: ui_mode %s", ui_mode_intent.params["mode"])
+        return ui_mode_intent, (time.perf_counter() - t0) * 1000
 
     if is_photo_search(cleaned):
         query = photo_query(cleaned)
@@ -932,6 +1240,20 @@ async def parse_intent(
     logger.info("Router → %s (session=%s new=%s)", routed, session_backend, is_new)
 
     if session_backend == "mesh" and not is_new:
+        # Above clarify_mesh: hole / loop / flat base are deterministic booleans,
+        # not a mismatch with CAD-only vocabulary.
+        boolean_intent = _check_mesh_boolean(cleaned, selection)
+        if boolean_intent:
+            logger.info(
+                "Fast path: mesh boolean %s", boolean_intent.params.get("op") or boolean_intent.action
+            )
+            return boolean_intent, (time.perf_counter() - t0) * 1000
+        # Above clarify_mesh: "30 mm deep" contains a CAD cue but is only a resize.
+        size_intent = _check_absolute_size(cleaned)
+        if size_intent:
+            size_intent.backend = "mesh"
+            logger.info("Fast path: absolute size %.3f m", size_intent.params["target_m"])
+            return size_intent, (time.perf_counter() - t0) * 1000
         scale_intent = _check_scale_only(cleaned)
         if scale_intent:
             scale_intent.backend = "mesh"
@@ -971,6 +1293,7 @@ async def parse_intent(
         current_script=script_for_llm,
         last_summary=last_summary if script_for_llm else None,
         current_color=current_color or (current_params or {}).get("color"),
+        selection_desc=_describe_selection(selection),
     )
     final = choose_backend(
         cleaned,
