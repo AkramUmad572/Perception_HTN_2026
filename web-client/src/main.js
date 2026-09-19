@@ -418,9 +418,15 @@ function refreshDimensions() {
 }
 
 function applyDisplaySize(obj, displaySizeM) {
+  // Measure detached: once the model sits in modelRoot (placed, grabbed,
+  // zoomed), world bounds include modelRoot's transform and would push the
+  // model off-centre on a voice resize.
+  const parent = obj.parent;
+  if (parent) parent.remove(obj);
   obj.scale.setScalar(displaySizeM / modelBaseMaxDim);
   const box = new THREE.Box3().setFromObject(obj);
   obj.position.sub(box.getCenter(new THREE.Vector3()));
+  if (parent) parent.add(obj);
 }
 
 async function setModelFromResponse(data) {
