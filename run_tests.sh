@@ -9,11 +9,36 @@
 
 set -e
 
+cd "$(dirname "$0")"
+
+# The backend deps (pydantic, trimesh, manifold3d...) live in the project venv.
+# Bare `python3` is usually a system interpreter without them, which makes every
+# backend suite "fail" with ModuleNotFoundError. Prefer the venv, and say so
+# loudly if the deps are missing rather than reporting phantom test failures.
+if [ -n "$VIRTUAL_ENV" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    PY="$VIRTUAL_ENV/bin/python"
+elif [ -x ".venv/bin/python" ]; then
+    PY=".venv/bin/python"
+elif [ -x "venv/bin/python" ]; then
+    PY="venv/bin/python"
+else
+    PY="$(command -v python3)"
+fi
+PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")"
+
 echo "========================================"
 echo "RUNNING ALL PERCY/QUEST TESTS"
 echo "========================================"
+echo "python: $PY ($("$PY" -V 2>&1))"
 
-cd "$(dirname "$0")"
+if ! "$PY" -c "import pydantic, pydantic_settings" >/dev/null 2>&1; then
+    echo ""
+    echo "ERROR: backend dependencies are missing from $PY."
+    echo "       Create the venv first, then re-run:"
+    echo "         python3 -m venv .venv"
+    echo "         .venv/bin/pip install -r backend/requirements.txt"
+    exit 2
+fi
 
 TOTAL_PASS=0
 TOTAL_FAIL=0
@@ -23,7 +48,7 @@ echo ""
 echo ">>> Running Sandbox Tests..."
 echo ""
 cd backend
-if python3 -m cad.test_sandbox; then
+if "$PY" -m cad.test_sandbox; then
     echo "Sandbox tests: PASSED"
 else
     echo "Sandbox tests: FAILED"
@@ -36,7 +61,7 @@ echo ""
 echo ">>> Running CAD PARAMS Tests..."
 echo ""
 cd backend
-if python3 -m cad.test_params; then
+if "$PY" -m cad.test_params; then
     echo "CAD PARAMS tests: PASSED"
 else
     echo "CAD PARAMS tests: FAILED"
@@ -49,7 +74,7 @@ echo ""
 echo ">>> Running Speech/STT Tests..."
 echo ""
 cd backend
-if python3 -m voice.test_speech; then
+if "$PY" -m voice.test_speech; then
     echo "Speech tests: PASSED"
 else
     echo "Speech tests: FAILED"
@@ -62,7 +87,7 @@ echo ""
 echo ">>> Running Pipeline Tests..."
 echo ""
 cd backend
-if python3 -m app.test_pipeline; then
+if "$PY" -m app.test_pipeline; then
     echo "Pipeline tests: PASSED"
 else
     echo "Pipeline tests: FAILED"
@@ -75,7 +100,7 @@ echo ""
 echo ">>> Running Intent Tests..."
 echo ""
 cd backend
-if python3 -m ai.test_intent; then
+if "$PY" -m ai.test_intent; then
     echo "Intent tests: PASSED"
 else
     echo "Intent tests: FAILED"
@@ -88,7 +113,7 @@ echo ""
 echo ">>> Running Projects Tests..."
 echo ""
 cd backend
-if python3 -m app.test_projects; then
+if "$PY" -m app.test_projects; then
     echo "Projects tests: PASSED"
 else
     echo "Projects tests: FAILED"
@@ -101,7 +126,7 @@ echo ""
 echo ">>> Running Mesh Boolean Tests..."
 echo ""
 cd backend
-if python3 -m mesh.test_boolean; then
+if "$PY" -m mesh.test_boolean; then
     echo "Mesh boolean tests: PASSED"
 else
     echo "Mesh boolean tests: FAILED"
@@ -141,6 +166,23 @@ else
     echo "Interaction tests: FAILED"
     TOTAL_FAIL=$((TOTAL_FAIL + 1))
 fi
+
+# Test 7: suites that live in the tree but were never wired into this runner,
+# plus the HTTP-surface regression tests.
+for M in mesh.test_cleanup mesh.test_factory mesh.test_hf_space \
+         mesh.test_meshy mesh.test_three_ws photos.test_drive app.test_api; do
+    echo ""
+    echo ">>> Running $M..."
+    echo ""
+    cd backend
+    if "$PY" -m $M; then
+        echo "$M: PASSED"
+    else
+        echo "$M: FAILED"
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
+    cd ..
+done
 
 # Final summary
 echo ""

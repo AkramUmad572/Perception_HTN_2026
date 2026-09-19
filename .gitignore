@@ -25,6 +25,8 @@ backend/storage/glb/*
 backend/storage/audio/*
 backend/storage/ref/*
 backend/storage/sessions.json
+# Per-object version history written at runtime by app/projects.py
+backend/storage/projects/
 !backend/storage/glb/.gitkeep
 !backend/storage/audio/.gitkeep
 !backend/storage/ref/.gitkeep
