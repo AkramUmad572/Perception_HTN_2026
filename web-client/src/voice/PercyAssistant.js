@@ -307,6 +307,27 @@ export class PercyAssistant {
     }
   }
 
+  /**
+   * Two-hand-stretch release: resize the project's real dimensions by
+   * `factor`. Silent on purpose, like postParamUpdate — this fires once per
+   * gesture, not on every frame of the stretch.
+   */
+  async postResize(projectId, factor) {
+    try {
+      const result = await this._postJson(
+        `${API_BASE}/api/projects/${projectId}/resize`,
+        { factor, session_id: SESSION_ID },
+        30000
+      );
+      await this._handleResponse(result);
+      return result;
+    } catch (e) {
+      console.error("[Percy] Resize failed:", e);
+      this.onStatusMessage(`Error: ${e.message}`, false);
+      return null;
+    }
+  }
+
   async _awaitJob(jobId) {
     const url = `${API_BASE}/api/jobs/${jobId}?session_id=${SESSION_ID}`;
     const deadline = Date.now() + JOB_MAX_MS;
