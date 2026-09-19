@@ -152,6 +152,49 @@ def test_prune():
     return t
 
 
+# ============================================================================
+# Task 3: undo / redo / saved_to_drive
+# ============================================================================
+
+def test_undo_redo():
+    print("\n=== Test: undo / redo ===")
+    from app import projects
+
+    s, root = _tmp_settings()
+    t = (0, 0)
+    try:
+        pid = projects.create_project(s, "cad", _glb(s.glb_dir, "a.glb"), script="S1").project_id
+        projects.append_version(s, pid, _glb(s.glb_dir, "b.glb"), script="S2")
+        projects.append_version(s, pid, _glb(s.glb_dir, "c.glb"), script="S3")
+
+        v = projects.undo(s, pid)
+        t = _add(t, _check("undo -> v2", v is not None and v.version == 2 and v.script == "S2"))
+        t = _add(t, _check("current follows undo", projects.current_version(s, pid).version == 2))
+        v = projects.undo(s, pid, steps=5)
+        t = _add(t, _check("undo clamps to v1", v is not None and v.version == 1))
+        t = _add(t, _check("undo at v1 -> None", projects.undo(s, pid) is None))
+        v = projects.redo(s, pid, steps=2)
+        t = _add(t, _check("redo 2 -> v3", v is not None and v.version == 3))
+        t = _add(t, _check("redo at end -> None", projects.redo(s, pid) is None))
+
+        projects.undo(s, pid)
+        v4 = projects.append_version(s, pid, _glb(s.glb_dir, "d.glb"), op="hand_edit")
+        nums = [x.version for x in projects.load_info(s, pid)["versions"]]
+        t = _add(t, _check("number never reused", v4.version == 4 and v4.parent == 2, v4.version))
+        t = _add(t, _check("redo tail dropped", nums == [1, 2, 4], nums))
+        t = _add(t, _check("dropped file deleted", not (s.projects_dir / pid / "v3.glb").exists()))
+        t = _add(t, _check("no redo after new edit", projects.redo(s, pid) is None))
+
+        t = _add(t, _check("unknown undo -> None", projects.undo(s, "nope") is None))
+        projects.mark_saved_to_drive(s, pid)
+        t = _add(t, _check("saved_to_drive set", projects.load_info(s, pid)["saved_to_drive"] is True))
+        projects.mark_saved_to_drive(s, "nope")  # must not raise
+        t = _add(t, _check("mark unknown is a no-op", True))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return t
+
+
 def run_all_tests():
     print("=" * 60)
     print("PROJECT / VERSION TESTS")
@@ -180,6 +223,7 @@ TESTS = [
     test_models,
     test_create_and_append,
     test_prune,
+    test_undo_redo,
 ]
 
 

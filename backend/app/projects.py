@@ -212,3 +212,38 @@ def prune(settings: Any, project_id: str, keep: int = MAX_VERSIONS) -> None:
             (pdir / f"v{v.version}.glb").unlink(missing_ok=True)
     info["versions"] = [v for v in versions if v.version in kept_nums]
     _write_info(settings, project_id, info)
+
+
+def _step(settings: Any, project_id: str, delta: int) -> VersionInfo | None:
+    """Move the current pointer through the kept versions; None if it cannot move."""
+    info = load_info(settings, project_id)
+    if info is None:
+        return None
+    versions: list[VersionInfo] = info["versions"]
+    idx = _index_of(versions, info["current"])
+    target = max(0, min(len(versions) - 1, idx + delta))
+    if target == idx:
+        return None
+    info["current"] = versions[target].version
+    _write_info(settings, project_id, info)
+    return versions[target]
+
+
+def undo(settings: Any, project_id: str, steps: int = 1) -> VersionInfo | None:
+    """Step back (clamped at the oldest kept version). None if nothing to undo."""
+    return _step(settings, project_id, -max(1, int(steps)))
+
+
+def redo(settings: Any, project_id: str, steps: int = 1) -> VersionInfo | None:
+    """Step forward (clamped at the newest). None if nothing to redo."""
+    return _step(settings, project_id, max(1, int(steps)))
+
+
+def mark_saved_to_drive(settings: Any, project_id: str) -> None:
+    """Exempt a project from TTL cleanup. Unknown projects are ignored."""
+    info = load_info(settings, project_id)
+    if info is None:
+        logger.warning("mark_saved_to_drive: unknown project %s", project_id)
+        return
+    info["saved_to_drive"] = True
+    _write_info(settings, project_id, info)
