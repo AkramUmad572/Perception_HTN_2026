@@ -63,11 +63,11 @@ Prototype findings (verified in scratch before writing this plan):
 
 **Produces:** `BooleanError`, `load_mesh`, `export_glb`, `_transfer_colors(dst, src) -> dst`, and test helpers `_textured_box_glb(dest)` (a unit cube: red where x<0, blue where x>0) and `_is_speakable(msg)`.
 
-- [ ] **Step 1: Write the failing test.** Tests: `test_load_bakes_texture` (loads the textured GLB, then checks vertex kind, that x<-0.1 is red and x>0.1 is blue, and volume≈1); `test_load_flattens_scene` (two boxes as separate nodes, one translated, come out as one mesh with the right bounds); `test_export_roundtrip_keeps_colors`; `test_load_missing_file_speakable`. The runner prints `TOTAL`.
-- [ ] **Step 2: Run** `cd backend && python -m mesh.test_boolean`. It should fail with an ImportError.
-- [ ] **Step 3: Implement.** `load_mesh`: `trimesh.load(path, force=None)`. Wrap a bare Trimesh in a Scene, then `scene.dump()` (a list of transformed geometries). For each Trimesh, `visual.to_color()` → `vertex_colors`, then build a `Trimesh(v, f, vertex_colors=c, process=False)`. Concatenate the pieces. Raise `BooleanError("I couldn't open that model to edit it.")` on a load failure or when there's no geometry. `export_glb`: `dest.write_bytes(trimesh.exchange.gltf.export_glb(trimesh.Scene(mesh)))`. `_transfer_colors`: build a cKDTree on the source vertices, query the destination vertices, and index into the source colours.
-- [ ] **Step 4: Run it and confirm it passes.** Add `manifold3d` and `scipy` to requirements, and add the runner block to `run_tests.sh`.
-- [ ] **Step 5: Commit** with the message `Add mesh boolean module skeleton with texture-to-vertex-colour loading`.
+- [x] **Step 1: Write the failing test.** Tests: `test_load_bakes_texture` (loads the textured GLB, then checks vertex kind, that x<-0.1 is red and x>0.1 is blue, and volume≈1); `test_load_flattens_scene` (two boxes as separate nodes, one translated, come out as one mesh with the right bounds); `test_export_roundtrip_keeps_colors`; `test_load_missing_file_speakable`. The runner prints `TOTAL`.
+- [x] **Step 2: Run** `cd backend && python -m mesh.test_boolean`. It should fail with an ImportError.
+- [x] **Step 3: Implement.** `load_mesh`: `trimesh.load(path, force=None)`. Wrap a bare Trimesh in a Scene, then `scene.dump()` (a list of transformed geometries). For each Trimesh, `visual.to_color()` → `vertex_colors`, then build a `Trimesh(v, f, vertex_colors=c, process=False)`. Concatenate the pieces. Raise `BooleanError("I couldn't open that model to edit it.")` on a load failure or when there's no geometry. `export_glb`: `dest.write_bytes(trimesh.exchange.gltf.export_glb(trimesh.Scene(mesh)))`. `_transfer_colors`: build a cKDTree on the source vertices, query the destination vertices, and index into the source colours.
+- [x] **Step 4: Run it and confirm it passes.** Add `manifold3d` and `scipy` to requirements, and add the runner block to `run_tests.sh`.
+- [x] **Step 5: Commit** with the message `Add mesh boolean module skeleton with texture-to-vertex-colour loading`.
 
 ### Task 2: `repair`
 
@@ -82,11 +82,11 @@ Ladder (stop at the first rung where `_solid(m)` is true, meaning `m.is_watertig
 
 If none of these produces a solid, raise `BooleanError("This sculpt has gaps I couldn't close, so I can't cut into it. The model is unchanged.")`. An empty mesh raises `BooleanError("There's no model to edit.")`. Negative volume after `fix_normals` is corrected with `invert()`.
 
-- [ ] **Step 1: Failing tests.** `test_repair_watertight_passthrough` (volume unchanged); `test_repair_small_hole` (3 faces removed from an icosphere); `test_repair_big_hole` (the cap y>0.7 removed); `test_repair_scattered_holes` (3% random faces removed, seed 0); `test_repair_split_seam` (a box with unmerged vertices, each face its own vertices); `test_repair_debris` (a sphere plus an open lone triangle far away); `test_repair_keeps_colors` (the textured box); `test_repair_hopeless_raises_speakable` (a flat open square of 2 triangles gives zero volume, so `BooleanError`, and `_is_speakable`).
-- [ ] **Step 2: Run** and confirm they fail with an AttributeError or ImportError on `repair`.
-- [ ] **Step 3: Implement** the ladder above.
-- [ ] **Step 4: Run** and confirm all pass.
-- [ ] **Step 5: Commit** with the message `Add watertight repair ladder for mesh booleans`.
+- [x] **Step 1: Failing tests.** `test_repair_watertight_passthrough` (volume unchanged); `test_repair_small_hole` (3 faces removed from an icosphere); `test_repair_big_hole` (the cap y>0.7 removed); `test_repair_scattered_holes` (3% random faces removed, seed 0); `test_repair_split_seam` (a box with unmerged vertices, each face its own vertices); `test_repair_debris` (a sphere plus an open lone triangle far away); `test_repair_keeps_colors` (the textured box); `test_repair_hopeless_raises_speakable` (a flat open square of 2 triangles gives zero volume, so `BooleanError`, and `_is_speakable`).
+- [x] **Step 2: Run** and confirm they fail with an AttributeError or ImportError on `repair`.
+- [x] **Step 3: Implement** the ladder above.
+- [x] **Step 4: Run** and confirm all pass.
+- [x] **Step 5: Commit** with the message `Add watertight repair ladder for mesh booleans`.
 
 ### Task 3: `drill_hole`
 
@@ -106,11 +106,11 @@ The mesh is repaired, then `difference(cutter, engine="manifold")`. Validation e
 
 On success, the result is re-coloured via `_transfer_colors(result, repaired)`.
 
-- [ ] **Step 1: Failing tests.** Through hole on an icosphere: watertight, volume drops by about π r² × chord (loose bounds). Blind hole: volume drops less than a through hole of the same diameter. Hole in the repaired big-hole sphere is watertight. Textured box with a 0.2-unit hole at x=-0.25 along -Y: vertices with x<-0.1 are all red and x>0.1 all blue; the export/load round-trip keeps them; no vertex is grey. A miss (centre far away) raises a speakable error. Bad diameter or units raise speakable errors. A `units_per_mm` conversion check: with `units_per_mm=0.01` and `diameter_mm=20`, the hole radius is 0.1 model units (measure the hole wall vertices' distance from the axis, ≈0.1).
-- [ ] **Step 2: Run** and confirm they fail.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** and confirm they pass.
-- [ ] **Step 5: Commit** with the message `Add drill_hole boolean with colour transfer`.
+- [x] **Step 1: Failing tests.** Through hole on an icosphere: watertight, volume drops by about π r² × chord (loose bounds). Blind hole: volume drops less than a through hole of the same diameter. Hole in the repaired big-hole sphere is watertight. Textured box with a 0.2-unit hole at x=-0.25 along -Y: vertices with x<-0.1 are all red and x>0.1 all blue; the export/load round-trip keeps them; no vertex is grey. A miss (centre far away) raises a speakable error. Bad diameter or units raise speakable errors. A `units_per_mm` conversion check: with `units_per_mm=0.01` and `diameter_mm=20`, the hole radius is 0.1 model units (measure the hole wall vertices' distance from the axis, ≈0.1).
+- [x] **Step 2: Run** and confirm they fail.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** and confirm they pass.
+- [x] **Step 5: Commit** with the message `Add drill_hole boolean with colour transfer`.
 
 ### Task 4: `add_loop`
 
@@ -118,11 +118,11 @@ On success, the result is re-coloured via `_transfer_colors(result, repaired)`.
 
 `trimesh.creation.annulus(r_min=hole_r, r_max=outer_r, height=thickness)` has its axis along Z. Rotate Z onto an `axis` that is perpendicular to `normal`: take `cross(normal, up)` with up = +Y, falling back to +X when that is parallel. Translate to `center + normal * (hole_r + (outer_r - hole_r) / 2)`. That puts the ring's bottom half a wall's depth inside the surface and its hole fully outside. Then `union(engine="manifold")`. Validation: `hole_d_mm >= outer_d_mm` gives "The loop's hole has to be smaller than the loop." Non-positive sizes give "The loop needs a size bigger than zero." Units, the normal, and the boolean failure use the same messages as the hole. Attachment check: `result.volume < repaired.volume + ring.volume - 1e-9 * scale` (they must overlap), otherwise "That spot missed the model, so the loop would float in the air." Colours come via `_transfer_colors`.
 
-- [ ] **Step 1: Failing tests.** A loop on the top of an icosphere (centre (0,1,0), normal +Y) is watertight with a bigger volume, one body (`len(result.split(only_watertight=False)) == 1`), max y above the sphere top (> 1.0) and below 1 + outer_d (loop height bound). A loop away from the model raises. `hole >= outer` raises. Textured box: the loop on top at x=-0.3 takes red.
-- [ ] **Step 2: Run** and confirm they fail.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** and confirm they pass.
-- [ ] **Step 5: Commit** with the message `Add add_loop boolean`.
+- [x] **Step 1: Failing tests.** A loop on the top of an icosphere (centre (0,1,0), normal +Y) is watertight with a bigger volume, one body (`len(result.split(only_watertight=False)) == 1`), max y above the sphere top (> 1.0) and below 1 + outer_d (loop height bound). A loop away from the model raises. `hole >= outer` raises. Textured box: the loop on top at x=-0.3 takes red.
+- [x] **Step 2: Run** and confirm they fail.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** and confirm they pass.
+- [x] **Step 5: Commit** with the message `Add add_loop boolean`.
 
 ### Task 5: `flatten_base`
 
@@ -130,14 +130,14 @@ On success, the result is re-coloured via `_transfer_colors(result, repaired)`.
 
 The cut plane is `y_cut = ymin + cut_fraction * height`. The cutter is a box spanning x and z at 3× the extents around the centre, from `ymin - height` up to `y_cut`. `difference(engine="manifold")`. Validation: `not 0 < cut_fraction < 0.5` gives "I can only trim a small slice off the bottom." Boolean failure and an empty result reuse the cut message. Colours come via `_transfer_colors`.
 
-- [ ] **Step 1: Failing tests.** For an icosphere: watertight, a smaller volume, `bounds[0][1] ≈ ymin + 0.05*h` (tol 1e-6), a flat-bottom check (the faces at min y have normals ≈ -Y and a total area > 0). Bad fraction raises a speakable error. Textured box: flattening keeps red/blue on both sides.
-- [ ] **Step 2: Run** and confirm they fail.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** and confirm they pass.
-- [ ] **Step 5: Commit** with the message `Add flatten_base boolean`.
+- [x] **Step 1: Failing tests.** For an icosphere: watertight, a smaller volume, `bounds[0][1] ≈ ymin + 0.05*h` (tol 1e-6), a flat-bottom check (the faces at min y have normals ≈ -Y and a total area > 0). Bad fraction raises a speakable error. Textured box: flattening keeps red/blue on both sides.
+- [x] **Step 2: Run** and confirm they fail.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** and confirm they pass.
+- [x] **Step 5: Commit** with the message `Add flatten_base boolean`.
 
 ### Task 6: Docs and full suite
 
-- [ ] Add a "Boolean features (mesh/boolean.py)" section to `/Users/dimural/Perception_HTN_2026/ai-docs/05-mesh-lane.md` covering the interface, conventions, the repair ladder, what it can't repair, and colour transfer. Note that it is not wired yet (WS-G).
-- [ ] Run `PATH=/Users/dimural/Perception_HTN_2026/.venv/bin:$PATH ./run_tests.sh` and confirm it's green.
-- [ ] Commit any final test or runner fixes. The ai-docs file is git-excluded, so it doesn't go in a commit.
+- [x] Add a "Boolean features (mesh/boolean.py)" section to `/Users/dimural/Perception_HTN_2026/ai-docs/05-mesh-lane.md` covering the interface, conventions, the repair ladder, what it can't repair, and colour transfer. Note that it is not wired yet (WS-G).
+- [x] Run `PATH=/Users/dimural/Perception_HTN_2026/.venv/bin:$PATH ./run_tests.sh` and confirm it's green.
+- [x] Commit any final test or runner fixes. The ai-docs file is git-excluded, so it doesn't go in a commit.
