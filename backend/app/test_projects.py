@@ -195,6 +195,75 @@ def test_undo_redo():
     return t
 
 
+# ============================================================================
+# Task 4: cleanup
+# ============================================================================
+
+def test_cleanup():
+    print("\n=== Test: cleanup TTLs ===")
+    import os
+    import time
+    from app import projects
+
+    s, root = _tmp_settings()
+    t = (0, 0)
+    try:
+        now = time.time()
+
+        def aged(path, age_s):
+            path.write_bytes(b"x")
+            os.utime(path, (now - age_s, now - age_s))
+            return path
+
+        old_audio = aged(s.audio_dir / "old.mp3", 2 * 3600)
+        new_audio = aged(s.audio_dir / "new.mp3", 600)
+        keep_dot = aged(s.audio_dir / ".gitkeep", 30 * 86400)
+        old_ref = aged(s.ref_dir / "old.png", 25 * 3600)
+        new_ref = aged(s.ref_dir / "new.png", 3600)
+
+        a = projects.create_project(s, "mesh", _glb(s.glb_dir, "a.glb")).project_id
+        b = projects.create_project(s, "mesh", _glb(s.glb_dir, "b.glb")).project_id
+        projects.mark_saved_to_drive(s, b)
+
+        fresh = projects.cleanup(s, now=time.time())
+        t = _add(t, _check("fresh projects kept", fresh["projects"] == 0, fresh))
+
+        counts = projects.cleanup(s, now=time.time() + 8 * 86400)
+        # Everything in audio/ref is "old" relative to +8 days, so re-check
+        # the per-TTL behaviour with the real clock instead.
+        t = _add(t, _check("old project removed", not (s.projects_dir / a).exists()))
+        t = _add(t, _check("saved_to_drive project kept", (s.projects_dir / b).exists()))
+        t = _add(t, _check("project count", counts["projects"] == 1, counts))
+        t = _add(t, _check("dot-files kept", keep_dot.exists()))
+
+        # TTLs for audio / ref at the real clock.
+        s2, root2 = _tmp_settings()
+        try:
+            o_a = aged(s2.audio_dir / "old.mp3", 2 * 3600)
+            n_a = aged(s2.audio_dir / "new.mp3", 600)
+            o_r = aged(s2.ref_dir / "old.png", 25 * 3600)
+            n_r = aged(s2.ref_dir / "new.png", 3600)
+            c2 = projects.cleanup(s2, now=now)
+            t = _add(t, _check("audio > 1 h deleted", not o_a.exists() and n_a.exists()))
+            t = _add(t, _check("ref > 24 h deleted", not o_r.exists() and n_r.exists()))
+            t = _add(t, _check(
+                "counts per kind",
+                c2 == {"audio": 1, "ref": 1, "projects": 0},
+                c2,
+            ))
+        finally:
+            shutil.rmtree(root2, ignore_errors=True)
+
+        missing = SimpleNamespace(
+            projects_dir=root / "nope1", audio_dir=root / "nope2", ref_dir=root / "nope3"
+        )
+        t = _add(t, _check("missing dirs do not raise", projects.cleanup(missing)["audio"] == 0))
+        del old_audio, new_audio, old_ref, new_ref
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return t
+
+
 def run_all_tests():
     print("=" * 60)
     print("PROJECT / VERSION TESTS")
@@ -224,6 +293,7 @@ TESTS = [
     test_create_and_append,
     test_prune,
     test_undo_redo,
+    test_cleanup,
 ]
 
 

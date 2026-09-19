@@ -247,3 +247,52 @@ def mark_saved_to_drive(settings: Any, project_id: str) -> None:
         return
     info["saved_to_drive"] = True
     _write_info(settings, project_id, info)
+
+
+def _sweep_files(directory: Path, ttl_s: float, now: float) -> int:
+    """Delete plain files older than ttl_s by mtime. Dot-files are left alone."""
+    removed = 0
+    try:
+        entries = list(Path(directory).iterdir())
+    except FileNotFoundError:
+        return 0
+    for path in entries:
+        try:
+            if path.name.startswith(".") or not path.is_file():
+                continue
+            if now - path.stat().st_mtime > ttl_s:
+                path.unlink(missing_ok=True)
+                removed += 1
+        except Exception as exc:
+            logger.warning("Cleanup skipped %s: %s", path.name, exc)
+    return removed
+
+
+def cleanup(settings: Any, now: float | None = None) -> dict[str, int]:
+    """
+    Delete spoken replies older than 1 h, staged reference photos older than
+    24 h, and projects untouched for 7 days unless marked saved_to_drive.
+    Returns how many entries were deleted per kind. Never raises.
+    """
+    now = time.time() if now is None else float(now)
+    counts = {
+        "audio": _sweep_files(settings.audio_dir, AUDIO_TTL_S, now),
+        "ref": _sweep_files(settings.ref_dir, REF_TTL_S, now),
+        "projects": 0,
+    }
+    try:
+        project_dirs = [p for p in Path(settings.projects_dir).iterdir() if p.is_dir()]
+    except FileNotFoundError:
+        project_dirs = []
+    for pdir in project_dirs:
+        try:
+            info = load_info(settings, pdir.name)
+            if info is not None and info.get("saved_to_drive"):
+                continue
+            touched = (info or {}).get("touched_at") or pdir.stat().st_mtime
+            if now - float(touched) > PROJECT_TTL_S:
+                shutil.rmtree(pdir, ignore_errors=True)
+                counts["projects"] += 1
+        except Exception as exc:
+            logger.warning("Cleanup skipped project %s: %s", pdir.name, exc)
+    return counts
