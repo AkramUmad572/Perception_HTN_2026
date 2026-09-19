@@ -378,6 +378,52 @@ def test_loop_keeps_texture_colors(tmp: Path) -> tuple[int, int]:
     return p + p2, f + f2
 
 
+# ---------------------------------------------------------------- flatten_base
+
+
+def test_flatten_sphere(tmp: Path) -> tuple[int, int]:
+    print("\nflatten_base trims the bottom of a sphere flat")
+    s = _sphere()
+    lo, hi = s.bounds[0][1], s.bounds[1][1]
+    out = boolean.flatten_base(s)
+    p, f = _check("watertight and smaller", out.is_watertight and out.volume < s.volume)
+    want = lo + 0.05 * (hi - lo)
+    p2, f2 = _check("bottom at the cut plane", abs(out.bounds[0][1] - want) < 1e-5,
+                    f"bottom={out.bounds[0][1]:.6f} want={want:.6f}")
+    bottom = np.abs(out.triangles_center[:, 1] - want) < 1e-5
+    flat = out.face_normals[bottom]
+    p3, f3 = _check(
+        "flat face points down with real area",
+        bottom.any() and np.allclose(flat, [0, -1, 0], atol=1e-4) and out.area_faces[bottom].sum() > 0.1,
+        f"faces={int(bottom.sum())}",
+    )
+    p4, f4 = _check("top untouched", abs(out.bounds[1][1] - hi) < 1e-6)
+    return p + p2 + p3 + p4, f + f2 + f3 + f4
+
+
+def test_flatten_errors_speakable(tmp: Path) -> tuple[int, int]:
+    print("\nflatten_base rejects silly fractions")
+    s = _sphere()
+    results = [
+        _expect_error("zero", lambda: boolean.flatten_base(s, 0)),
+        _expect_error("half", lambda: boolean.flatten_base(s, 0.5)),
+        _expect_error("nan", lambda: boolean.flatten_base(s, float("nan"))),
+    ]
+    return sum(r[0] for r in results), sum(r[1] for r in results)
+
+
+def test_flatten_keeps_texture_colors(tmp: Path) -> tuple[int, int]:
+    print("\nflatten_base keeps the textured box's colours")
+    mesh = boolean.load_mesh(_textured_box_glb(tmp / "tex.glb"))
+    out = boolean.flatten_base(mesh, 0.1)
+    p, f = _check("box shortened", abs(out.volume - 0.9) < 1e-5, f"{out.volume=}")
+    ok, why = _colors_split_by_x(out)
+    p2, f2 = _check("red/blue split survives", ok, why)
+    ok, why = _all_known_colors(out)
+    p3, f3 = _check("no foreign colours", ok, why)
+    return p + p2 + p3, f + f2 + f3
+
+
 # ---------------------------------------------------------------- runner
 
 TESTS = [
@@ -402,6 +448,9 @@ TESTS = [
     test_loop_hole_is_open,
     test_loop_errors_speakable,
     test_loop_keeps_texture_colors,
+    test_flatten_sphere,
+    test_flatten_errors_speakable,
+    test_flatten_keeps_texture_colors,
 ]
 
 

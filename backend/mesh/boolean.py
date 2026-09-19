@@ -335,6 +335,39 @@ def add_loop(
     return _transfer_colors(out, solid)
 
 
+MSG_FLATTEN_FRACTION = "I can only trim a small slice off the bottom."
+UP_AXIS = 1  # glTF is Y-up
+
+
+def flatten_base(mesh: trimesh.Trimesh, cut_fraction: float = 0.05) -> trimesh.Trimesh:
+    """
+    Slice off the lowest ``cut_fraction`` of the model's height so it stands
+    on a flat face. The result keeps its local frame (it is not re-grounded).
+    """
+    try:
+        frac = float(cut_fraction)
+    except (TypeError, ValueError) as exc:
+        raise BooleanError(MSG_FLATTEN_FRACTION) from exc
+    if not (np.isfinite(frac) and 0.0 < frac < 0.5):
+        raise BooleanError(MSG_FLATTEN_FRACTION)
+
+    solid = repair(mesh)
+    lo, hi = solid.bounds
+    height = hi[UP_AXIS] - lo[UP_AXIS]
+    cut_y = lo[UP_AXIS] + frac * height
+    extents = solid.extents * 3.0 + 1e-6
+    box_lo = lo[UP_AXIS] - height
+    size = [extents[0], cut_y - box_lo, extents[2]]
+    centre = solid.bounds.mean(axis=0)
+    centre[UP_AXIS] = (cut_y + box_lo) / 2.0
+    cutter = trimesh.creation.box(
+        extents=size, transform=trimesh.transformations.translation_matrix(centre)
+    )
+
+    out = _boolean(solid, cutter, "difference")
+    return _transfer_colors(out, solid)
+
+
 def _units(units_per_mm) -> float:
     if not _positive(units_per_mm):
         raise BooleanError(MSG_NO_SIZE)
