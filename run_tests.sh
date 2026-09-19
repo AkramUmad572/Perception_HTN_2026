@@ -31,6 +31,19 @@ else
 fi
 cd ..
 
+# Test 1b: CAD PARAMS (extract / rewrite / prompt examples)
+echo ""
+echo ">>> Running CAD PARAMS Tests..."
+echo ""
+cd backend
+if python3 -m cad.test_params; then
+    echo "CAD PARAMS tests: PASSED"
+else
+    echo "CAD PARAMS tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+cd ..
+
 # Test 2: Speech/STT tests
 echo ""
 echo ">>> Running Speech/STT Tests..."
@@ -57,6 +70,45 @@ else
 fi
 cd ..
 
+# Test 3a: Intent router tests
+echo ""
+echo ">>> Running Intent Tests..."
+echo ""
+cd backend
+if python3 -m ai.test_intent; then
+    echo "Intent tests: PASSED"
+else
+    echo "Intent tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+cd ..
+
+# Test 3b: Project / version history tests
+echo ""
+echo ">>> Running Projects Tests..."
+echo ""
+cd backend
+if python3 -m app.test_projects; then
+    echo "Projects tests: PASSED"
+else
+    echo "Projects tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+cd ..
+
+# Test 3c: Mesh boolean tests (hole / loop / flat base on sculpts)
+echo ""
+echo ">>> Running Mesh Boolean Tests..."
+echo ""
+cd backend
+if python3 -m mesh.test_boolean; then
+    echo "Mesh boolean tests: PASSED"
+else
+    echo "Mesh boolean tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+cd ..
+
 # Test 4: Client model update tests
 echo ""
 echo ">>> Running Client Model Update Tests..."
@@ -76,6 +128,17 @@ if node web-client/src/test_vad_timing.js; then
     echo "VAD timing tests: PASSED"
 else
     echo "VAD timing tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+
+# Test 6: Interaction math (two-hand, measurement, tape measure)
+echo ""
+echo ">>> Running Interaction Tests..."
+echo ""
+if node web-client/src/interaction/test_interaction.js; then
+    echo "Interaction tests: PASSED"
+else
+    echo "Interaction tests: FAILED"
     TOTAL_FAIL=$((TOTAL_FAIL + 1))
 fi
 

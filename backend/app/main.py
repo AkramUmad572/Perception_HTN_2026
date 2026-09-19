@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -13,16 +15,27 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from ai.intent import parse_intent
-from app import jobs
+from app import jobs, projects
 from app.config import get_settings
 from app.httpclient import aclose_http_client
-from app.models import CommandRequest, CommandResponse, PhotoChooseRequest, ScriptRequest
+from app.models import (
+    CommandRequest,
+    CommandResponse,
+    HistoryRequest,
+    ParamUpdateRequest,
+    PhotoChooseRequest,
+    ScriptRequest,
+    Selection,
+)
 from app.pipeline import (
     apply_intent,
+    apply_param_update,
     build_chosen_photo,
     build_from_image,
     confirm_chosen_photo,
     execute_script_direct,
+    history_step,
+    save_client_version,
 )
 from app.session import clear_session, get_session
 from mesh.refimage import isolate_subject
@@ -33,7 +46,44 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("perception_cad")
 
 settings = get_settings()
-app = FastAPI(title="Perception CAD", version="0.2.0")
+
+# Old audio replies, staged photos and abandoned projects are swept on startup
+# and then hourly (app/projects.py:cleanup has the TTLs).
+CLEANUP_INTERVAL_S = 3600
+
+
+def _parse_selection(raw: str | None) -> Selection | None:
+    """A client-sent `selection` field, or None if absent/unparseable. Never raises."""
+    if not raw:
+        return None
+    try:
+        return Selection.model_validate_json(raw)
+    except Exception as exc:
+        logger.info("Ignoring unparseable selection: %s", exc)
+        return None
+
+
+async def _cleanup_loop() -> None:
+    while True:
+        try:
+            counts = await asyncio.to_thread(projects.cleanup, settings)
+            if any(counts.values()):
+                logger.info("Storage cleanup removed %s", counts)
+        except Exception as exc:
+            logger.exception("Storage cleanup failed: %s", exc)
+        await asyncio.sleep(CLEANUP_INTERVAL_S)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    task = asyncio.create_task(_cleanup_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+app = FastAPI(title="Perception CAD", version="0.2.0", lifespan=lifespan)
 
 
 @app.on_event("shutdown")
@@ -51,6 +101,9 @@ app.add_middleware(
 app.mount("/media/glb", StaticFiles(directory=str(settings.glb_dir)), name="glb")
 app.mount("/media/audio", StaticFiles(directory=str(settings.audio_dir)), name="audio")
 app.mount("/media/ref", StaticFiles(directory=str(settings.ref_dir)), name="ref")
+app.mount(
+    "/media/projects", StaticFiles(directory=str(settings.projects_dir)), name="projects"
+)
 
 WEB_DIST = Path(__file__).resolve().parents[2] / "web-client" / "dist"
 
@@ -107,6 +160,95 @@ async def reset_session(session_id: str = "default"):
     return get_session(session_id)
 
 
+@app.get("/api/projects/{project_id}")
+async def project_info(project_id: str):
+    """Version history of one project. Read-only."""
+    try:
+        info = projects.get_project(settings, project_id)
+    except Exception as exc:
+        logger.exception("Project read failed: %s", exc)
+        info = None
+    if info is None:
+        return {"ok": False, "error": "Unknown project"}
+    return {"ok": True, **info}
+
+
+async def _history_route(project_id: str, body: HistoryRequest, direction: str) -> CommandResponse:
+    t_all = time.perf_counter()
+    session = get_session(body.session_id)
+    try:
+        result = await history_step(session, settings, project_id, direction, body.steps)
+    except Exception as exc:
+        logger.exception("%s failed: %s", direction, exc)
+        result = CommandResponse(
+            ok=False,
+            reply=f"I couldn't {direction} that.",
+            action="clarify",
+            session=session,
+            error=str(exc),
+        )
+    result.latency_ms["total_ms"] = (time.perf_counter() - t_all) * 1000
+    return result
+
+
+@app.post("/api/projects/{project_id}/undo", response_model=CommandResponse)
+async def project_undo(project_id: str, body: HistoryRequest):
+    """Step back; responds rebuilt=True with the stored version's URL."""
+    return await _history_route(project_id, body, "undo")
+
+
+@app.post("/api/projects/{project_id}/redo", response_model=CommandResponse)
+async def project_redo(project_id: str, body: HistoryRequest):
+    return await _history_route(project_id, body, "redo")
+
+
+@app.post("/api/projects/{project_id}/versions", response_model=CommandResponse)
+async def project_save_version(
+    project_id: str,
+    glb: UploadFile = File(...),
+    op: str = Form("hand_edit"),
+    summary: str | None = Form(None),
+    session_id: str = Form("default"),
+):
+    """
+    Store a client-side edit (exported GLB) as the next version.
+    Responds rebuilt=False, action="version_saved": the client already shows it.
+    """
+    session = get_session(session_id)
+    try:
+        raw = await glb.read()
+        return await save_client_version(session, settings, project_id, raw, op, summary)
+    except Exception as exc:
+        logger.exception("Version save failed: %s", exc)
+        return CommandResponse(
+            ok=False,
+            reply="That edit didn't save. Try again.",
+            action="clarify",
+            session=session,
+            error=str(exc),
+        )
+
+
+@app.post("/api/projects/{project_id}/params", response_model=CommandResponse)
+async def project_update_params(project_id: str, body: ParamUpdateRequest):
+    """
+    Rewrite named PARAMS on the project's current CAD script and rerun the
+    sandbox — no LLM. Fired on drag release from the client's dimension panel.
+    """
+    session = get_session(body.session_id)
+    try:
+        return await apply_param_update(session, settings, project_id, body.updates)
+    except Exception as exc:
+        logger.exception("Param update failed: %s", exc)
+        return CommandResponse(
+            ok=False,
+            reply="That change didn't save. Try again.",
+            action="clarify",
+            session=session,
+            error=str(exc),
+        )
+
+
 @app.post("/api/command", response_model=CommandResponse)
 async def command(body: CommandRequest):
     t_all = time.perf_counter()
@@ -121,6 +263,7 @@ async def command(body: CommandRequest):
         current_color=session.color,
         last_backend=session.last_backend,
         last_mesh_prompt=session.last_mesh_prompt,
+        selection=body.selection,
     )
     result = await apply_intent(
         intent,
@@ -330,6 +473,7 @@ async def job_status(job_id: str, session_id: str = "default"):
 async def voice(
     audio: UploadFile = File(...),
     session_id: str = Form("default"),
+    selection: str | None = Form(None),
 ):
     t_all = time.perf_counter()
     session = get_session(session_id)
@@ -368,6 +512,7 @@ async def voice(
             current_color=session.color,
             last_backend=session.last_backend,
             last_mesh_prompt=session.last_mesh_prompt,
+            selection=_parse_selection(selection),
         )
         result = await apply_intent(
             intent,

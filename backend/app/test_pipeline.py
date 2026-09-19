@@ -1119,6 +1119,274 @@ async def test_cad_generate_still_uses_sandbox():
     print("  [ok] CAD generate uses sandbox only")
     return 1, 0
 
+# ============================================================================
+# WS-A: project versions
+# ============================================================================
+
+def _version_settings():
+    """Mock settings with real temp dirs so GLBs can actually move into projects."""
+    import tempfile
+
+    root = Path(tempfile.mkdtemp(prefix="ws_a_pipe_"))
+    settings = _mock_settings()
+    settings.glb_dir = root / "glb"
+    settings.projects_dir = root / "projects"
+    settings.ref_dir = root / "ref"
+    for d in (settings.glb_dir, settings.projects_dir, settings.ref_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    return settings, root
+
+
+def _fake_executor(cfg):
+    """Stand-in for _execute_with_retry that writes a GLB like the sandbox does."""
+    counter = {"n": 0}
+
+    async def run(script, original_text, session, settings, latency, flatten_color=True):
+        counter["n"] += 1
+        model_id = f"built{counter['n']}"
+        (cfg.glb_dir / f"{model_id}.glb").write_bytes(b"glTF" + bytes(20))
+        session.template = None
+        session.params = {}
+        session.model_id = model_id
+        session.glb_url = f"/media/glb/{model_id}.glb"
+        session.last_script = script
+        session.last_backend = "cad"
+        session.last_mesh_prompt = None
+        return True, model_id, None
+
+    return run
+
+
+async def _run_cad(intent, session, settings, transcript):
+    with patch("app.pipeline._execute_with_retry", side_effect=_fake_executor_for(settings)), \
+         patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+         patch("app.pipeline.save_session"):
+        return await apply_intent(intent, session, settings, transcript=transcript)
+
+
+_EXECUTORS: dict = {}
+
+
+def _fake_executor_for(settings):
+    key = id(settings)
+    if key not in _EXECUTORS:
+        _EXECUTORS[key] = _fake_executor(settings)
+    return _EXECUTORS[key]
+
+
+def _report(name, errors):
+    if errors:
+        print(f"  [FAIL] {name}")
+        for e in errors:
+            print(f"    - {e}")
+        return 0, 1
+    print(f"  [ok] {name}")
+    return 1, 0
+
+
+async def test_builds_record_project_versions():
+    """Every rebuild lands in a project; follow-ups append, new objects start a project."""
+    import shutil
+    from app import projects
+
+    print("\n=== Test: builds record project versions ===")
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_a")
+        r1 = await _run_cad(
+            Intent(action="generate", script="S1", reply="A box."), session, settings, "build me a box"
+        )
+        pid = session.project_id
+        if not pid:
+            errors.append("session.project_id not set")
+        else:
+            if r1.model_id != f"{pid}-v1":
+                errors.append(f"model_id {r1.model_id!r} != {pid}-v1")
+            if r1.glb_url != f"/media/projects/{pid}/v1.glb":
+                errors.append(f"glb_url {r1.glb_url!r}")
+            if not (settings.projects_dir / pid / "v1.glb").is_file():
+                errors.append("v1.glb not on disk")
+            if session.version != 1 or not r1.rebuilt:
+                errors.append(f"version={session.version} rebuilt={r1.rebuilt}")
+            v1 = projects.get_version(settings, pid, 1)
+            if not v1 or v1.script != "S1" or v1.summary != "A box." or v1.op != "generate":
+                errors.append(f"v1 meta wrong: {v1}")
+
+        r2 = await _run_cad(
+            Intent(action="generate", script="S2", reply="Taller box."), session, settings, "make it taller"
+        )
+        if session.project_id != pid or r2.model_id != f"{pid}-v2":
+            errors.append(f"follow-up did not append: {session.project_id} {r2.model_id}")
+        v2 = projects.get_version(settings, pid, 2) if pid else None
+        if not v2 or v2.parent != 1 or v2.script != "S2":
+            errors.append(f"v2 meta wrong: {v2}")
+
+        r3 = await _run_cad(
+            Intent(action="set_material", params={"color": "#FF0000"}, reply="Red."),
+            session, settings, "make it red",
+        )
+        v3 = projects.get_version(settings, pid, 3) if pid else None
+        if r3.model_id != f"{pid}-v3" or not v3 or v3.op != "set_material" or v3.color != "#FF0000":
+            errors.append(f"set_material not versioned: {r3.model_id} {v3}")
+
+        await _run_cad(
+            Intent(action="generate", script="R1", reply="A ring."), session, settings, "build me a ring"
+        )
+        if session.project_id == pid or session.version != 1:
+            errors.append("new object should start a new project")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("builds record project versions", errors)
+
+
+async def test_missing_glb_keeps_legacy_url():
+    """No GLB on disk (mocked build) → nothing recorded, legacy ids untouched."""
+    print("\n=== Test: missing GLB keeps legacy url ===")
+    import shutil
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_a")
+        with patch("app.pipeline._execute_with_retry", AsyncMock(return_value=(True, "ghost", None))), \
+             patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+             patch("app.pipeline.save_session"):
+            r = await apply_intent(Intent(action="generate", script="x"), session, settings, transcript="build me a box")
+        if r.model_id != "ghost" or session.project_id is not None:
+            errors.append(f"model_id={r.model_id} project_id={session.project_id}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("missing GLB keeps legacy url", errors)
+
+
+async def test_photo_build_records_project():
+    print("\n=== Test: photo build records a mesh project ===")
+    import shutil
+    from app import projects
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_a")
+
+        async def fake_image(image_url, output_dir, **kwargs):
+            (Path(output_dir) / "photo1.glb").write_bytes(b"glTF" + bytes(20))
+            return {"ok": True, "model_id": "photo1", "textured": True, "exec_ms": 1}
+
+        with patch("app.pipeline.generate_mesh_glb_from_image", side_effect=fake_image), \
+             patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+             patch("app.pipeline.save_session"):
+            r = await build_from_image("http://x/ref.png", session, settings, prompt="a mug")
+        pid = session.project_id
+        cur = projects.current_version(settings, pid) if pid else None
+        if not cur or cur.kind != "mesh" or cur.op != "photo" or cur.mesh_prompt != "a mug":
+            errors.append(f"photo version wrong: {cur}")
+        if r.model_id != f"{pid}-v1" or r.glb_url != f"/media/projects/{pid}/v1.glb":
+            errors.append(f"response ids {r.model_id} {r.glb_url}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("photo build records a mesh project", errors)
+
+
+# ============================================================================
+# Absolute size ("make it 8 cm tall") on sculpts
+# ============================================================================
+
+async def _apply_scale(intent, session, settings):
+    with patch("app.pipeline.synthesize_speech") as mock_tts:
+        mock_tts.return_value = (None, 0.0)
+        with patch("app.pipeline.save_session"):
+            return await apply_intent(intent, session, settings)
+
+
+def _mesh_session(**kw):
+    base = dict(
+        session_id="test", last_backend="mesh", model_id="m1",
+        glb_url="/media/glb/m1.glb", base_size_m=0.2, scale=1.0,
+    )
+    base.update(kw)
+    return SessionState(**base)
+
+
+async def test_absolute_size_sets_longest_edge():
+    print("\n=== Test: absolute size sets the longest edge ===")
+    session = _mesh_session()
+    intent = Intent(action="set_scale", params={"target_m": 0.08, "axis": None},
+                    reply="Made it 8 centimetres.", backend="mesh")
+    result = await _apply_scale(intent, session, _mock_settings())
+    errors = []
+    if result.action != "set_scale":
+        errors.append(f"action {result.action!r}")
+    if result.rebuilt:
+        errors.append("must not rebuild")
+    if abs(session.scale - 0.4) > 1e-6:
+        errors.append(f"scale {session.scale}")
+    if abs((result.display_size_m or 0) - 0.08) > 1e-6:
+        errors.append(f"display_size_m {result.display_size_m}")
+    if errors:
+        print("  ✗ FAILED: " + "; ".join(errors))
+        return 0, 1
+    print("  ✓ 8 cm target → scale 0.4, display 0.08 m")
+    return 1, 0
+
+
+async def test_absolute_size_uses_axis_from_glb():
+    print("\n=== Test: absolute height reads the GLB bounds ===")
+    import tempfile
+    import trimesh
+
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = _mock_settings()
+        settings.glb_dir = Path(tmp)
+        # Width 1, height 2, depth 4: height is half the longest edge.
+        trimesh.creation.box(extents=(1.0, 2.0, 4.0)).export(str(Path(tmp) / "m1.glb"))
+        session = _mesh_session()
+        intent = Intent(action="set_scale", params={"target_m": 0.08, "axis": "height"},
+                        reply="Made it 8 centimetres tall.", backend="mesh")
+        result = await _apply_scale(intent, session, settings)
+    errors = []
+    if abs(session.scale - 0.8) > 1e-6:
+        errors.append(f"scale {session.scale}")
+    if abs((result.display_size_m or 0) - 0.16) > 1e-6:
+        errors.append(f"display_size_m {result.display_size_m}")
+    if errors:
+        print("  ✗ FAILED: " + "; ".join(errors))
+        return 0, 1
+    print("  ✓ 8 cm tall on a 1×2×4 box → longest edge 16 cm")
+    return 1, 0
+
+
+async def test_absolute_size_never_scales_cad():
+    print("\n=== Test: absolute size never display-scales CAD ===")
+    session = _mesh_session(last_backend="cad", last_script="result = None")
+    intent = Intent(action="set_scale", params={"target_m": 0.08, "axis": "height"},
+                    reply="Made it 8 centimetres tall.")
+    result = await _apply_scale(intent, session, _mock_settings())
+    if result.action == "clarify" and session.scale == 1.0 and not result.rebuilt:
+        print("  ✓ CAD refused with a spoken reason:", result.reply)
+        return 1, 0
+    print(f"  ✗ FAILED: action={result.action} scale={session.scale}")
+    return 0, 1
+
+
+async def test_absolute_size_clamps_and_says_so():
+    print("\n=== Test: absolute size beyond the display range ===")
+    session = _mesh_session()
+    intent = Intent(action="set_scale", params={"target_m": 5.0, "axis": None},
+                    reply="Made it 5 metres.", backend="mesh")
+    result = await _apply_scale(intent, session, _mock_settings())
+    ok = (
+        abs((result.display_size_m or 0) - 2.0) < 1e-6
+        and "as far as I can" in (result.reply or "")
+    )
+    if ok:
+        print("  ✓ clamped to 2 m and said so")
+        return 1, 0
+    print(f"  ✗ FAILED: display={result.display_size_m} reply={result.reply!r}")
+    return 0, 1
+
+
 def run_all_tests():
     """Run all pipeline regression tests."""
     print("=" * 60)
@@ -1205,6 +1473,43 @@ def run_all_tests():
         p, f = loop.run_until_complete(test_cad_generate_still_uses_sandbox())
         total_pass += p
         total_fail += f
+
+        # === WS-A: project versions ===
+        print("\n--- Project Version Tests ---")
+        for test in WS_A_TESTS:
+            p, f = loop.run_until_complete(test())
+            total_pass += p
+            total_fail += f
+
+        # === WS-E: CAD params wiring ===
+        print("\n--- CAD Params Tests ---")
+        for test in WS_E_TESTS:
+            p, f = loop.run_until_complete(test())
+            total_pass += p
+            total_fail += f
+
+        # === WS-FG: mesh boolean wiring ===
+        print("\n--- Mesh Boolean Wiring Tests ---")
+        for test in WS_FG_TESTS:
+            p, f = loop.run_until_complete(test())
+            total_pass += p
+            total_fail += f
+
+        p, f = loop.run_until_complete(test_absolute_size_sets_longest_edge())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_absolute_size_uses_axis_from_glb())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_absolute_size_never_scales_cad())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_absolute_size_clamps_and_says_so())
+        total_pass += p
+        total_fail += f
         
     finally:
         loop.close()
@@ -1220,6 +1525,444 @@ def run_all_tests():
     else:
         print("\n✓ ALL TESTS PASSED")
         return 0
+
+
+async def test_undo_redo_restores_session():
+    print("\n=== Test: undo/redo restore follow-up context ===")
+    import shutil
+    from app.pipeline import history_step
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_a")
+        await _run_cad(Intent(action="generate", script="S1", reply="A box."), session, settings, "build me a box")
+        await _run_cad(Intent(action="generate", script="S2", reply="Taller."), session, settings, "make it taller")
+        pid = session.project_id
+
+        r = await _run_cad(Intent(action="undo", params={"steps": 1}, reply="Undone."), session, settings, "undo")
+        if not (r.rebuilt and r.model_id == f"{pid}-v1" and r.glb_url == f"/media/projects/{pid}/v1.glb"):
+            errors.append(f"undo response {r.rebuilt} {r.model_id} {r.glb_url}")
+        if session.last_script != "S1" or session.last_summary != "A box." or session.version != 1:
+            errors.append(f"undo did not restore: {session.last_script} {session.last_summary} {session.version}")
+        if r.action != "undo" or not r.ok:
+            errors.append(f"undo action {r.action} ok={r.ok}")
+
+        again = await _run_cad(Intent(action="undo", params={"steps": 1}), session, settings, "undo")
+        if again.rebuilt or again.action != "noop" or again.reply != "Nothing to undo." or not again.ok:
+            errors.append(f"undo at v1: {again.action} {again.reply} rebuilt={again.rebuilt}")
+
+        r = await _run_cad(Intent(action="redo", params={"steps": 1}, reply="Redone."), session, settings, "redo")
+        if not r.rebuilt or r.model_id != f"{pid}-v2" or session.last_script != "S2":
+            errors.append(f"redo {r.model_id} {session.last_script}")
+
+        empty = SessionState(session_id="ws_a_empty")
+        r = await _run_cad(Intent(action="undo", params={"steps": 1}), empty, settings, "undo")
+        if r.rebuilt or r.action != "noop" or r.reply != "There's nothing to undo yet.":
+            errors.append(f"no project: {r.action} {r.reply}")
+
+        with patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+             patch("app.pipeline.save_session"):
+            r = await history_step(session, settings, "nope", "undo", 1)
+            if r.ok or r.action != "clarify":
+                errors.append(f"unknown project: ok={r.ok} action={r.action}")
+            r = await history_step(session, settings, pid, "undo", 1)
+            if not r.rebuilt or r.model_id != f"{pid}-v1":
+                errors.append(f"history_step undo {r.model_id}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("undo/redo restore follow-up context", errors)
+
+
+async def test_save_client_version():
+    print("\n=== Test: client version save ===")
+    import shutil
+    from app import projects
+    from app.pipeline import save_client_version
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_a")
+        await _run_cad(Intent(action="generate", script="S1", reply="A box."), session, settings, "build me a box")
+        await _run_cad(Intent(action="generate", script="S2", reply="Taller."), session, settings, "make it taller")
+        pid = session.project_id
+        with patch("app.pipeline.save_session"):
+            r = await save_client_version(session, settings, pid, b"glTF" + bytes(40), "hand_edit", "Moved it.")
+            if r.action != "version_saved" or r.rebuilt is not False or not r.ok:
+                errors.append(f"response {r.action} rebuilt={r.rebuilt} ok={r.ok}")
+            if r.model_id != f"{pid}-v3" or r.glb_url != f"/media/projects/{pid}/v3.glb":
+                errors.append(f"ids {r.model_id} {r.glb_url}")
+            if not (settings.projects_dir / pid / "v3.glb").is_file() or session.version != 3:
+                errors.append("v3 not stored / session not moved")
+            v3 = projects.get_version(settings, pid, 3)
+            if not v3 or v3.op != "hand_edit" or v3.script != "S2" or v3.summary != "Moved it.":
+                errors.append(f"v3 meta {v3}")
+
+            bad = await save_client_version(session, settings, pid, b"not a glb at all", "hand_edit")
+            if bad.ok or bad.action != "clarify" or projects.current_version(settings, pid).version != 3:
+                errors.append(f"bad upload accepted: {bad.action}")
+
+            odd = await save_client_version(session, settings, pid, b"glTF" + bytes(40), "rm -rf")
+            if projects.get_version(settings, pid, 4).op != "hand_edit":
+                errors.append("unknown op not normalised to hand_edit")
+            del odd
+
+            missing = await save_client_version(session, settings, "nope", b"glTF" + bytes(40), "hand_edit")
+            if missing.ok or missing.action != "clarify":
+                errors.append("unknown project accepted")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("client version save", errors)
+
+
+WS_A_TESTS = [
+    test_builds_record_project_versions,
+    test_missing_glb_keeps_legacy_url,
+    test_photo_build_records_project,
+    test_undo_redo_restores_session,
+    test_save_client_version,
+]
+
+
+# ============================================================================
+# WS-E: CAD params wiring
+# ============================================================================
+
+_PARAM_SCRIPT = (
+    'import cadquery as cq\n'
+    'PARAMS = {"width_mm": 10, "height_mm": 5}\n'
+    'result = cq.Workplane("XY").box(PARAMS["width_mm"], PARAMS["height_mm"], 2)\n'
+)
+
+
+def _fake_sandbox_exec(model_id="param_built_1"):
+    """Stand-in for cad.sandbox.execute_cadquery_script: writes a fake GLB."""
+
+    def run(script, output_dir, timeout=45.0, color="#C0C0C0", flatten_color=True):
+        (Path(output_dir) / f"{model_id}.glb").write_bytes(b"glTF" + bytes(20))
+        return {"ok": True, "model_id": model_id, "exec_ms": 1.0}
+
+    return run
+
+
+async def test_generate_records_and_returns_cad_params():
+    """A CAD build with PARAMS records them on the version and echoes them back."""
+    print("\n=== Test: generate records and returns cad_params ===")
+    import shutil
+    from app import projects
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_e")
+        r = await _run_cad(
+            Intent(action="generate", script=_PARAM_SCRIPT, reply="A box."),
+            session, settings, "build me a box",
+        )
+        want = {"width_mm": 10.0, "height_mm": 5.0}
+        if r.cad_params != want:
+            errors.append(f"response cad_params {r.cad_params}")
+        v1 = projects.get_version(settings, session.project_id, 1)
+        if not v1 or v1.params != want:
+            errors.append(f"v1.params {v1.params if v1 else None}")
+
+        no_params = await _run_cad(
+            Intent(action="generate", script="import cadquery as cq\nresult = cq.Workplane('XY').box(1,1,1)\n", reply="Plain."),
+            session, settings, "build a plain box",
+        )
+        if no_params.cad_params != {}:
+            errors.append(f"script without PARAMS should give {{}}: {no_params.cad_params}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("generate records and returns cad_params", errors)
+
+
+async def test_param_update_rebuilds_and_versions():
+    """A drag-release param update reruns the sandbox and appends a param_edit version."""
+    print("\n=== Test: param update rebuilds and records a version ===")
+    import shutil
+    from app import projects
+    from app.pipeline import apply_param_update
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_e")
+        await _run_cad(
+            Intent(action="generate", script=_PARAM_SCRIPT, reply="A box."),
+            session, settings, "build me a box",
+        )
+        pid = session.project_id
+
+        with patch("app.pipeline.execute_cadquery_script", side_effect=_fake_sandbox_exec()), \
+             patch("app.pipeline.save_session"):
+            r = await apply_param_update(session, settings, pid, {"width_mm": 20})
+
+        if not r.ok or not r.rebuilt or r.action != "param_edit":
+            errors.append(f"response ok={r.ok} rebuilt={r.rebuilt} action={r.action}")
+        if r.model_id != f"{pid}-v2" or r.glb_url != f"/media/projects/{pid}/v2.glb":
+            errors.append(f"ids {r.model_id} {r.glb_url}")
+        want = {"width_mm": 20.0, "height_mm": 5.0}
+        if r.cad_params != want:
+            errors.append(f"cad_params {r.cad_params}")
+        v2 = projects.get_version(settings, pid, 2)
+        if not v2 or v2.op != "param_edit" or v2.params != want:
+            errors.append(f"v2 meta {v2}")
+        if not v2 or '"width_mm": 20' not in (v2.script or ""):
+            errors.append(f"v2.script not rewritten: {v2.script if v2 else None}")
+        if session.version != 2 or session.last_script != (v2.script if v2 else None):
+            errors.append("session not moved to the new version")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("param update rebuilds and records a version", errors)
+
+
+async def test_param_update_bad_value_clarifies_and_leaves_model():
+    """An unknown dimension or a non-positive value comes back as a clarify, unchanged."""
+    print("\n=== Test: param update bad value clarifies ===")
+    import shutil
+    from app import projects
+    from app.pipeline import apply_param_update
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_e")
+        await _run_cad(
+            Intent(action="generate", script=_PARAM_SCRIPT, reply="A box."),
+            session, settings, "build me a box",
+        )
+        pid = session.project_id
+
+        with patch("app.pipeline.save_session"):
+            unknown = await apply_param_update(session, settings, pid, {"depth_mm": 4})
+            if unknown.ok or unknown.action != "clarify" or "no dimension called" not in unknown.reply:
+                errors.append(f"unknown dimension: ok={unknown.ok} action={unknown.action} reply={unknown.reply!r}")
+
+            negative = await apply_param_update(session, settings, pid, {"width_mm": -5})
+            if negative.ok or negative.action != "clarify" or "positive number" not in negative.reply:
+                errors.append(f"negative value: ok={negative.ok} reply={negative.reply!r}")
+
+            if projects.current_version(settings, pid).version != 1:
+                errors.append("a rejected update must not create a new version")
+
+            missing = await apply_param_update(session, settings, "nope", {"width_mm": 5})
+            if missing.ok or missing.action != "clarify":
+                errors.append(f"unknown project: ok={missing.ok} action={missing.action}")
+
+            no_script_session = SessionState(session_id="ws_e_mesh")
+            mesh_r = await _execute_mesh_stub(no_script_session, settings)
+            mesh_pid = no_script_session.project_id
+            if mesh_pid:
+                mesh_reply = await apply_param_update(no_script_session, settings, mesh_pid, {"a_mm": 1})
+                if mesh_reply.ok or mesh_reply.action != "clarify":
+                    errors.append(f"mesh project should clarify: {mesh_reply.action}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("param update bad value clarifies", errors)
+
+
+async def _execute_mesh_stub(session, settings):
+    """Records a mesh version directly (skips the real mesh generator)."""
+    from app.pipeline import _record_version
+
+    model_id = "mesh_built_1"
+    (settings.glb_dir / f"{model_id}.glb").write_bytes(b"glTF" + bytes(20))
+    session.last_backend = "mesh"
+    session.last_script = None
+    session.last_mesh_prompt = "a duck"
+    session.model_id = model_id
+    session.glb_url = f"/media/glb/{model_id}.glb"
+    _record_version(session, settings, model_id, "generate", new_object=True)
+    return session
+
+
+WS_E_TESTS = [
+    test_generate_records_and_returns_cad_params,
+    test_param_update_rebuilds_and_versions,
+    test_param_update_bad_value_clarifies_and_leaves_model,
+]
+
+
+# ============================================================================
+# WS-FG: mesh_boolean wiring (hole / loop / flat base)
+# ============================================================================
+
+
+def _boolean_mesh_session(settings, **kw):
+    """A mesh session pointing at a real box GLB in settings.glb_dir/m1.glb."""
+    import trimesh
+
+    trimesh.creation.box(extents=(1.0, 1.0, 1.0)).export(str(Path(settings.glb_dir) / "m1.glb"))
+    base = dict(
+        session_id="ws_fg", last_backend="mesh", model_id="m1",
+        glb_url="/media/glb/m1.glb", base_size_m=0.2, scale=1.0,
+    )
+    base.update(kw)
+    return SessionState(**base)
+
+
+async def _run_boolean(intent, session, settings):
+    with patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+         patch("app.pipeline.save_session"):
+        return await apply_intent(intent, session, settings, transcript="mesh boolean")
+
+
+async def test_mesh_boolean_hole_drills_through():
+    print("\n=== Test: mesh_boolean drills a hole ===")
+    import shutil
+
+    settings, root = _version_settings()
+    try:
+        session = _boolean_mesh_session(settings)
+        intent = Intent(
+            action="mesh_boolean", backend="mesh",
+            params={"op": "hole", "center": [0.5, 0.0, 0.0], "normal": [1.0, 0.0, 0.0]},
+            reply="Drilling that hole.",
+        )
+        result = await _run_boolean(intent, session, settings)
+        errors = []
+        if not result.rebuilt or not result.ok:
+            errors.append(f"rebuilt={result.rebuilt} ok={result.ok} error={result.error}")
+        if result.backend != "mesh":
+            errors.append(f"backend {result.backend}")
+        if result.model_id is None or result.model_id == "m1":
+            errors.append(f"model_id did not change: {result.model_id}")
+        if result.reply != "Drilled it.":
+            errors.append(f"reply {result.reply!r}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("mesh_boolean drills a hole", errors)
+
+
+async def test_mesh_boolean_flat_base_needs_no_selection():
+    print("\n=== Test: mesh_boolean flattens the base with no selection ===")
+    import shutil
+
+    settings, root = _version_settings()
+    try:
+        session = _boolean_mesh_session(settings)
+        intent = Intent(action="mesh_boolean", backend="mesh", params={"op": "flat_base"}, reply="Flattening the base.")
+        result = await _run_boolean(intent, session, settings)
+        errors = []
+        if not result.rebuilt or not result.ok:
+            errors.append(f"rebuilt={result.rebuilt} ok={result.ok} error={result.error}")
+        if result.reply != "Flattened the base.":
+            errors.append(f"reply {result.reply!r}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("mesh_boolean flattens the base", errors)
+
+
+async def test_mesh_boolean_error_leaves_model_unchanged():
+    print("\n=== Test: a BooleanError leaves the model unchanged ===")
+    import shutil
+
+    settings, root = _version_settings()
+    try:
+        session = _boolean_mesh_session(settings)
+        # diameter_mm=0 is invalid (mesh/boolean.py: MSG_HOLE_SIZE) and never reaches manifold.
+        intent = Intent(
+            action="mesh_boolean", backend="mesh",
+            params={"op": "hole", "center": [0.5, 0.0, 0.0], "normal": [1.0, 0.0, 0.0], "diameter_mm": 0},
+            reply="Drilling that hole.",
+        )
+        result = await _run_boolean(intent, session, settings)
+        errors = []
+        if result.rebuilt or result.ok or result.action != "clarify":
+            errors.append(f"rebuilt={result.rebuilt} ok={result.ok} action={result.action}")
+        if "bigger than zero" not in (result.reply or ""):
+            errors.append(f"reply not the boolean error: {result.reply!r}")
+        if session.model_id != "m1" or session.glb_url != "/media/glb/m1.glb":
+            errors.append(f"session moved on failure: {session.model_id} {session.glb_url}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("BooleanError leaves the model unchanged", errors)
+
+
+async def test_mesh_boolean_requires_mesh_session():
+    print("\n=== Test: mesh_boolean refuses a CAD session ===")
+    import shutil
+
+    settings, root = _version_settings()
+    try:
+        session = _boolean_mesh_session(settings, last_backend="cad", last_script="result = 1")
+        intent = Intent(action="mesh_boolean", backend="mesh", params={"op": "flat_base"}, reply="Flattening the base.")
+        result = await _run_boolean(intent, session, settings)
+        errors = []
+        if result.rebuilt or result.action != "clarify" or "no sculpt" not in (result.reply or "").lower():
+            errors.append(f"rebuilt={result.rebuilt} action={result.action} reply={result.reply!r}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("mesh_boolean refuses a CAD session", errors)
+
+
+async def test_mesh_boolean_missing_glb_clarifies():
+    print("\n=== Test: mesh_boolean with no GLB on disk clarifies ===")
+    import shutil
+
+    settings, root = _version_settings()
+    try:
+        session = SessionState(
+            session_id="ws_fg", last_backend="mesh", model_id="ghost",
+            glb_url="/media/glb/ghost.glb", base_size_m=0.2, scale=1.0,
+        )
+        intent = Intent(action="mesh_boolean", backend="mesh", params={"op": "flat_base"}, reply="Flattening the base.")
+        result = await _run_boolean(intent, session, settings)
+        errors = []
+        if result.rebuilt or result.action != "clarify":
+            errors.append(f"rebuilt={result.rebuilt} action={result.action}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("mesh_boolean with missing GLB clarifies", errors)
+
+
+async def test_mesh_boolean_records_project_version():
+    print("\n=== Test: mesh_boolean appends a project version op=boolean ===")
+    import shutil
+    from app import projects
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        import trimesh
+
+        from app.pipeline import restore_version
+
+        v1_src = settings.ref_dir / "seed.glb"
+        trimesh.creation.box(extents=(1.0, 1.0, 1.0)).export(str(v1_src))
+        info = projects.create_project(
+            settings, "mesh", v1_src, op="generate", summary="A sculpt.",
+            mesh_prompt="a cube", color="#FFFFFF", base_size_m=0.2,
+        )
+        session = SessionState(session_id="ws_fg")
+        with patch("app.pipeline.save_session"):
+            restore_version(session, info)
+
+        intent = Intent(action="mesh_boolean", backend="mesh", params={"op": "flat_base"}, reply="Flattening the base.")
+        result = await _run_boolean(intent, session, settings)
+        if not result.rebuilt or not result.ok:
+            errors.append(f"rebuilt={result.rebuilt} ok={result.ok} error={result.error}")
+        pid = session.project_id
+        v2 = projects.get_version(settings, pid, 2) if pid else None
+        if not v2 or v2.op != "boolean":
+            errors.append(f"v2 {v2}")
+        if result.model_id != f"{pid}-v2":
+            errors.append(f"model_id {result.model_id} != {pid}-v2")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("mesh_boolean appends a project version", errors)
+
+
+WS_FG_TESTS = [
+    test_mesh_boolean_hole_drills_through,
+    test_mesh_boolean_flat_base_needs_no_selection,
+    test_mesh_boolean_error_leaves_model_unchanged,
+    test_mesh_boolean_requires_mesh_session,
+    test_mesh_boolean_missing_glb_clarifies,
+    test_mesh_boolean_records_project_version,
+]
 
 
 if __name__ == "__main__":

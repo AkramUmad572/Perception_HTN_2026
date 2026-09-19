@@ -6,6 +6,7 @@
 
 import { voiceState } from "./VoiceState.js";
 import { PTTRecorder } from "./PTTRecorder.js";
+import { parseRegionCommand } from "../interaction/regionOps.js";
 
 const API_BASE = "";
 const SESSION_ID = "default";
@@ -26,12 +27,43 @@ export class PercyAssistant {
     this.onStatusMessage = options.onStatusMessage || (() => {});
     this.onTalkingChange = options.onTalkingChange || (() => {});
     this.onPhotoCandidates = options.onPhotoCandidates || (() => {});
+    // Applies a parsed region command (regionOps.js) to the loaded model and
+    // saves the result as a new version. When set, a text/voice command that
+    // matches the local table runs here instead of /api/command — no LLM
+    // round trip for "bigger" / "pull it out" / etc. on a selection.
+    this.onRegionCommand = options.onRegionCommand || null;
 
     this.recorder = new PTTRecorder();
     this.recorder.onMaxHold = () => this.endTalk();
     this.replyAudio = null;
     this.started = false;
     this._ending = false;
+    // What the user last pointed at (interaction/selection.js). Consumed by
+    // the next voice or text command, then cleared.
+    this.selection = null;
+    // Called once the pending selection is consumed (sent or dropped), so
+    // main.js can clear the in-world highlight.
+    this.onSelectionCleared = options.onSelectionCleared || (() => {});
+  }
+
+  /** Attach a Selection to the next voice/text command; cleared once sent. */
+  setSelection(selection) {
+    this.selection = selection || null;
+  }
+
+  clearSelection() {
+    if (!this.selection) return;
+    this.selection = null;
+    this.onSelectionCleared();
+  }
+
+  _takeSelection() {
+    const selection = this.selection;
+    if (selection) {
+      this.selection = null;
+      this.onSelectionCleared();
+    }
+    return selection;
   }
 
   async start() {
@@ -70,6 +102,7 @@ export class PercyAssistant {
   async beginTalk() {
     if (!this.started || voiceState.isMuted) return;
     if (voiceState.isListening || voiceState.isThinking) return;
+    this._cancelPending = false;
 
     if (this.replyAudio) {
       try {
@@ -80,6 +113,13 @@ export class PercyAssistant {
 
     try {
       await this.recorder.start();
+      if (this._cancelPending) {
+        // cancelTalk() arrived while the mic was still opening.
+        this._cancelPending = false;
+        this.recorder.abort();
+        this.onTalkingChange(false);
+        return;
+      }
       voiceState.toListening();
       this.onTalkingChange(true);
       this.onStatusMessage("Listening… hold to talk, release to send.", true);
@@ -88,6 +128,19 @@ export class PercyAssistant {
       voiceState.toError("Microphone access required");
       this.onStatusMessage("Mic access required. Allow and retry.", false);
     }
+  }
+
+  /**
+   * Drop the current hold without sending it. Used when a left-hand pinch
+   * turns out to be half of a two-hand gesture rather than push-to-talk.
+   */
+  cancelTalk() {
+    this._cancelPending = true;
+    if (!voiceState.isListening || this._ending) return;
+    this._cancelPending = false;
+    this.recorder.abort();
+    voiceState.toIdle();
+    this.onTalkingChange(false);
   }
 
   async endTalk() {
@@ -147,6 +200,8 @@ export class PercyAssistant {
     const form = new FormData();
     form.append("audio", blob, `utterance.${ext}`);
     form.append("session_id", SESSION_ID);
+    const selection = this._takeSelection();
+    if (selection) form.append("selection", JSON.stringify(selection));
 
     return this._fetchJson(`${API_BASE}/api/voice`, { method: "POST", body: form });
   }
@@ -154,15 +209,35 @@ export class PercyAssistant {
   async sendTextCommand(text) {
     if (voiceState.isMuted) return null;
 
+    // A region edit on an active selection runs client-side (regionOps.js),
+    // with no LLM round trip: parse the small local table first.
+    const regionCmd = this.selection ? parseRegionCommand(text) : null;
+    if (regionCmd && this.onRegionCommand) {
+      const selection = this._takeSelection();
+      voiceState.toThinking();
+      this.onStatusMessage(`Applying "${text}"…`, true);
+      try {
+        const result = await this.onRegionCommand(regionCmd, selection, text);
+        await this._handleResponse(result);
+        return result;
+      } catch (e) {
+        voiceState.toError(e.message);
+        this.onStatusMessage(`Error: ${e.message}`, false);
+        setTimeout(() => voiceState.toIdle(), 3000);
+        return null;
+      }
+    }
+
     voiceState.toThinking();
     this.onStatusMessage(`Looking that up… ("${text}")`, true);
 
     try {
-      const result = await this._postJson(`${API_BASE}/api/command`, {
-        text,
-        session_id: SESSION_ID,
-      });
-      return await this._deliverResponse(result);
+      const body = { text, session_id: SESSION_ID };
+      const selection = this._takeSelection();
+      if (selection) body.selection = selection;
+      const result = await this._postJson(`${API_BASE}/api/command`, body);
+      await this._deliverResponse(result);
+      return result;
     } catch (e) {
       voiceState.toError(e.message);
       this.onStatusMessage(`Error: ${e.message}`, false);
@@ -207,6 +282,27 @@ export class PercyAssistant {
       voiceState.toError(e.message);
       this.onStatusMessage(`Error: ${e.message}`, false);
       setTimeout(() => voiceState.toIdle(), 3000);
+      return null;
+    }
+  }
+
+  /**
+   * Drag-release from the dimension panel: rewrite one or more named PARAMS
+   * on the current CAD project and rerun the sandbox. Silent on purpose —
+   * this can fire on every release, like save_client_version.
+   */
+  async postParamUpdate(projectId, updates) {
+    try {
+      const result = await this._postJson(
+        `${API_BASE}/api/projects/${projectId}/params`,
+        { updates, session_id: SESSION_ID },
+        30000
+      );
+      await this._handleResponse(result);
+      return result;
+    } catch (e) {
+      console.error("[Percy] Param update failed:", e);
+      this.onStatusMessage(`Error: ${e.message}`, false);
       return null;
     }
   }

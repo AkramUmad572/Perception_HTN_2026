@@ -49,6 +49,36 @@
         background: rgba(255,255,255,0.14);
         border: 2px solid rgba(255,255,255,0.22);
       }
+      #tapeButton {
+        position: fixed;
+        bottom: 40px;
+        right: 24px;
+        z-index: 12;
+        padding: 12px 18px;
+        font-size: 13px;
+        background: rgba(255,255,255,0.14);
+        border: 2px solid rgba(255,255,255,0.22);
+      }
+      #tapeButton.active {
+        background: #f9a825;
+        border-color: #ffd54f;
+        color: #1a1a1a;
+      }
+      #selectButton {
+        position: fixed;
+        bottom: 40px;
+        right: 100px;
+        z-index: 12;
+        padding: 12px 18px;
+        font-size: 13px;
+        background: rgba(255,255,255,0.14);
+        border: 2px solid rgba(255,255,255,0.22);
+      }
+      #selectButton.active {
+        background: #4f8cff;
+        border-color: #90caf9;
+        color: #0a0c12;
+      }
       #micButton.talking {
         background: #e53935;
         border-color: #ff8a80;
@@ -109,6 +139,8 @@
 
     <div id="overlay">
       <button id="micButton" class="hit" type="button" aria-label="Hold to talk">Hold</button>
+      <button id="tapeButton" class="hit" type="button" aria-label="Toggle tape measure">Tape</button>
+      <button id="selectButton" class="hit" type="button" aria-label="Toggle point/select mode">Select</button>
       <!-- Legacy HUD - hidden by default -->
       <div id="hud">
         <div class="panel hit">
@@ -116,7 +148,8 @@
           <p class="status" id="status">Initializing Percy...</p>
           <p class="hint">
             <b>Hold</b> left trigger / pinch / Space / mic to talk. Release to send.
-            Right pinch the model to move it. <b>M</b> mutes.
+            Right pinch the model to move it; pinch with both hands to zoom and turn.
+            <b>T</b> tape measure. <b>V</b> point/select a spot, then say "drill a hole" or "bigger". <b>M</b> mutes.
             <br>Try: "build me a star", "make it yellow", "bigger"
           </p>
         </div>

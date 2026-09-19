@@ -2,6 +2,7 @@
 .env
 *.env
 !.env.example
+backend/.env
 
 # Python
 __pycache__/
@@ -12,9 +13,12 @@ venv/
 
 # Node
 node_modules/
+web-client/node_modules/
 dist/
 .vite/
 .iwsdk/
+web-client/.iwsdk/
+web-client/dist/
 
 # Generated storage
 backend/storage/glb/*
@@ -24,6 +28,9 @@ backend/storage/sessions.json
 !backend/storage/glb/.gitkeep
 !backend/storage/audio/.gitkeep
 !backend/storage/ref/.gitkeep
+
+# Worktrees
+.claude/worktrees/
 
 # OS
 .DS_Store

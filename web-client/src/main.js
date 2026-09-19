@@ -12,11 +12,38 @@ import { ARButton } from "three/addons/webxr/ARButton.js";
 import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
 import { XRHandModelFactory } from "three/addons/webxr/XRHandModelFactory.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
 import { PercyAssistant } from "./voice/PercyAssistant.js";
 import { voiceState, VoiceStates } from "./voice/VoiceState.js";
 import { PhotoPicker } from "./PhotoPicker.js";
+import { realSize, realScaleFor } from "./interaction/measure.js";
+import {
+  twoHandTransform,
+  midpoint,
+  applyTwoHandToPosition,
+  isTwoHandActive,
+  clampNavScale,
+} from "./interaction/twoHand.js";
+import { createDimensionsLabel } from "./interaction/dimensionsLabel.js";
+import { createTapeMeasure } from "./interaction/tapeMeasure.js";
+import { makeTextSprite } from "./interaction/textSprite.js";
+import {
+  paramsForPart,
+  paramRows,
+  pickRow,
+  dragParamValue,
+  paramPanelLines,
+} from "./interaction/paramPanel.js";
+import { selectionFromStroke } from "./interaction/selection.js";
+import {
+  scaleRegion,
+  pullRegion,
+  flattenRegion,
+  smoothRegion,
+  paintRegion,
+} from "./interaction/regionOps.js";
 
 // Desktop XR emulation is injected by @iwsdk/vite-plugin-dev (localhost only).
 // Quest / LAN IP keep native WebXR — do not manually install IWER here.
@@ -382,14 +409,160 @@ let lastTextured = false;
 // just moves this number.
 const DEFAULT_DISPLAY_SIZE_M = 0.22;
 let modelBaseMaxDim = 1;
+// Raw GLB bounds and lane of the loaded model, for the real-size label.
+const modelBaseSize = new THREE.Vector3(1, 1, 1);
+let lastBackend = null;
+// Two-hand / wheel zoom. Display only: it lives on modelRoot.scale and is
+// never sent to the server.
+let navScale = 1;
+
+const dimsLabel = createDimensionsLabel();
+scene.add(dimsLabel.object3d);
+
+// CAD PARAMS dimension panel: the pointed part's named dimensions, pinch-drag
+// a row to change it (left-hand pinch = fine mode), POST on release.
+let cadParams = {};
+let currentProjectId = null;
+let activeParamRows = [];
+let paramDrag = null; // { anchor, key, rowIndex, name, baseValueMm, startY, liveValue }
+const paramPanel = makeTextSprite({ widthM: 0.16, aspect: 0.5 });
+paramPanel.sprite.visible = false;
+scene.add(paramPanel.sprite);
+const paramRaycaster = new THREE.Raycaster();
+
+function realScale() {
+  return currentModel ? realScaleFor(lastBackend, currentModel.scale.x) : 1;
+}
+
+// modelRoot-local distances are display metres; divide the display scale out.
+const tape = createTapeMeasure(scene, modelRoot, {
+  toReal: (d) => (currentModel ? (d / currentModel.scale.x) * realScale() : d),
+});
+let tapeMode = false;
+
+// The project this session's builds land in (from CommandResponse.session),
+// so a hand edit knows where to POST its saved version.
+let lastProjectId = null;
+
+// --- Selection (WS-FG): point/lasso a spot on the model, then say what to
+// do to it ("drill a hole", "bigger", "paint red", ...). Selection.center
+// and .normal are in the model's own GLB-local frame (matching what the
+// backend expects and what mesh/boolean.py operates on), never world space.
+let selectMode = false;
+let pendingSelection = null;
+let strokeHits = [];
+const _local = new THREE.Vector3();
+const _invModel = new THREE.Matrix4();
+const _normalMat = new THREE.Matrix3();
+
+const selectionMarker = new THREE.Mesh(
+  new THREE.SphereGeometry(0.006, 16, 12),
+  new THREE.MeshBasicMaterial({ color: 0xffee58, transparent: true, opacity: 0.9, depthTest: false })
+);
+selectionMarker.visible = false;
+selectionMarker.renderOrder = 999;
+
+/** A world-space point/direction, expressed in currentModel's own local frame. */
+function toModelLocalPoint(worldPoint) {
+  currentModel.updateMatrixWorld(true);
+  _invModel.copy(currentModel.matrixWorld).invert();
+  _local.copy(worldPoint).applyMatrix4(_invModel);
+  return { x: _local.x, y: _local.y, z: _local.z };
+}
+
+function toModelLocalDirection(worldDir) {
+  currentModel.updateMatrixWorld(true);
+  _normalMat.getNormalMatrix(currentModel.matrixWorld);
+  _local.copy(worldDir).applyMatrix3(_normalMat).normalize();
+  return { x: _local.x, y: _local.y, z: _local.z };
+}
+
+function modelHit(origin, dir) {
+  if (!currentModel) return null;
+  tapeRaycaster.set(origin, dir.clone().normalize());
+  const hit = tapeRaycaster.intersectObject(currentModel, true)[0];
+  if (!hit) return null;
+  let worldNormal = new THREE.Vector3(0, 1, 0);
+  if (hit.face) {
+    worldNormal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+  }
+  let part = null;
+  for (let o = hit.object; o && o !== currentModel; o = o.parent) {
+    if (o.name) {
+      part = o.name;
+      break;
+    }
+  }
+  return {
+    point: toModelLocalPoint(hit.point),
+    normal: toModelLocalDirection(worldNormal),
+    part,
+  };
+}
+
+function clearSelectionHighlight() {
+  pendingSelection = null;
+  strokeHits = [];
+  selectionMarker.visible = false;
+  if (selectionMarker.parent) selectionMarker.parent.remove(selectionMarker);
+}
+
+function showSelectionHighlight(selection) {
+  if (!currentModel) return;
+  currentModel.add(selectionMarker);
+  selectionMarker.position.set(selection.center.x, selection.center.y, selection.center.z);
+  selectionMarker.scale.setScalar(selection.radius > 0 ? Math.max(selection.radius, 0.004) / 0.006 : 1);
+  selectionMarker.visible = true;
+}
+
+function finishSelectionStroke() {
+  if (!strokeHits.length) return;
+  const selection = selectionFromStroke(strokeHits);
+  strokeHits = [];
+  if (!selection) return;
+  pendingSelection = selection;
+  showSelectionHighlight(selection);
+  percy.setSelection(selection);
+  setStatus(
+    selection.parts.length ? `Selected ${selection.parts[0]}. Say what to do.` : "Point selected. Say what to do.",
+    true
+  );
+}
+
+function setSelectMode(on) {
+  selectMode = on;
+  strokeHits = [];
+  if (!on) {
+    clearSelectionHighlight();
+    percy.clearSelection();
+  }
+  if (on && grabbing) endGrab();
+  if (on && tapeMode) setTapeMode(false);
+  document.getElementById("selectButton")?.classList.toggle("active", on);
+  setStatus(on ? "Select mode: pinch a spot on the model." : "Select mode off.", true);
+}
+
+function refreshDimensions() {
+  if (!currentModel) return;
+  dimsLabel.setSize(realSize(modelBaseSize, realScale()));
+}
 
 function applyDisplaySize(obj, displaySizeM) {
+  // Measure detached: once the model sits in modelRoot (placed, grabbed,
+  // zoomed), world bounds include modelRoot's transform and would push the
+  // model off-centre on a voice resize.
+  const parent = obj.parent;
+  if (parent) parent.remove(obj);
   obj.scale.setScalar(displaySizeM / modelBaseMaxDim);
   const box = new THREE.Box3().setFromObject(obj);
   obj.position.sub(box.getCenter(new THREE.Vector3()));
+  if (parent) parent.add(obj);
 }
 
 async function setModelFromResponse(data) {
+  cadParams = data.cad_params || {};
+  if (data.session?.project_id) currentProjectId = data.session.project_id;
+  if (data.session?.project_id) lastProjectId = data.session.project_id;
   if (data.action === "find_photos" || data.action === "browse_photos") {
     return;
   }
@@ -418,6 +591,7 @@ async function setModelFromResponse(data) {
       const box = new THREE.Box3().setFromObject(sceneObj);
       const size = box.getSize(new THREE.Vector3());
       modelBaseMaxDim = Math.max(size.x, size.y, size.z) || 1;
+      modelBaseSize.copy(size);
       applyDisplaySize(sceneObj, displaySizeM);
 
       const textured = Boolean(data.textured || data.backend === "mesh");
@@ -451,6 +625,11 @@ async function setModelFromResponse(data) {
       modelRoot.add(currentModel);
       lastLoadedGlbUrl = newGlbUrl;
       lastModelId = newModelId;
+      lastBackend = data.backend || (textured ? "mesh" : "cad");
+      refreshDimensions();
+      tape.clear();
+      clearSelectionHighlight();
+      percy.clearSelection();
       photoPicker.hide();
 
       if (wasGrabbing && savedOffset && savedSource) {
@@ -471,6 +650,7 @@ async function setModelFromResponse(data) {
   } else if (data.action === "set_scale" && currentModel) {
     // Resizing a sculpt ships no new GLB — rescale what is already loaded.
     applyDisplaySize(currentModel, displaySizeM);
+    refreshDimensions();
     console.log("[Percy] Resized to", displaySizeM.toFixed(3), "m");
   } else if (data.color && currentModel && !lastTextured) {
     // Color-only update (no new model) - apply hologram paint on CAD only
@@ -555,6 +735,18 @@ const PINCH_THRESHOLD_END = 0.045;
 const PINCH_MIN_DURATION_MS = 50;
 const GRAB_RANGE = 0.20;
 
+// Two-hand mode and the tape measure use a proper hysteresis latch per hand
+// (on below START, off above END), separate from the one-hand grab logic.
+const held = { 0: false, 1: false };
+const heldPos = { 0: new THREE.Vector3(), 1: new THREE.Vector3() };
+let twoHandOn = false;
+const prevL = new THREE.Vector3();
+const prevR = new THREE.Vector3();
+const _yawQuat = new THREE.Quaternion();
+const _up = new THREE.Vector3(0, 1, 0);
+const tapeRaycaster = new THREE.Raycaster();
+const _rayDir = new THREE.Vector3();
+
 function modelInteractTarget() {
   return currentModel || (placeholder.visible ? placeholder : null);
 }
@@ -630,15 +822,22 @@ function updateGrab() {
   tempMatrix.multiplyMatrices(grabSource.matrixWorld, grabOffset);
   const s = new THREE.Vector3();
   tempMatrix.decompose(modelRoot.position, modelRoot.quaternion, s);
-  modelRoot.scale.set(1, 1, 1);
+  modelRoot.scale.setScalar(navScale);
 }
 
 function pollHand(handEntry, key) {
   const gap = updatePinchAnchor(handEntry);
+  const wasHeld = held[key];
+  if (gap === null) held[key] = false;
+  else if (gap < PINCH_THRESHOLD_START) held[key] = true;
+  else if (gap > PINCH_THRESHOLD_END) held[key] = false;
+  if (gap !== null) heldPos[key].copy(handEntry.pinchAnchor.position);
+
   if (gap === null) {
     if (wasPinching[key]) {
       if (key === 0) percy.endTalk();
       if (grabHandKey === key) endGrab();
+      endParamDrag(key);
     }
     wasPinching[key] = false;
     pinchStartTime[key] = 0;
@@ -665,6 +864,27 @@ function pollHand(handEntry, key) {
     return;
   }
 
+  if (key === 1 && tapeMode) {
+    if (held[1] && !wasHeld) placeTapePointFromHand(handEntry);
+    wasPinching[key] = isPinching;
+    return;
+  }
+
+  if (key === 1 && selectMode) {
+    if (held[1] && !wasHeld) {
+      strokeHits = [];
+      const hit = raycastFromHand(handEntry);
+      if (hit) strokeHits.push(hit);
+    } else if (held[1] && wasHeld) {
+      const hit = raycastFromHand(handEntry);
+      if (hit) strokeHits.push(hit);
+    } else if (!held[1] && wasHeld) {
+      finishSelectionStroke();
+    }
+    wasPinching[key] = isPinching;
+    return;
+  }
+
   if (key === 1 && !grabbing) {
     getModelCenter(_modelCenter);
     const dist = pos.distanceTo(_modelCenter);
@@ -678,19 +898,185 @@ function pollHand(handEntry, key) {
     if (key === 0) percy.beginTalk();
   }
 
-  if (key === 1 && isPinching && wasPinching[key] && !grabbing) {
+  if (key === 1 && isPinching && wasPinching[key] && !grabbing && !twoHandOn && !paramDrag) {
     const duration = now - pinchStartTime[key];
     if (duration >= PINCH_MIN_DURATION_MS && nearModel(pos, GRAB_RANGE)) {
-      beginGrab(handEntry.pinchAnchor, key);
+      if (activeParamRows.length) {
+        const localY = pos.y - paramPanel.sprite.position.y;
+        beginParamDrag(handEntry, key, pickRow(activeParamRows, localY));
+      } else {
+        beginGrab(handEntry.pinchAnchor, key);
+      }
     }
   }
 
   if (wasOpen && wasPinching[key]) {
     if (key === 0) percy.endTalk();
     if (grabHandKey === key) endGrab();
+    endParamDrag(key);
   }
 
   wasPinching[key] = isPinching;
+}
+
+/**
+ * Both hands pinching near the model: spread zooms, twist turns about vertical,
+ * moving both carries it. Engaging needs both pinches near the model; once
+ * engaged it continues while both are held, so the hands can spread apart.
+ */
+function updateTwoHand() {
+  if (!twoHandOn) {
+    const active = isTwoHandActive({
+      leftPinching: held[0],
+      rightPinching: held[1],
+      leftNear: held[0] && nearModel(heldPos[0], GRAB_RANGE),
+      rightNear: held[1] && nearModel(heldPos[1], GRAB_RANGE),
+      tapeMode,
+    });
+    if (!active) return;
+    twoHandOn = true;
+    if (grabbing) endGrab();
+    // The left pinch started push-to-talk; this was a gesture, not speech.
+    percy.cancelTalk();
+    prevL.copy(heldPos[0]);
+    prevR.copy(heldPos[1]);
+    halo.material.opacity = 0.9;
+    halo.material.color.setHex(0x00ff88);
+    return;
+  }
+  if (!held[0] || !held[1]) {
+    twoHandOn = false;
+    halo.material.color.setHex(0x4f8cff);
+    return;
+  }
+  const t = twoHandTransform(prevL, prevR, heldPos[0], heldPos[1]);
+  const newScale = clampNavScale(navScale, t.scale);
+  const p = applyTwoHandToPosition(modelRoot.position, midpoint(prevL, prevR), {
+    ...t,
+    scale: newScale / navScale,
+  });
+  modelRoot.position.set(p.x, p.y, p.z);
+  _yawQuat.setFromAxisAngle(_up, t.yaw);
+  modelRoot.quaternion.premultiply(_yawQuat);
+  navScale = newScale;
+  modelRoot.scale.setScalar(navScale);
+  prevL.copy(heldPos[0]);
+  prevR.copy(heldPos[1]);
+}
+
+function tapeHit(origin, dir) {
+  if (!currentModel) return null;
+  tapeRaycaster.set(origin, dir.clone().normalize());
+  return tapeRaycaster.intersectObject(currentModel, true)[0]?.point || null;
+}
+
+/** Right hand's target ray hitting the model: the point and its named part, if any. */
+function pointedPartHit() {
+  if (!currentModel || lastBackend !== "cad") return null;
+  const c = right.controller;
+  c.updateMatrixWorld(true);
+  _rayDir.set(0, 0, -1).transformDirection(c.matrixWorld);
+  paramRaycaster.set(new THREE.Vector3().setFromMatrixPosition(c.matrixWorld), _rayDir.clone().normalize());
+  const hit = paramRaycaster.intersectObject(currentModel, true)[0];
+  if (!hit) return null;
+  let node = hit.object;
+  while (node && !node.name && node.parent) node = node.parent;
+  return { point: hit.point, part: node?.name || "" };
+}
+
+/** Show the pointed part's dimensions (or all of them if the part has none of its own). */
+function updateParamPanel() {
+  if (paramDrag) return; // the live label during a drag stays as-is
+  const hit = !grabbing && !twoHandOn && !tapeMode && !photoPicker.isOpen ? pointedPartHit() : null;
+  if (!hit) {
+    paramPanel.sprite.visible = false;
+    activeParamRows = [];
+    return;
+  }
+  const specific = paramsForPart(cadParams, hit.part);
+  const rows = paramRows(Object.keys(specific).length ? specific : cadParams);
+  activeParamRows = rows;
+  if (!rows.length) {
+    paramPanel.sprite.visible = false;
+    return;
+  }
+  paramPanel.setText(paramPanelLines(rows));
+  paramPanel.sprite.position.copy(hit.point);
+  paramPanel.sprite.position.y += 0.05;
+  paramPanel.sprite.visible = true;
+}
+
+function beginParamDrag(handEntry, key, rowIndex) {
+  const row = activeParamRows[rowIndex];
+  if (!row) return;
+  paramDrag = {
+    anchor: handEntry.pinchAnchor,
+    key,
+    rowIndex,
+    name: row.name,
+    baseValueMm: row.value,
+    startY: handEntry.pinchAnchor.position.y,
+    liveValue: row.value,
+  };
+  halo.material.opacity = 0.9;
+  halo.material.color.setHex(0xffd54f);
+}
+
+function updateParamDrag() {
+  if (!paramDrag) return;
+  const deltaM = paramDrag.anchor.position.y - paramDrag.startY;
+  const value = dragParamValue(paramDrag.baseValueMm, deltaM, held[0]);
+  paramDrag.liveValue = value;
+  const rows = activeParamRows.map((r, i) => (i === paramDrag.rowIndex ? { ...r, value } : r));
+  paramPanel.setText(paramPanelLines(rows, paramDrag.rowIndex));
+}
+
+function endParamDrag(key) {
+  if (!paramDrag || paramDrag.key !== key) return;
+  const { name, liveValue, baseValueMm } = paramDrag;
+  paramDrag = null;
+  halo.material.color.setHex(0x4f8cff);
+  if (currentProjectId && liveValue !== baseValueMm) {
+    percy.postParamUpdate(currentProjectId, { [name]: liveValue });
+  }
+}
+
+/** Controller target ray first; for a pinch touching the model, aim at its centre. */
+function placeTapePointFromHand(handEntry) {
+  const c = handEntry.controller;
+  c.updateMatrixWorld(true);
+  _rayDir.set(0, 0, -1).transformDirection(c.matrixWorld);
+  let point = tapeHit(new THREE.Vector3().setFromMatrixPosition(c.matrixWorld), _rayDir);
+  if (!point) {
+    const from = handEntry.pinchAnchor.position;
+    getModelCenter(_modelCenter);
+    point = tapeHit(from, _modelCenter.clone().sub(from));
+  }
+  if (point) tape.place(point);
+  else setStatus("Point at the model to measure.", false);
+}
+
+/** Same target-ray-then-pinch-to-centre aim as the tape measure, for selection.js hits. */
+function raycastFromHand(handEntry) {
+  const c = handEntry.controller;
+  c.updateMatrixWorld(true);
+  _rayDir.set(0, 0, -1).transformDirection(c.matrixWorld);
+  let hit = modelHit(new THREE.Vector3().setFromMatrixPosition(c.matrixWorld), _rayDir);
+  if (!hit) {
+    const from = handEntry.pinchAnchor.position;
+    getModelCenter(_modelCenter);
+    hit = modelHit(from, _modelCenter.clone().sub(from));
+  }
+  return hit;
+}
+
+function setTapeMode(on) {
+  tapeMode = on;
+  if (!on) tape.clear();
+  if (on && grabbing) endGrab();
+  if (on && selectMode) setSelectMode(false);
+  document.getElementById("tapeButton")?.classList.toggle("active", on);
+  setStatus(on ? "Tape measure: pinch two points on the model." : "Tape measure off.", true);
 }
 
 left.controller.addEventListener("selectstart", () => {
@@ -706,6 +1092,19 @@ right.controller.addEventListener("selectstart", () => {
     photoPicker.beginPinch(_pinch);
     return;
   }
+  // Hand input also fires select events; hands place tape points in pollHand.
+  if (tapeMode) {
+    if (!right.hand.joints?.["index-finger-tip"]) placeTapePointFromHand(right);
+    return;
+  }
+  if (selectMode) {
+    if (!right.hand.joints?.["index-finger-tip"]) {
+      strokeHits = [];
+      const hit = raycastFromHand(right);
+      if (hit) strokeHits.push(hit);
+    }
+    return;
+  }
   if (nearModel(_pinch, GRAB_RANGE)) beginGrab(right.controller, -1);
 });
 right.controller.addEventListener("selectend", () => {
@@ -715,12 +1114,122 @@ right.controller.addEventListener("selectend", () => {
     if (picked) buildFromPickedPhoto(picked);
     return;
   }
+  if (selectMode) {
+    finishSelectionStroke();
+    return;
+  }
   if (grabSource === right.controller) endGrab();
 });
+
+function meshesOf(root) {
+  const meshes = [];
+  root.traverse((child) => {
+    if (child.isMesh) meshes.push(child);
+  });
+  return meshes;
+}
+
+/** Adjacency list from a geometry's index buffer, for smoothRegion. */
+function buildNeighbors(geometry, count) {
+  const sets = Array.from({ length: count }, () => new Set());
+  const index = geometry.index;
+  if (index) {
+    const add = (a, b) => {
+      sets[a].add(b);
+      sets[b].add(a);
+    };
+    const arr = index.array;
+    for (let i = 0; i < arr.length; i += 3) {
+      add(arr[i], arr[i + 1]);
+      add(arr[i + 1], arr[i + 2]);
+      add(arr[i + 2], arr[i]);
+    }
+  }
+  return sets.map((s) => Array.from(s));
+}
+
+function hexToRgb01(hex) {
+  const c = new THREE.Color(hex);
+  return { r: c.r, g: c.g, b: c.b };
+}
+
+/** Mutate one mesh's geometry with a regionOps.js op, in the mesh's own local space. */
+function applyRegionOpToMesh(mesh, cmd, selection) {
+  const geom = mesh.geometry;
+  const pos = geom.attributes.position;
+  const count = pos.count;
+  const verts = new Array(count);
+  for (let i = 0; i < count; i++) verts[i] = { x: pos.getX(i), y: pos.getY(i), z: pos.getZ(i) };
+
+  let out = verts;
+  if (cmd.op === "scale") out = scaleRegion(verts, selection, cmd.factor);
+  else if (cmd.op === "pull") out = pullRegion(verts, selection, cmd.amountM);
+  else if (cmd.op === "flatten") out = flattenRegion(verts, selection);
+  else if (cmd.op === "smooth") out = smoothRegion(verts, buildNeighbors(geom, count), selection, 0.5);
+
+  if (out !== verts) {
+    for (let i = 0; i < count; i++) pos.setXYZ(i, out[i].x, out[i].y, out[i].z);
+    pos.needsUpdate = true;
+    geom.computeVertexNormals();
+  }
+
+  if (cmd.op === "paint") {
+    let color = geom.attributes.color;
+    if (!color) {
+      const arr = new Float32Array(count * 3).fill(1);
+      color = new THREE.BufferAttribute(arr, 3);
+      geom.setAttribute("color", color);
+    }
+    const colors = new Array(count);
+    for (let i = 0; i < count; i++) colors[i] = { r: color.getX(i), g: color.getY(i), b: color.getZ(i) };
+    const painted = paintRegion(colors, verts, selection, hexToRgb01(cmd.color));
+    for (let i = 0; i < count; i++) color.setXYZ(i, painted[i].r, painted[i].g, painted[i].b);
+    color.needsUpdate = true;
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    mats.forEach((m) => {
+      if (m) m.vertexColors = true;
+    });
+  }
+}
+
+/**
+ * A region command (regionOps.js) applied to every mesh in currentModel, then
+ * saved as a hand-edit version — no LLM round trip. Selection.center/normal
+ * are already in currentModel's local frame (see toModelLocalPoint), the same
+ * frame vertex buffers live in for a single-mesh sculpt.
+ */
+async function applyRegionCommand(cmd, selection, text) {
+  if (!currentModel || !selection) throw new Error("Nothing is selected.");
+  const meshes = meshesOf(currentModel);
+  if (!meshes.length) throw new Error("No mesh to edit.");
+  meshes.forEach((mesh) => applyRegionOpToMesh(mesh, cmd, selection));
+
+  if (!lastProjectId) {
+    // Best-effort, like the backend's own versioning: the edit still shows,
+    // it just isn't saved as a version yet.
+    return { ok: true, reply: "Done.", action: "hand_edit", rebuilt: false };
+  }
+
+  const glbBuffer = await new GLTFExporter().parseAsync(currentModel, { binary: true });
+  const form = new FormData();
+  form.append("glb", new Blob([glbBuffer], { type: "model/gltf-binary" }), "edit.glb");
+  form.append("op", "hand_edit");
+  form.append("summary", text || cmd.op);
+  form.append("session_id", SESSION_ID);
+
+  const res = await fetch(`${API_BASE}/api/projects/${lastProjectId}/versions`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
 
 const percy = new PercyAssistant({
   onModelUpdate: (data) => setModelFromResponse(data),
   onStatusMessage: (msg, ok) => setStatus(msg, ok),
+  onRegionCommand: (cmd, selection, text) => applyRegionCommand(cmd, selection, text),
+  onSelectionCleared: () => clearSelectionHighlight(),
   onPhotoCandidates: (cands) => {
     if (!cands || !cands.length) {
       photoPicker.hide();
@@ -785,12 +1294,17 @@ renderer.setAnimationLoop(() => {
 
   pollHand(left, 0);
   pollHand(right, 1);
-  updateGrab();
+  updateTwoHand();
+  if (!twoHandOn) updateGrab();
+  updateParamPanel();
+  updateParamDrag();
+  dimsLabel.follow(currentModel, camera);
+  tape.update();
   const nowTick = performance.now();
   photoPicker.tick((nowTick - lastTick) / 1000);
   lastTick = nowTick;
 
-  if (!grabbing) {
+  if (!grabbing && !twoHandOn) {
     const decay = 0.92;
     halo.material.opacity *= decay;
     if (halo.material.opacity < 0.01) halo.material.opacity = 0;
@@ -833,6 +1347,32 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
   pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
   pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
+  if (tapeMode) {
+    const hit = currentModel && raycaster.intersectObject(currentModel, true)[0];
+    if (hit) tape.place(hit.point);
+    return;
+  }
+  if (selectMode) {
+    const hit = currentModel && raycaster.intersectObject(currentModel, true)[0];
+    if (hit) {
+      let worldNormal = new THREE.Vector3(0, 1, 0);
+      if (hit.face) worldNormal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+      let part = null;
+      for (let o = hit.object; o && o !== currentModel; o = o.parent) {
+        if (o.name) {
+          part = o.name;
+          break;
+        }
+      }
+      strokeHits = [
+        { point: toModelLocalPoint(hit.point), normal: toModelLocalDirection(worldNormal), part },
+      ];
+      finishSelectionStroke();
+    } else {
+      setStatus("Click on the model to select a spot.", false);
+    }
+    return;
+  }
   const target = modelInteractTarget();
   if (target && raycaster.intersectObject(target, true).length) {
     desktopMode = e.shiftKey ? "spin" : "move";
@@ -866,9 +1406,28 @@ window.addEventListener("pointermove", (e) => {
   }
 });
 
+renderer.domElement.addEventListener(
+  "wheel",
+  (e) => {
+    if (renderer.xr.isPresenting) return;
+    // Display zoom only, same as the two-hand spread.
+    navScale = clampNavScale(navScale, Math.exp(-e.deltaY * 0.001));
+    modelRoot.scale.setScalar(navScale);
+  },
+  { passive: true }
+);
+
 window.addEventListener("keydown", (e) => {
   if (e.key === "m" || e.key === "M") {
     percy.toggleMute();
+    return;
+  }
+  if ((e.key === "t" || e.key === "T") && !e.repeat) {
+    setTapeMode(!tapeMode);
+    return;
+  }
+  if ((e.key === "v" || e.key === "V") && !e.repeat) {
+    setSelectMode(!selectMode);
     return;
   }
   if (e.code === "Space" && !e.repeat) {
@@ -881,6 +1440,16 @@ window.addEventListener("keyup", (e) => {
     e.preventDefault();
     percy.endTalk();
   }
+});
+
+document.getElementById("tapeButton")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  setTapeMode(!tapeMode);
+});
+
+document.getElementById("selectButton")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  setSelectMode(!selectMode);
 });
 
 const micButton = document.getElementById("micButton");
@@ -936,6 +1505,12 @@ window.PerceptionCAD = {
   onVoiceStateChange: (callback) => voiceState.subscribe(callback),
   
   isGrabbing: () => grabbing,
+  isTwoHand: () => twoHandOn,
+  setTapeMode,
+  getTapeDistanceM: () => tape.distance(),
+  setSelectMode,
+  getSelection: () => pendingSelection,
+  getNavScale: () => navScale,
   placeModelInFrontOfUser,
   clearStaleGrabRefs: clearStaleGrabRefs,
   rebindGrabAfterMeshSwap: () => {
