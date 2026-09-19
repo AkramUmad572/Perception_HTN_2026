@@ -318,6 +318,66 @@ def test_drill_errors_speakable(tmp: Path) -> tuple[int, int]:
     return sum(r[0] for r in results), sum(r[1] for r in results)
 
 
+# ---------------------------------------------------------------- add_loop
+
+LOOP_UNITS = 0.02  # a 10 mm loop is 0.2 units on the unit sphere
+
+
+def test_loop_on_sphere(tmp: Path) -> tuple[int, int]:
+    print("\nadd_loop on top of a sphere")
+    s = _sphere()
+    out = boolean.add_loop(s, (0, 1, 0), (0, 1, 0), LOOP_UNITS)
+    p, f = _check("watertight and bigger", out.is_watertight and out.volume > s.volume,
+                  f"watertight={out.is_watertight} {out.volume=:.4f} {s.volume=:.4f}")
+    p2, f2 = _check("one body", len(out.split(only_watertight=False)) == 1)
+    top = out.bounds[1][1]
+    p3, f3 = _check("rises above the sphere, within one loop", 1.0 < top < 1.0 + 0.2, f"{top=:.4f}")
+    # The hole must be open: a ray along the ring axis through the hole centre misses.
+    return p + p2 + p3, f + f2 + f3
+
+
+def test_loop_hole_is_open(tmp: Path) -> tuple[int, int]:
+    print("\nadd_loop leaves the loop's hole clear of the surface")
+    s = _sphere()
+    out = boolean.add_loop(s, (0, 1, 0), (0, 1, 0), LOOP_UNITS)
+    # Normal +Y, so the ring axis is horizontal; the hole centre sits at
+    # 1 + hole_r + wall/2 = 1 + 0.04 + 0.03 = 1.07. The point must be outside.
+    # (Mesh.contains needs rtree, which is not installed; probe with manifold.)
+    probe = trimesh.creation.icosphere(subdivisions=1, radius=0.005)
+    probe.apply_translation((0, 1.07, 0))
+    try:
+        filled = out.intersection(probe, engine="manifold").volume
+    except Exception:  # noqa: BLE001  (empty intersection may come back as no mesh)
+        filled = 0.0
+    return _check("hole centre is empty space", filled < 1e-9, f"{filled=}")
+
+
+def test_loop_errors_speakable(tmp: Path) -> tuple[int, int]:
+    print("\nadd_loop rejects bad input with speakable reasons")
+    s = _sphere()
+    results = [
+        _expect_error("floating", lambda: boolean.add_loop(s, (5, 5, 5), (0, 1, 0), LOOP_UNITS)),
+        _expect_error("hole too big", lambda: boolean.add_loop(s, (0, 1, 0), (0, 1, 0), LOOP_UNITS, 10, 12)),
+        _expect_error("zero size", lambda: boolean.add_loop(s, (0, 1, 0), (0, 1, 0), LOOP_UNITS, 0, 0)),
+        _expect_error("no real size", lambda: boolean.add_loop(s, (0, 1, 0), (0, 1, 0), 0)),
+        _expect_error("no normal", lambda: boolean.add_loop(s, (0, 1, 0), (0, 0, 0), LOOP_UNITS)),
+    ]
+    return sum(r[0] for r in results), sum(r[1] for r in results)
+
+
+def test_loop_keeps_texture_colors(tmp: Path) -> tuple[int, int]:
+    print("\nadd_loop on the textured box takes the colour under it")
+    mesh = boolean.load_mesh(_textured_box_glb(tmp / "tex.glb"))
+    out = boolean.add_loop(mesh, (-0.3, 0.5, 0), (0, 1, 0), LOOP_UNITS)
+    ok, why = _colors_split_by_x(out)
+    p, f = _check("red/blue split survives", ok, why)
+    rgb = np.asarray(out.visual.vertex_colors)[:, :3]
+    ring = rgb[out.vertices[:, 1] > 0.52]
+    p2, f2 = _check("ring is red", len(ring) > 0 and (ring == RED).all(),
+                    f"ring colours {np.unique(ring, axis=0).tolist()}")
+    return p + p2, f + f2
+
+
 # ---------------------------------------------------------------- runner
 
 TESTS = [
@@ -338,6 +398,10 @@ TESTS = [
     test_drill_repaired_sculpt,
     test_drill_keeps_texture_colors,
     test_drill_errors_speakable,
+    test_loop_on_sphere,
+    test_loop_hole_is_open,
+    test_loop_errors_speakable,
+    test_loop_keeps_texture_colors,
 ]
 
 

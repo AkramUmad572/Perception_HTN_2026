@@ -282,6 +282,59 @@ def drill_hole(
     return _transfer_colors(out, solid)
 
 
+MSG_LOOP_SIZE = "The loop needs a size bigger than zero."
+MSG_LOOP_HOLE = "The loop's hole has to be smaller than the loop."
+MSG_NO_NORMAL = "I couldn't tell which way the surface faces there."
+MSG_LOOP_MISSED = "That spot missed the model, so the loop would float in the air."
+
+
+def add_loop(
+    mesh: trimesh.Trimesh,
+    center,
+    normal,
+    units_per_mm: float,
+    outer_d_mm: float = 10.0,
+    hole_d_mm: float = 4.0,
+    thickness_mm: float = 3.0,
+) -> trimesh.Trimesh:
+    """
+    Fuse a hanging loop (a flat ring) onto the surface at ``center``.
+
+    The ring stands up along ``normal`` (pointing out of the surface) with its
+    axis perpendicular to it, like a keyring loop: half the wall is sunk into
+    the surface so it bonds, and the hole sits fully outside it.
+    """
+    units = _units(units_per_mm)
+    if not all(_positive(v) for v in (outer_d_mm, hole_d_mm, thickness_mm)):
+        raise BooleanError(MSG_LOOP_SIZE)
+    if hole_d_mm >= outer_d_mm:
+        raise BooleanError(MSG_LOOP_HOLE)
+    up = _unit(normal, MSG_NO_NORMAL)
+    c = np.asarray(center, dtype=float)
+
+    solid = repair(mesh)
+    outer_r = outer_d_mm / 2.0 * units
+    hole_r = hole_d_mm / 2.0 * units
+    ring = trimesh.creation.annulus(
+        r_min=hole_r, r_max=outer_r, height=thickness_mm * units, sections=CUTTER_SECTIONS
+    )
+    # Ring axis: horizontal when the normal allows it, so the loop reads as a
+    # hanger when the model stands upright.
+    axis = np.cross(up, [0.0, 1.0, 0.0])
+    if np.linalg.norm(axis) < 1e-6:
+        axis = np.cross(up, [1.0, 0.0, 0.0])
+    axis /= np.linalg.norm(axis)
+    ring.apply_transform(trimesh.geometry.align_vectors([0.0, 0.0, 1.0], axis))
+    ring.apply_translation(c + up * (hole_r + (outer_r - hole_r) / 2.0))
+
+    out = _boolean(solid, ring, "union")
+    # A bonded loop merges into an existing body; a floating one adds a body.
+    # (Volume arithmetic is too noisy here: manifold's output is float32-ish.)
+    if out.body_count > solid.body_count:
+        raise BooleanError(MSG_LOOP_MISSED)
+    return _transfer_colors(out, solid)
+
+
 def _units(units_per_mm) -> float:
     if not _positive(units_per_mm):
         raise BooleanError(MSG_NO_SIZE)
