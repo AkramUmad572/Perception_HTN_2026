@@ -57,6 +57,19 @@ else
 fi
 cd ..
 
+# Test 3b: Intent router tests
+echo ""
+echo ">>> Running Intent Router Tests..."
+echo ""
+cd backend
+if python3 -m ai.test_intent; then
+    echo "Intent router tests: PASSED"
+else
+    echo "Intent router tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+cd ..
+
 # Test 4: Client model update tests
 echo ""
 echo ">>> Running Client Model Update Tests..."
