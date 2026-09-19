@@ -86,3 +86,15 @@ export function selectionFromStroke(hits) {
   const snapped = dominantPart(hits);
   return { parts: snapped ? [snapped] : [], center, normal, radius };
 }
+
+/**
+ * Outside circle/lasso mode, a right-hand pinch on the model is either a
+ * quick tap (select that point) or a hold (grab, as before). Released before
+ * `maxMs` and moved under `maxM` from where the pinch started = a tap.
+ */
+export const TAP_MAX_MS = 250;
+export const TAP_MAX_MOVE_M = 0.02;
+
+export function isTapRelease(durationMs, movementM, maxMs = TAP_MAX_MS, maxM = TAP_MAX_MOVE_M) {
+  return durationMs < maxMs && movementM < maxM;
+}
