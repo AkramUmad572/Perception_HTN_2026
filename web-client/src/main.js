@@ -12,6 +12,7 @@ import { ARButton } from "three/addons/webxr/ARButton.js";
 import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
 import { XRHandModelFactory } from "three/addons/webxr/XRHandModelFactory.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
 import { PercyAssistant } from "./voice/PercyAssistant.js";
@@ -35,6 +36,14 @@ import {
   dragParamValue,
   paramPanelLines,
 } from "./interaction/paramPanel.js";
+import { selectionFromStroke } from "./interaction/selection.js";
+import {
+  scaleRegion,
+  pullRegion,
+  flattenRegion,
+  smoothRegion,
+  paintRegion,
+} from "./interaction/regionOps.js";
 
 // Desktop XR emulation is injected by @iwsdk/vite-plugin-dev (localhost only).
 // Quest / LAN IP keep native WebXR — do not manually install IWER here.
@@ -431,6 +440,108 @@ const tape = createTapeMeasure(scene, modelRoot, {
 });
 let tapeMode = false;
 
+// The project this session's builds land in (from CommandResponse.session),
+// so a hand edit knows where to POST its saved version.
+let lastProjectId = null;
+
+// --- Selection (WS-FG): point/lasso a spot on the model, then say what to
+// do to it ("drill a hole", "bigger", "paint red", ...). Selection.center
+// and .normal are in the model's own GLB-local frame (matching what the
+// backend expects and what mesh/boolean.py operates on), never world space.
+let selectMode = false;
+let pendingSelection = null;
+let strokeHits = [];
+const _local = new THREE.Vector3();
+const _invModel = new THREE.Matrix4();
+const _normalMat = new THREE.Matrix3();
+
+const selectionMarker = new THREE.Mesh(
+  new THREE.SphereGeometry(0.006, 16, 12),
+  new THREE.MeshBasicMaterial({ color: 0xffee58, transparent: true, opacity: 0.9, depthTest: false })
+);
+selectionMarker.visible = false;
+selectionMarker.renderOrder = 999;
+
+/** A world-space point/direction, expressed in currentModel's own local frame. */
+function toModelLocalPoint(worldPoint) {
+  currentModel.updateMatrixWorld(true);
+  _invModel.copy(currentModel.matrixWorld).invert();
+  _local.copy(worldPoint).applyMatrix4(_invModel);
+  return { x: _local.x, y: _local.y, z: _local.z };
+}
+
+function toModelLocalDirection(worldDir) {
+  currentModel.updateMatrixWorld(true);
+  _normalMat.getNormalMatrix(currentModel.matrixWorld);
+  _local.copy(worldDir).applyMatrix3(_normalMat).normalize();
+  return { x: _local.x, y: _local.y, z: _local.z };
+}
+
+function modelHit(origin, dir) {
+  if (!currentModel) return null;
+  tapeRaycaster.set(origin, dir.clone().normalize());
+  const hit = tapeRaycaster.intersectObject(currentModel, true)[0];
+  if (!hit) return null;
+  let worldNormal = new THREE.Vector3(0, 1, 0);
+  if (hit.face) {
+    worldNormal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+  }
+  let part = null;
+  for (let o = hit.object; o && o !== currentModel; o = o.parent) {
+    if (o.name) {
+      part = o.name;
+      break;
+    }
+  }
+  return {
+    point: toModelLocalPoint(hit.point),
+    normal: toModelLocalDirection(worldNormal),
+    part,
+  };
+}
+
+function clearSelectionHighlight() {
+  pendingSelection = null;
+  strokeHits = [];
+  selectionMarker.visible = false;
+  if (selectionMarker.parent) selectionMarker.parent.remove(selectionMarker);
+}
+
+function showSelectionHighlight(selection) {
+  if (!currentModel) return;
+  currentModel.add(selectionMarker);
+  selectionMarker.position.set(selection.center.x, selection.center.y, selection.center.z);
+  selectionMarker.scale.setScalar(selection.radius > 0 ? Math.max(selection.radius, 0.004) / 0.006 : 1);
+  selectionMarker.visible = true;
+}
+
+function finishSelectionStroke() {
+  if (!strokeHits.length) return;
+  const selection = selectionFromStroke(strokeHits);
+  strokeHits = [];
+  if (!selection) return;
+  pendingSelection = selection;
+  showSelectionHighlight(selection);
+  percy.setSelection(selection);
+  setStatus(
+    selection.parts.length ? `Selected ${selection.parts[0]}. Say what to do.` : "Point selected. Say what to do.",
+    true
+  );
+}
+
+function setSelectMode(on) {
+  selectMode = on;
+  strokeHits = [];
+  if (!on) {
+    clearSelectionHighlight();
+    percy.clearSelection();
+  }
+  if (on && grabbing) endGrab();
+  if (on && tapeMode) setTapeMode(false);
+  document.getElementById("selectButton")?.classList.toggle("active", on);
+  setStatus(on ? "Select mode: pinch a spot on the model." : "Select mode off.", true);
+}
+
 function refreshDimensions() {
   if (!currentModel) return;
   dimsLabel.setSize(realSize(modelBaseSize, realScale()));
@@ -451,6 +562,7 @@ function applyDisplaySize(obj, displaySizeM) {
 async function setModelFromResponse(data) {
   cadParams = data.cad_params || {};
   if (data.session?.project_id) currentProjectId = data.session.project_id;
+  if (data.session?.project_id) lastProjectId = data.session.project_id;
   if (data.action === "find_photos") {
     return;
   }
@@ -516,6 +628,8 @@ async function setModelFromResponse(data) {
       lastBackend = data.backend || (textured ? "mesh" : "cad");
       refreshDimensions();
       tape.clear();
+      clearSelectionHighlight();
+      percy.clearSelection();
       photoPicker.hide();
 
       if (wasGrabbing && savedOffset && savedSource) {
@@ -756,6 +870,21 @@ function pollHand(handEntry, key) {
     return;
   }
 
+  if (key === 1 && selectMode) {
+    if (held[1] && !wasHeld) {
+      strokeHits = [];
+      const hit = raycastFromHand(handEntry);
+      if (hit) strokeHits.push(hit);
+    } else if (held[1] && wasHeld) {
+      const hit = raycastFromHand(handEntry);
+      if (hit) strokeHits.push(hit);
+    } else if (!held[1] && wasHeld) {
+      finishSelectionStroke();
+    }
+    wasPinching[key] = isPinching;
+    return;
+  }
+
   if (key === 1 && !grabbing) {
     getModelCenter(_modelCenter);
     const dist = pos.distanceTo(_modelCenter);
@@ -927,10 +1056,25 @@ function placeTapePointFromHand(handEntry) {
   else setStatus("Point at the model to measure.", false);
 }
 
+/** Same target-ray-then-pinch-to-centre aim as the tape measure, for selection.js hits. */
+function raycastFromHand(handEntry) {
+  const c = handEntry.controller;
+  c.updateMatrixWorld(true);
+  _rayDir.set(0, 0, -1).transformDirection(c.matrixWorld);
+  let hit = modelHit(new THREE.Vector3().setFromMatrixPosition(c.matrixWorld), _rayDir);
+  if (!hit) {
+    const from = handEntry.pinchAnchor.position;
+    getModelCenter(_modelCenter);
+    hit = modelHit(from, _modelCenter.clone().sub(from));
+  }
+  return hit;
+}
+
 function setTapeMode(on) {
   tapeMode = on;
   if (!on) tape.clear();
   if (on && grabbing) endGrab();
+  if (on && selectMode) setSelectMode(false);
   document.getElementById("tapeButton")?.classList.toggle("active", on);
   setStatus(on ? "Tape measure: pinch two points on the model." : "Tape measure off.", true);
 }
@@ -953,6 +1097,14 @@ right.controller.addEventListener("selectstart", () => {
     if (!right.hand.joints?.["index-finger-tip"]) placeTapePointFromHand(right);
     return;
   }
+  if (selectMode) {
+    if (!right.hand.joints?.["index-finger-tip"]) {
+      strokeHits = [];
+      const hit = raycastFromHand(right);
+      if (hit) strokeHits.push(hit);
+    }
+    return;
+  }
   if (nearModel(_pinch, GRAB_RANGE)) beginGrab(right.controller, -1);
 });
 right.controller.addEventListener("selectend", () => {
@@ -962,12 +1114,122 @@ right.controller.addEventListener("selectend", () => {
     if (picked) buildFromPickedPhoto(picked);
     return;
   }
+  if (selectMode) {
+    finishSelectionStroke();
+    return;
+  }
   if (grabSource === right.controller) endGrab();
 });
+
+function meshesOf(root) {
+  const meshes = [];
+  root.traverse((child) => {
+    if (child.isMesh) meshes.push(child);
+  });
+  return meshes;
+}
+
+/** Adjacency list from a geometry's index buffer, for smoothRegion. */
+function buildNeighbors(geometry, count) {
+  const sets = Array.from({ length: count }, () => new Set());
+  const index = geometry.index;
+  if (index) {
+    const add = (a, b) => {
+      sets[a].add(b);
+      sets[b].add(a);
+    };
+    const arr = index.array;
+    for (let i = 0; i < arr.length; i += 3) {
+      add(arr[i], arr[i + 1]);
+      add(arr[i + 1], arr[i + 2]);
+      add(arr[i + 2], arr[i]);
+    }
+  }
+  return sets.map((s) => Array.from(s));
+}
+
+function hexToRgb01(hex) {
+  const c = new THREE.Color(hex);
+  return { r: c.r, g: c.g, b: c.b };
+}
+
+/** Mutate one mesh's geometry with a regionOps.js op, in the mesh's own local space. */
+function applyRegionOpToMesh(mesh, cmd, selection) {
+  const geom = mesh.geometry;
+  const pos = geom.attributes.position;
+  const count = pos.count;
+  const verts = new Array(count);
+  for (let i = 0; i < count; i++) verts[i] = { x: pos.getX(i), y: pos.getY(i), z: pos.getZ(i) };
+
+  let out = verts;
+  if (cmd.op === "scale") out = scaleRegion(verts, selection, cmd.factor);
+  else if (cmd.op === "pull") out = pullRegion(verts, selection, cmd.amountM);
+  else if (cmd.op === "flatten") out = flattenRegion(verts, selection);
+  else if (cmd.op === "smooth") out = smoothRegion(verts, buildNeighbors(geom, count), selection, 0.5);
+
+  if (out !== verts) {
+    for (let i = 0; i < count; i++) pos.setXYZ(i, out[i].x, out[i].y, out[i].z);
+    pos.needsUpdate = true;
+    geom.computeVertexNormals();
+  }
+
+  if (cmd.op === "paint") {
+    let color = geom.attributes.color;
+    if (!color) {
+      const arr = new Float32Array(count * 3).fill(1);
+      color = new THREE.BufferAttribute(arr, 3);
+      geom.setAttribute("color", color);
+    }
+    const colors = new Array(count);
+    for (let i = 0; i < count; i++) colors[i] = { r: color.getX(i), g: color.getY(i), b: color.getZ(i) };
+    const painted = paintRegion(colors, verts, selection, hexToRgb01(cmd.color));
+    for (let i = 0; i < count; i++) color.setXYZ(i, painted[i].r, painted[i].g, painted[i].b);
+    color.needsUpdate = true;
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    mats.forEach((m) => {
+      if (m) m.vertexColors = true;
+    });
+  }
+}
+
+/**
+ * A region command (regionOps.js) applied to every mesh in currentModel, then
+ * saved as a hand-edit version — no LLM round trip. Selection.center/normal
+ * are already in currentModel's local frame (see toModelLocalPoint), the same
+ * frame vertex buffers live in for a single-mesh sculpt.
+ */
+async function applyRegionCommand(cmd, selection, text) {
+  if (!currentModel || !selection) throw new Error("Nothing is selected.");
+  const meshes = meshesOf(currentModel);
+  if (!meshes.length) throw new Error("No mesh to edit.");
+  meshes.forEach((mesh) => applyRegionOpToMesh(mesh, cmd, selection));
+
+  if (!lastProjectId) {
+    // Best-effort, like the backend's own versioning: the edit still shows,
+    // it just isn't saved as a version yet.
+    return { ok: true, reply: "Done.", action: "hand_edit", rebuilt: false };
+  }
+
+  const glbBuffer = await new GLTFExporter().parseAsync(currentModel, { binary: true });
+  const form = new FormData();
+  form.append("glb", new Blob([glbBuffer], { type: "model/gltf-binary" }), "edit.glb");
+  form.append("op", "hand_edit");
+  form.append("summary", text || cmd.op);
+  form.append("session_id", SESSION_ID);
+
+  const res = await fetch(`${API_BASE}/api/projects/${lastProjectId}/versions`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
 
 const percy = new PercyAssistant({
   onModelUpdate: (data) => setModelFromResponse(data),
   onStatusMessage: (msg, ok) => setStatus(msg, ok),
+  onRegionCommand: (cmd, selection, text) => applyRegionCommand(cmd, selection, text),
+  onSelectionCleared: () => clearSelectionHighlight(),
   onPhotoCandidates: (cands) => {
     if (!cands || !cands.length) {
       photoPicker.hide();
@@ -1073,6 +1335,27 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
     if (hit) tape.place(hit.point);
     return;
   }
+  if (selectMode) {
+    const hit = currentModel && raycaster.intersectObject(currentModel, true)[0];
+    if (hit) {
+      let worldNormal = new THREE.Vector3(0, 1, 0);
+      if (hit.face) worldNormal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+      let part = null;
+      for (let o = hit.object; o && o !== currentModel; o = o.parent) {
+        if (o.name) {
+          part = o.name;
+          break;
+        }
+      }
+      strokeHits = [
+        { point: toModelLocalPoint(hit.point), normal: toModelLocalDirection(worldNormal), part },
+      ];
+      finishSelectionStroke();
+    } else {
+      setStatus("Click on the model to select a spot.", false);
+    }
+    return;
+  }
   const target = modelInteractTarget();
   if (target && raycaster.intersectObject(target, true).length) {
     desktopMode = e.shiftKey ? "spin" : "move";
@@ -1116,6 +1399,10 @@ window.addEventListener("keydown", (e) => {
     setTapeMode(!tapeMode);
     return;
   }
+  if ((e.key === "v" || e.key === "V") && !e.repeat) {
+    setSelectMode(!selectMode);
+    return;
+  }
   if (e.code === "Space" && !e.repeat) {
     e.preventDefault();
     percy.beginTalk();
@@ -1131,6 +1418,11 @@ window.addEventListener("keyup", (e) => {
 document.getElementById("tapeButton")?.addEventListener("click", (e) => {
   e.preventDefault();
   setTapeMode(!tapeMode);
+});
+
+document.getElementById("selectButton")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  setSelectMode(!selectMode);
 });
 
 const micButton = document.getElementById("micButton");
@@ -1189,6 +1481,8 @@ window.PerceptionCAD = {
   isTwoHand: () => twoHandOn,
   setTapeMode,
   getTapeDistanceM: () => tape.distance(),
+  setSelectMode,
+  getSelection: () => pendingSelection,
   getNavScale: () => navScale,
   placeModelInFrontOfUser,
   clearStaleGrabRefs: clearStaleGrabRefs,

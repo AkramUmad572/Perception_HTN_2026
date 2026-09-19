@@ -32,9 +32,18 @@ class Intent(BaseModel):
     photo_query: str | None = None
 
 
+class Selection(BaseModel):
+    """What the user pointed at, built client-side from a pinch/lasso on the model."""
+    parts: list[str] = Field(default_factory=list)  # GLB node names hit (CAD parts; empty for most sculpts)
+    center: list[float]  # [x,y,z] model-local GLB units (CAD GLB units are metres)
+    normal: list[float]  # outward surface normal at center, model-local
+    radius: float = 0.0  # model-local units; 0 = a point, not a circle
+
+
 class CommandRequest(BaseModel):
     text: str
     session_id: str = "default"
+    selection: Selection | None = None
 
 
 class PhotoChooseRequest(BaseModel):

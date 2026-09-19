@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from app.config import Settings
-from app.models import Intent
+from app.models import Intent, Selection
 from photos.search import is_photo_search, photo_query
 
 logger = logging.getLogger(__name__)
@@ -399,7 +399,7 @@ _MESH_UNAVAILABLE_REPLY = (
     "or set NVIDIA_API_KEY / MESHY_API_KEY."
 )
 _MESH_CAD_CLARIFY_REPLY = (
-    "I can't drill a hole in a sculpted mesh like CAD. "
+    "I can't build CAD features like that on a sculpted mesh. "
     "Ask me to build a new CAD part, or keep sculpting this one."
 )
 
@@ -662,13 +662,92 @@ def _check_absolute_size(text: str) -> Intent | None:
     )
 
 
+# Hole / loop / flat-base on an existing sculpt, routed to mesh/boolean.py
+# instead of the generic "I can't do that on a mesh" clarify. Hole and loop
+# need a point on the surface (the client's Selection); flat base does not.
+_HOLE_RE = re.compile(r"\bholes?\b", re.I)
+_LOOP_RE = re.compile(r"\b(?:hanging\s+)?loop\b|\bhanger\b|\bkeyring\s+loop\b", re.I)
+_FLAT_BASE_RE = re.compile(
+    r"\bflat(?:ten)?\s+(?:it\s+|the\s+|its\s+)?(?:base|bottom)\b|\bflat\s+base\b", re.I
+)
+_NO_SELECTION_REPLY = "Point at where you want it first."
+_MM_SIZE_RE = re.compile(
+    r"\b(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>" + "|".join(p for p, _m, _w in _SIZE_UNITS) + r")\b",
+    re.I,
+)
+
+
+def _size_mm_from_text(text: str) -> float | None:
+    """First "<number> <unit>" in the text, converted to millimetres."""
+    m = _MM_SIZE_RE.search(text)
+    if not m:
+        return None
+    for pattern, to_m, _word in _SIZE_UNITS:
+        if re.fullmatch(pattern, m.group("unit"), re.I):
+            return float(m.group("num")) * to_m * 1000.0
+    return None
+
+
+def _check_mesh_boolean(text: str, selection: Selection | None) -> Intent | None:
+    """"Drill a hole" / "add a loop" / "flatten the base" on a sculpt.
+
+    Flat base needs no selection. Hole and loop need a point on the surface;
+    without one they clarify rather than falling through to the generic
+    mesh/CAD mismatch reply.
+    """
+    t = text.lower().strip()
+    if _is_new_object_request(t):
+        return None
+    if _FLAT_BASE_RE.search(t):
+        return Intent(
+            action="mesh_boolean",
+            backend="mesh",
+            params={"op": "flat_base"},
+            reply="Flattening the base.",
+        )
+    is_hole = bool(_HOLE_RE.search(t))
+    is_loop = bool(_LOOP_RE.search(t))
+    if not (is_hole or is_loop):
+        return None
+    has_selection = bool(selection is not None and getattr(selection, "center", None))
+    if not has_selection:
+        return Intent(action="clarify", backend="mesh", reply=_NO_SELECTION_REPLY)
+    op = "hole" if is_hole else "loop"
+    params: dict[str, Any] = {
+        "op": op,
+        "center": list(selection.center),
+        "normal": list(selection.normal),
+    }
+    diameter_mm = _size_mm_from_text(t)
+    if diameter_mm is not None:
+        params["diameter_mm"] = diameter_mm
+    reply = "Drilling that hole." if op == "hole" else "Adding a loop."
+    return Intent(action="mesh_boolean", backend="mesh", params=params, reply=reply)
+
+
+def _describe_selection(selection: Selection | None) -> str | None:
+    """Spoken-free text for the codegen payload: "user pointed at X near (x,y,z) mm"."""
+    if selection is None:
+        return None
+    center = getattr(selection, "center", None)
+    if not center or len(center) != 3:
+        return None
+    parts = getattr(selection, "parts", None) or []
+    parts_txt = ", ".join(parts) if parts else "the model"
+    x, y, z = (round(float(c) * 1000.0, 1) for c in center)
+    return f"user pointed at {parts_txt} near ({x}, {y}, {z}) mm"
+
+
 def _build_user_payload(
     text: str,
     current_script: str | None = None,
     last_summary: str | None = None,
     current_color: str | None = None,
+    selection_desc: str | None = None,
 ) -> str:
     payload: dict[str, Any] = {"utterance": text}
+    if selection_desc:
+        payload["selection"] = selection_desc
     if current_script:
         payload["has_existing_model"] = True
         payload["current_script"] = current_script
@@ -746,6 +825,7 @@ async def _gemini_codegen(
     last_error: str | None = None,
     last_summary: str | None = None,
     current_color: str | None = None,
+    selection_desc: str | None = None,
 ) -> Intent:
     """Generate CadQuery code via Gemini API."""
     import httpx
@@ -758,7 +838,7 @@ async def _gemini_codegen(
         temperature = 0.15
     else:
         user_content = _build_user_payload(
-            text, current_script, last_summary, current_color
+            text, current_script, last_summary, current_color, selection_desc
         )
         temperature = 0.15 if current_script else 0.4
 
@@ -798,6 +878,7 @@ async def _openai_codegen(
     last_error: str | None = None,
     last_summary: str | None = None,
     current_color: str | None = None,
+    selection_desc: str | None = None,
 ) -> Intent:
     """Generate CadQuery code via OpenAI API."""
     from openai import AsyncOpenAI
@@ -809,7 +890,7 @@ async def _openai_codegen(
         temperature = 0.15
     else:
         user_content = _build_user_payload(
-            text, current_script, last_summary, current_color
+            text, current_script, last_summary, current_color, selection_desc
         )
         temperature = 0.15 if current_script else 0.4
 
@@ -992,6 +1073,7 @@ async def generate_code(
     last_error: str | None = None,
     last_summary: str | None = None,
     current_color: str | None = None,
+    selection_desc: str | None = None,
 ) -> Intent:
     """Generate CadQuery code from natural language using LLM."""
     kwargs = {
@@ -1001,6 +1083,7 @@ async def generate_code(
         "last_error": last_error,
         "last_summary": last_summary,
         "current_color": current_color,
+        "selection_desc": selection_desc,
     }
     if settings.gemini_api_key:
         try:
@@ -1060,6 +1143,7 @@ async def parse_intent(
     current_color: str | None = None,
     last_backend: str | None = None,
     last_mesh_prompt: str | None = None,
+    selection: Selection | None = None,
 ) -> tuple[Intent, float]:
     """
     Parse user utterance into Intent (CadQuery script or mesh prompt).
@@ -1069,6 +1153,11 @@ async def parse_intent(
     2. Route cad vs mesh (CAD cues, organic cues, session)
     3. Fast path: named color only on CAD sessions
     4. Mesh: skip sandbox codegen. CAD: LLM script, new object drops current_script.
+
+    `selection` is what the client last pointed at (interaction/selection.js).
+    On a mesh session it can turn "drill a hole" into a mesh_boolean edit
+    instead of a clarify; on a CAD session it rides along in the codegen
+    payload as a hint of which part the user means.
 
     Returns (Intent, latency_ms).
     """
@@ -1105,6 +1194,14 @@ async def parse_intent(
     logger.info("Router → %s (session=%s new=%s)", routed, session_backend, is_new)
 
     if session_backend == "mesh" and not is_new:
+        # Above clarify_mesh: hole / loop / flat base are deterministic booleans,
+        # not a mismatch with CAD-only vocabulary.
+        boolean_intent = _check_mesh_boolean(cleaned, selection)
+        if boolean_intent:
+            logger.info(
+                "Fast path: mesh boolean %s", boolean_intent.params.get("op") or boolean_intent.action
+            )
+            return boolean_intent, (time.perf_counter() - t0) * 1000
         # Above clarify_mesh: "30 mm deep" contains a CAD cue but is only a resize.
         size_intent = _check_absolute_size(cleaned)
         if size_intent:
@@ -1150,6 +1247,7 @@ async def parse_intent(
         current_script=script_for_llm,
         last_summary=last_summary if script_for_llm else None,
         current_color=current_color or (current_params or {}).get("color"),
+        selection_desc=_describe_selection(selection),
     )
     final = choose_backend(
         cleaned,
