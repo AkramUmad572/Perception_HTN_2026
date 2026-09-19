@@ -160,7 +160,7 @@ export class PercyAssistant {
       this.onStatusMessage("Looking that up…", true);
 
       const result = await this._sendVoice(audioBlob);
-      await this._handleResponse(result);
+      await this._deliverResponse(result);
     } catch (e) {
       console.error("[Percy] Error in voice pipeline:", e);
       voiceState.toError(e.message);
@@ -236,7 +236,7 @@ export class PercyAssistant {
       const selection = this._takeSelection();
       if (selection) body.selection = selection;
       const result = await this._postJson(`${API_BASE}/api/command`, body);
-      await this._handleResponse(result);
+      await this._deliverResponse(result);
       return result;
     } catch (e) {
       voiceState.toError(e.message);
@@ -307,6 +307,27 @@ export class PercyAssistant {
     }
   }
 
+  /**
+   * Two-hand-stretch release: resize the project's real dimensions by
+   * `factor`. Silent on purpose, like postParamUpdate — this fires once per
+   * gesture, not on every frame of the stretch.
+   */
+  async postResize(projectId, factor) {
+    try {
+      const result = await this._postJson(
+        `${API_BASE}/api/projects/${projectId}/resize`,
+        { factor, session_id: SESSION_ID },
+        30000
+      );
+      await this._handleResponse(result);
+      return result;
+    } catch (e) {
+      console.error("[Percy] Resize failed:", e);
+      this.onStatusMessage(`Error: ${e.message}`, false);
+      return null;
+    }
+  }
+
   async _awaitJob(jobId) {
     const url = `${API_BASE}/api/jobs/${jobId}?session_id=${SESSION_ID}`;
     const deadline = Date.now() + JOB_MAX_MS;
@@ -324,16 +345,40 @@ export class PercyAssistant {
       misses = 0;
       if (data.action !== "building") return data;
       const secs = Math.round((data.latency_ms?.elapsed_ms || 0) / 1000);
-      this.onStatusMessage(`Sculpting from your photo… ${secs}s`, true);
+      this.onStatusMessage(`Still sculpting… ${secs}s`, true);
     }
     throw new Error("Build timed out");
+  }
+
+  // Voice/text commands that kick off a mesh build return immediately with
+  // action="building" + job_id (see app/pipeline.py's _start_mesh_build) so
+  // Percy can speak an instant ack instead of going silent for the sculpt's
+  // full 10-90s+. Speak the ack, then poll the same way choosePhoto() does,
+  // and hand the finished build to _handleResponse once it lands.
+  async _deliverResponse(result) {
+    if (result?.action !== "building" || !result?.job_id) {
+      await this._handleResponse(result);
+      return result;
+    }
+    await this._handleResponse(result);
+    try {
+      const final = await this._awaitJob(result.job_id);
+      await this._handleResponse(final);
+      return final;
+    } catch (e) {
+      voiceState.toError(e.message);
+      this.onStatusMessage(`Error: ${e.message}`, false);
+      setTimeout(() => voiceState.toIdle(), 3000);
+      return null;
+    }
   }
 
   async _handleResponse(data) {
     const heard = data.transcript ? `"${data.transcript}" → ` : "";
     const ms = data.latency_ms?.total_ms ? ` (${Math.round(data.latency_ms.total_ms)}ms)` : "";
 
-    if (data.action === "find_photos" && (data.candidates || []).length) {
+    const isPhotoListing = data.action === "find_photos" || data.action === "browse_photos";
+    if (isPhotoListing && (data.candidates || []).length) {
       this.onPhotoCandidates(data.candidates);
     } else if (data.rebuilt && data.glb_url) {
       this.onPhotoCandidates(null);

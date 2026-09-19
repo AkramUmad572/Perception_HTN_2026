@@ -1,11 +1,36 @@
+# Secrets
+.env
+*.env
+!.env.example
+backend/.env
+
+# Python
 __pycache__/
 *.pyc
 .venv/
-.claude/worktrees/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
 web-client/node_modules/
+dist/
+.vite/
+.iwsdk/
 web-client/.iwsdk/
 web-client/dist/
-backend/.env
-backend/storage/*/*
-!backend/storage/*/.gitkeep
+
+# Generated storage
+backend/storage/glb/*
+backend/storage/audio/*
+backend/storage/ref/*
 backend/storage/sessions.json
+!backend/storage/glb/.gitkeep
+!backend/storage/audio/.gitkeep
+!backend/storage/ref/.gitkeep
+
+# Worktrees
+.claude/worktrees/
+
+# OS
+.DS_Store

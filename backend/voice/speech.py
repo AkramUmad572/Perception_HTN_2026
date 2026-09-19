@@ -7,9 +7,8 @@ import re
 import time
 import uuid
 
-import httpx
-
 from app.config import Settings
+from app.httpclient import get_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -104,46 +103,47 @@ async def _elevenlabs_stt(
     mime = _audio_mime(filename)
     name = filename or "utterance.webm"
 
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        last_err: Exception | None = None
-        for model_id in ("scribe_v2", "scribe_v1"):
-            # Try with keyterms, then without if rejected
-            for with_keyterms in (True, False):
-                try:
-                    # Put fields in `files` (not `data`) so AsyncClient does not
-                    # try a sync multipart encode (httpx: "sync request with AsyncClient").
-                    files: list[tuple[str, tuple]] = [
-                        ("file", (name, audio_bytes, mime)),
-                        ("model_id", (None, model_id)),
-                        ("language_code", (None, "eng")),
-                        ("tag_audio_events", (None, "false")),
-                    ]
-                    if with_keyterms:
-                        for term in CAD_KEYTERMS:
-                            files.append(("keyterms", (None, term)))
+    client = get_http_client()
+    last_err: Exception | None = None
+    for model_id in ("scribe_v2", "scribe_v1"):
+        # Try with keyterms, then without if rejected
+        for with_keyterms in (True, False):
+            try:
+                # Put fields in `files` (not `data`) so AsyncClient does not
+                # try a sync multipart encode (httpx: "sync request with AsyncClient").
+                files: list[tuple[str, tuple]] = [
+                    ("file", (name, audio_bytes, mime)),
+                    ("model_id", (None, model_id)),
+                    ("language_code", (None, "eng")),
+                    ("tag_audio_events", (None, "false")),
+                ]
+                if with_keyterms:
+                    for term in CAD_KEYTERMS:
+                        files.append(("keyterms", (None, term)))
 
-                    resp = await client.post(
-                        "https://api.elevenlabs.io/v1/speech-to-text",
-                        headers={"xi-api-key": settings.elevenlabs_api_key},
-                        files=files,
-                    )
-                    if resp.status_code == 422 and with_keyterms:
-                        logger.info("Scribe rejected keyterms; retrying plain")
-                        continue
-                    resp.raise_for_status()
-                    transcript = (resp.json().get("text") or "").strip()
-                    transcript = normalize_wake_word(transcript)
-                    logger.info("STT(%s): %r", model_id, transcript)
-                    return transcript
-                except Exception as exc:
-                    last_err = exc
-                    logger.warning(
-                        "ElevenLabs STT %s keyterms=%s failed: %s",
-                        model_id,
-                        with_keyterms,
-                        exc,
-                    )
-        raise RuntimeError(f"ElevenLabs STT failed: {last_err}")
+                resp = await client.post(
+                    "https://api.elevenlabs.io/v1/speech-to-text",
+                    headers={"xi-api-key": settings.elevenlabs_api_key},
+                    files=files,
+                    timeout=90.0,
+                )
+                if resp.status_code == 422 and with_keyterms:
+                    logger.info("Scribe rejected keyterms; retrying plain")
+                    continue
+                resp.raise_for_status()
+                transcript = (resp.json().get("text") or "").strip()
+                transcript = normalize_wake_word(transcript)
+                logger.info("STT(%s): %r", model_id, transcript)
+                return transcript
+            except Exception as exc:
+                last_err = exc
+                logger.warning(
+                    "ElevenLabs STT %s keyterms=%s failed: %s",
+                    model_id,
+                    with_keyterms,
+                    exc,
+                )
+    raise RuntimeError(f"ElevenLabs STT failed: {last_err}")
 
 
 async def transcribe_audio(
@@ -160,28 +160,29 @@ async def transcribe_audio(
             logger.warning("ElevenLabs STT unavailable: %s", exc)
 
     if settings.deepgram_api_key:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                "https://api.deepgram.com/v1/listen"
-                "?model=nova-2&smart_format=true&language=en",
-                headers={
-                    "Authorization": f"Token {settings.deepgram_api_key}",
-                    "Content-Type": "application/octet-stream",
-                },
-                content=audio_bytes,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            transcript = (
-                data.get("results", {})
-                .get("channels", [{}])[0]
-                .get("alternatives", [{}])[0]
-                .get("transcript", "")
-                .strip()
-            )
-            transcript = normalize_wake_word(transcript)
-            logger.info("STT(deepgram): %r", transcript)
-            return transcript, (time.perf_counter() - t0) * 1000
+        client = get_http_client()
+        resp = await client.post(
+            "https://api.deepgram.com/v1/listen"
+            "?model=nova-2&smart_format=true&language=en",
+            headers={
+                "Authorization": f"Token {settings.deepgram_api_key}",
+                "Content-Type": "application/octet-stream",
+            },
+            content=audio_bytes,
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        transcript = (
+            data.get("results", {})
+            .get("channels", [{}])[0]
+            .get("alternatives", [{}])[0]
+            .get("transcript", "")
+            .strip()
+        )
+        transcript = normalize_wake_word(transcript)
+        logger.info("STT(deepgram): %r", transcript)
+        return transcript, (time.perf_counter() - t0) * 1000
 
     if settings.openai_api_key:
         try:
@@ -225,22 +226,23 @@ async def synthesize_speech(text: str, settings: Settings) -> tuple[str | None, 
     out_path = settings.audio_dir / out_name
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{settings.elevenlabs_voice_id}",
-                headers={
-                    "xi-api-key": settings.elevenlabs_api_key,
-                    "Content-Type": "application/json",
-                    "Accept": "audio/mpeg",
-                },
-                json={
-                    "text": text,
-                    "model_id": "eleven_turbo_v2_5",
-                    "voice_settings": {"stability": 0.4, "similarity_boost": 0.7},
-                },
-            )
-            resp.raise_for_status()
-            out_path.write_bytes(resp.content)
+        client = get_http_client()
+        resp = await client.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{settings.elevenlabs_voice_id}",
+            headers={
+                "xi-api-key": settings.elevenlabs_api_key,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+            json={
+                "text": text,
+                "model_id": "eleven_turbo_v2_5",
+                "voice_settings": {"stability": 0.4, "similarity_boost": 0.7},
+            },
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        out_path.write_bytes(resp.content)
         return f"/media/audio/{out_name}", (time.perf_counter() - t0) * 1000
     except Exception as exc:
         logger.warning("ElevenLabs TTS failed: %s", exc)

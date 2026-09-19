@@ -23,6 +23,28 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Warm cadquery/trimesh in *this* (parent) process once at import time, then
+# fork workers from it. `spawn` (macOS/Windows default) re-imports cadquery's
+# OpenCascade bindings from a cold interpreter on every single call — measured
+# at ~1.4s per script, dwarfing actual geometry time. `fork` clones this
+# already-warm process via copy-on-write, landing at ~10ms. Each execution
+# still gets its own real OS process (same isolation/timeout/kill guarantees
+# as before) — only how that process comes to exist has changed.
+try:
+    import cadquery as _cq_warm  # noqa: F401
+    from cadquery import exporters as _cq_exporters_warm  # noqa: F401
+    import trimesh as _trimesh_warm  # noqa: F401
+
+    _CADQUERY_PREWARMED = True
+except Exception:
+    _CADQUERY_PREWARMED = False
+
+try:
+    _MP_CTX = multiprocessing.get_context("fork")
+except ValueError:
+    # Platforms without fork (Windows) fall back to the previous behavior.
+    _MP_CTX = multiprocessing.get_context()
+
 EXEC_TIMEOUT_SEC = 45
 MAX_VERTICES = 500_000
 MAX_FACES = 500_000
@@ -493,8 +515,8 @@ def _execute_sandboxed(
 
     t0 = time.perf_counter()
 
-    result_queue = multiprocessing.Queue()
-    proc = multiprocessing.Process(
+    result_queue = _MP_CTX.Queue()
+    proc = _MP_CTX.Process(
         target=_run_in_sandbox,
         args=(script, str(out_glb), result_queue),
     )

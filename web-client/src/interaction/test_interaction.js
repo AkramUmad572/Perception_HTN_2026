@@ -22,6 +22,7 @@ import {
   applyTwoHandToPosition,
   isTwoHandActive,
   clampNavScale,
+  stretchFactor,
   NAV_SCALE_MIN,
   NAV_SCALE_MAX,
 } from "./twoHand.js";
@@ -42,8 +43,11 @@ import {
   strokeLength,
   dominantPart,
   selectionFromStroke,
+  isTapRelease,
   POINT_STROKE_LEN_M,
   LASSO_SNAP_SHARE,
+  TAP_MAX_MS,
+  TAP_MAX_MOVE_M,
 } from "./selection.js";
 import {
   falloff,
@@ -217,6 +221,15 @@ test("clampNavScale keeps the zoom in range", () => {
   assert(near(clampNavScale(1, 1.5), 1.5), "in range");
 });
 
+test("stretchFactor is the ratio of zoom now to zoom at gesture start", () => {
+  eq(stretchFactor(1, 1), 1);
+  assert(near(stretchFactor(1, 2), 2), "doubled");
+  assert(near(stretchFactor(2, 1), 0.5), "halved");
+  assert(near(stretchFactor(4, 6), 1.5), "1.5x from a non-1 start");
+  eq(stretchFactor(0, 5), 1);
+  eq(stretchFactor(-1, 5), 1);
+});
+
 console.log("\n=== paramPanel.js ===");
 
 test("paramsForPart matches a plain prefix", () => {
@@ -345,6 +358,18 @@ test("selectionFromStroke: a drag becomes a lasso with a positive radius", () =>
 test("selectionFromStroke returns null for no hits", () => {
   eq(selectionFromStroke([]), null);
   eq(selectionFromStroke(null), null);
+});
+
+test("isTapRelease: quick and still is a tap, slow or far is a hold", () => {
+  eq(TAP_MAX_MS, 250);
+  eq(TAP_MAX_MOVE_M, 0.02);
+  eq(isTapRelease(100, 0.005), true);
+  eq(isTapRelease(249, 0.019), true);
+  eq(isTapRelease(250, 0.005), false, "at the duration limit is a hold");
+  eq(isTapRelease(300, 0.005), false, "too slow is a hold");
+  eq(isTapRelease(100, 0.02), false, "at the movement limit is a hold");
+  eq(isTapRelease(100, 0.05), false, "too far is a hold");
+  eq(isTapRelease(50, 0.01, 500, 0.1), true, "custom thresholds");
 });
 
 console.log("\n=== regionOps.js ===");

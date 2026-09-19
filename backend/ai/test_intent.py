@@ -965,6 +965,47 @@ def test_history_rung():
     return passed, failed
 
 
+def test_ui_mode_rung():
+    """'select mode' / 'tape measure' / 'done' switch client UI modes, no network."""
+    print("\n=== Test: ui_mode rung ===")
+
+    passed = failed = 0
+
+    positives = [
+        ("select mode", "lasso"),
+        ("circle mode", "lasso"),
+        ("Select mode.", "lasso"),
+        ("Hey Percy, select mode", "lasso"),
+        ("tape measure", "tape"),
+        ("measure mode", "tape"),
+        ("Tape measure.", "tape"),
+        ("done", "none"),
+        ("cancel", "none"),
+        ("exit mode", "none"),
+        ("clear selection", "none"),
+        ("Percy, done", "none"),
+    ]
+    for text, mode in positives:
+        got = intent_mod._check_ui_mode(intent_mod._normalize_transcript(text))
+        if got is not None and got.action == "ui_mode" and got.params.get("mode") == mode and got.reply:
+            print(f"  [ok] {text!r} → ui_mode {mode}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} → {got.action if got else None} {got.params if got else None}")
+            failed += 1
+
+    for text in ("select the ear", "make it done", "cancel my order", "build me a circle"):
+        got = intent_mod._check_ui_mode(intent_mod._normalize_transcript(text))
+        if got is None:
+            print(f"  [ok] {text!r} is not a ui_mode command")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} → {got.action} {got.params}")
+            failed += 1
+
+    return passed, failed
+
+
 # ============================================================================
 # Run All Tests
 # ============================================================================
@@ -987,14 +1028,15 @@ def run_all_tests():
     a_pass, a_fail = test_absolute_size()
     mb_pass, mb_fail = test_mesh_boolean_rung()
     sel_pass, sel_fail = test_selection_in_codegen_payload()
+    ui_pass, ui_fail = test_ui_mode_rung()
 
     total_pass = (
         w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass
-        + h_pass + a_pass + mb_pass + sel_pass
+        + h_pass + a_pass + mb_pass + sel_pass + ui_pass
     )
     total_fail = (
         w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail
-        + h_fail + a_fail + mb_fail + sel_fail
+        + h_fail + a_fail + mb_fail + sel_fail + ui_fail
     )
 
     print("\n" + "=" * 60)
@@ -1012,6 +1054,7 @@ def run_all_tests():
     print(f"Absolute size:              {a_pass}/{a_pass + a_fail} passed")
     print(f"Mesh boolean rung:          {mb_pass}/{mb_pass + mb_fail} passed")
     print(f"Selection in payload:       {sel_pass}/{sel_pass + sel_fail} passed")
+    print(f"ui_mode rung:               {ui_pass}/{ui_pass + ui_fail} passed")
     print(f"TOTAL:                      {total_pass}/{total_pass + total_fail} passed")
     
     if total_fail > 0:

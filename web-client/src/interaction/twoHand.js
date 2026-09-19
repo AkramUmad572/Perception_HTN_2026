@@ -75,3 +75,14 @@ export function isTwoHandActive({ leftPinching, rightPinching, leftNear, rightNe
 export function clampNavScale(current, factor) {
   return Math.min(Math.max(current * factor, NAV_SCALE_MIN), NAV_SCALE_MAX);
 }
+
+/**
+ * How much a two-hand stretch has grown/shrunk the model since it engaged:
+ * the ratio of the current display zoom to the zoom when the gesture began.
+ * Used both for the live dimensions-label preview and as the resize POST
+ * factor on release.
+ */
+export function stretchFactor(navScaleAtEngage, navScaleNow) {
+  if (!(navScaleAtEngage > 0)) return 1;
+  return navScaleNow / navScaleAtEngage;
+}

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+import math
+import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from ai.intent import _is_new_object_request, extract_named_color
-from app import projects
+from app import jobs, projects
 from app.config import Settings
 from app.models import CommandResponse, Intent, SessionState, VersionInfo
 from app.session import save_session
@@ -24,7 +26,7 @@ from mesh.factory import (
     generate_mesh_glb_from_image,
     mesh_ready,
 )
-from photos.drive import download_file, list_images
+from photos.drive import download_file, list_images, preview_url
 from photos.search import find_photos
 from photos.stage import stage_photo
 from voice.speech import synthesize_speech
@@ -181,6 +183,9 @@ def restore_version(session: SessionState, info: VersionInfo) -> None:
         session.color = info.color
     if info.base_size_m:
         session.base_size_m = info.base_size_m
+    # Every stored version's base_size_m is already its real size; any display
+    # multiplier from an earlier voice resize belongs to a different version.
+    session.scale = 1.0
     save_session(session)
 
 
@@ -336,6 +341,119 @@ async def _execute_mesh(
     return True, result["model_id"], None, bool(result.get("textured", True))
 
 
+async def _finish_mesh_build(
+    prompt: str,
+    session: SessionState,
+    settings: Settings,
+    transcript: str | None,
+    completion_reply: str,
+    failure_prefix: str,
+    size_mm: float | None = None,
+    recolor: str | None = None,
+) -> CommandResponse:
+    """
+    Runs detached (see jobs.py): the actual sculpt, then the final response
+    the client picks up via /api/jobs/{id}. Mirrors apply_intent's own
+    mesh success/failure shaping, just off the request path.
+    """
+    latency: dict[str, float] = {}
+    success, model_id, error, _textured = await _execute_mesh(
+        prompt, session, settings, latency, size_mm=size_mm
+    )
+
+    if success:
+        reply = completion_reply
+        rebuilt = True
+        result_model_id = model_id
+        textured = True
+        error_msg = None
+        if recolor:
+            session.color = recolor
+            session.params["color"] = recolor
+        session.last_summary = reply
+        save_session(session)
+    else:
+        reply = f"{failure_prefix}{error}"
+        rebuilt = False
+        result_model_id = None
+        textured = False
+        error_msg = error
+
+    t0 = time.perf_counter()
+    audio_url, tts_ms = await synthesize_speech(reply, settings)
+    latency["tts_ms"] = tts_ms if tts_ms else (time.perf_counter() - t0) * 1000
+
+    return CommandResponse(
+        ok=error_msg is None,
+        transcript=transcript,
+        reply=reply,
+        action="generate" if success else "clarify",
+        rebuilt=rebuilt,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=result_model_id if rebuilt else session.model_id,
+        reply_audio_url=audio_url,
+        session=session,
+        latency_ms=latency,
+        error=error_msg,
+        textured=textured,
+        backend="mesh",
+        display_size_m=_display_size_m(session),
+        candidates=[],
+    )
+
+
+async def _start_mesh_build(
+    prompt: str,
+    session: SessionState,
+    settings: Settings,
+    transcript: str | None,
+    ack_reply: str,
+    completion_reply: str,
+    failure_prefix: str,
+    latency: dict[str, float] | None = None,
+    size_mm: float | None = None,
+    recolor: str | None = None,
+) -> CommandResponse:
+    """
+    Speak an instant acknowledgment, then sculpt in the background.
+
+    Mesh generation runs 10-90s+; holding the request open that whole time
+    leaves Percy silent. Acknowledge immediately — same idea as the photo-pick
+    flow's confirm step — and let the client poll /api/jobs/{id} for the
+    finished model, exactly as it already does for photo builds.
+    """
+    t0 = time.perf_counter()
+    audio_url, tts_ms = await synthesize_speech(ack_reply, settings)
+    ack_latency = dict(latency or {})
+    ack_latency["tts_ms"] = tts_ms if tts_ms else (time.perf_counter() - t0) * 1000
+
+    async def work() -> CommandResponse:
+        return await _finish_mesh_build(
+            prompt,
+            session,
+            settings,
+            transcript,
+            completion_reply,
+            failure_prefix,
+            size_mm=size_mm,
+            recolor=recolor,
+        )
+
+    job_id = jobs.start(work)
+    return CommandResponse(
+        ok=True,
+        transcript=transcript,
+        reply=ack_reply,
+        action="building",
+        session=session,
+        backend="mesh",
+        reply_audio_url=audio_url,
+        latency_ms=ack_latency,
+        job_id=job_id,
+    )
+
+
 async def apply_intent(
     intent: Intent,
     session: SessionState,
@@ -417,6 +535,40 @@ async def apply_intent(
             else:
                 intent.reply = f"Found {n}. Pinch to pick one."
 
+    elif action == "browse_photos":
+        # Listing only. Cards load /api/photos/{id}/preview, which the backend
+        # fetches from Drive and serves — the headset never talks to Google.
+        response_backend = "mesh"
+        try:
+            files = await list_images(settings)
+        except Exception as exc:
+            logger.warning("Drive list failed: %s", exc)
+            error_msg = str(exc)
+            intent.reply = "I couldn't reach your photos."
+            action = "clarify"
+            files = []
+        candidates = [
+            {
+                "id": f["id"],
+                "name": f.get("name") or "photo",
+                "preview_url": preview_url(f["id"]),
+                "image_url": preview_url(f["id"]),
+            }
+            for f in files
+            if f.get("id")
+        ]
+        session.last_photos = candidates
+        save_session(session)
+        n = len(candidates)
+        if n == 0:
+            if not error_msg:
+                intent.reply = "Your Drive folder looks empty."
+            action = "clarify"
+        elif n == 1:
+            intent.reply = "One photo in your Drive. Pinch to build it."
+        else:
+            intent.reply = f"Here's all {n} from your Drive. Pinch one to build."
+
     elif action == "generate" and (intent.backend or "cad") == "mesh":
         prompt = (intent.mesh_prompt or "").strip()
         if not prompt:
@@ -432,21 +584,22 @@ async def apply_intent(
             response_backend = "mesh"
         else:
             session.scale = 1.0
-            success, model_id, error, _mesh_textured = await _execute_mesh(
-                prompt, session, settings, latency, size_mm=intent.size_mm
+            return await _start_mesh_build(
+                prompt,
+                session,
+                settings,
+                transcript,
+                ack_reply="Sculpting that, one moment.",
+                completion_reply=intent.reply or "Here's that sculpt.",
+                failure_prefix="Sculpt failed: ",
+                latency=latency,
+                size_mm=intent.size_mm,
             )
-            if success:
-                rebuilt = True
-                result_model_id = model_id
-                textured = True
-                response_backend = "mesh"
-                session.last_summary = intent.reply
-                save_session(session)
-            else:
-                error_msg = error
-                intent.reply = f"Sculpt failed: {error}"
-                action = "clarify"
-                response_backend = "mesh"
+
+    elif action == "ui_mode":
+        # A client UI switch ("select mode", "tape measure", "done") — no
+        # model change, just echoes intent.params["mode"] back on the response.
+        response_backend = session.last_backend
 
     elif action == "set_scale":
         # Resizing a sculpt is a display change, not a reason to spend 90s
@@ -687,20 +840,17 @@ async def apply_intent(
                 response_backend = "mesh"
             else:
                 prompt = f"{session.last_mesh_prompt}, overall color {color}"
-                success, model_id, error, _tex = await _execute_mesh(
-                    prompt, session, settings, latency
+                return await _start_mesh_build(
+                    prompt,
+                    session,
+                    settings,
+                    transcript,
+                    ack_reply="Recoloring that, one moment.",
+                    completion_reply=intent.reply or "Changed the color.",
+                    failure_prefix="Couldn't apply color: ",
+                    latency=latency,
+                    recolor=color,
                 )
-                if success:
-                    rebuilt = True
-                    result_model_id = model_id
-                    textured = True
-                    response_backend = "mesh"
-                    session.color = color
-                    session.params["color"] = color
-                else:
-                    error_msg = f"Color change failed: {error}"
-                    intent.reply = f"Couldn't apply color: {error}"
-                    response_backend = "mesh"
         elif session.last_script:
             rebuild_attempted = True
             success, model_id, error = await _execute_with_retry(
@@ -775,8 +925,9 @@ async def apply_intent(
         textured=textured,
         backend=response_backend,
         display_size_m=_display_size_m(session),
-        candidates=candidates if action == "find_photos" else [],
+        candidates=candidates if action in ("find_photos", "browse_photos") else [],
         cad_params=_cad_params(session),
+        ui_mode=intent.params.get("mode") if action == "ui_mode" else None,
     )
 
 
@@ -825,8 +976,6 @@ async def save_client_version(
     geometry already, so it must only move its version pointer, not reload.
     Silent on purpose — this fires on every drag release.
     """
-    import tempfile
-
     if projects.current_version(settings, project_id) is None:
         return CommandResponse(
             ok=False,
@@ -878,10 +1027,17 @@ async def apply_param_update(
     settings: Settings,
     project_id: str,
     updates: dict[str, float],
+    op: str = "param_edit",
+    action: str = "param_edit",
+    reply: str = "Updated.",
 ) -> CommandResponse:
     """
-    Drag-release from the client's dimension panel: rewrite named PARAMS in the
-    project's current CAD script and rerun the sandbox. No LLM involved.
+    Rewrite named PARAMS in the project's current CAD script and rerun the
+    sandbox. No LLM involved.
+
+    Drag-release from the client's dimension panel (the default op/action), or
+    a two-hand-stretch resize (apply_resize passes op="resize") — same rewrite
+    path either way, just a different version op and spoken reply.
 
     Returns rebuilt=True with a fresh model_id/glb_url on success, same
     contract as any other rebuild. A ParamError (unknown dimension, or a value
@@ -945,7 +1101,7 @@ async def apply_param_update(
         settings,
         project_id,
         src,
-        op="param_edit",
+        op=op,
         script=new_script,
         params=new_params,
         color=color,
@@ -954,8 +1110,8 @@ async def apply_param_update(
     restore_version(session, info)
     return CommandResponse(
         ok=True,
-        reply="Updated.",
-        action="param_edit",
+        reply=reply,
+        action=action,
         rebuilt=True,
         color=session.color,
         glb_url=session.glb_url,
@@ -966,6 +1122,113 @@ async def apply_param_update(
         textured=False,
         display_size_m=_display_size_m(session),
         cad_params=new_params,
+    )
+
+
+# A two-hand stretch within this of 1.0x is not a resize (jitter / release wobble).
+RESIZE_NOOP_TOLERANCE = 0.02
+_NO_MM_PARAMS_REPLY = "This model has no measurements I can scale. Ask me to make it bigger instead."
+_RESIZE_NOOP_REPLY = "That's already about that size."
+
+
+async def apply_resize(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    factor: float,
+) -> CommandResponse:
+    """
+    Two-hand-stretch release: change the model's real dimensions, not just the
+    display zoom (the client resets its own zoom to 1 after this succeeds).
+
+    CAD: every PARAMS key ending in "_mm" is multiplied by `factor` and the
+    sandbox reruns — reuses apply_param_update's rewrite path with op="resize".
+    A CAD model with no "_mm" params has nothing to scale and clarifies.
+
+    Mesh: no geometry rebuild — the version's base_size_m absorbs the current
+    display scale times `factor`, and the session's scale resets to 1 so the
+    new version already reads at its full real size.
+
+    Factor <= 0, non-finite, or within ±2% of 1 is a silent no-op: no version,
+    no model change.
+    """
+    if not math.isfinite(factor) or factor <= 0 or abs(factor - 1.0) <= RESIZE_NOOP_TOLERANCE:
+        return CommandResponse(
+            ok=True,
+            reply=_RESIZE_NOOP_REPLY,
+            action="noop",
+            color=session.color,
+            glb_url=session.glb_url,
+            model_id=session.model_id,
+            session=session,
+            backend=session.last_backend,
+            display_size_m=_display_size_m(session),
+            cad_params=_cad_params(session),
+        )
+
+    current = projects.current_version(settings, project_id)
+    if current is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+
+    if current.kind == "cad":
+        params = extract_cad_params(current.script or "")
+        mm_updates = {k: v * factor for k, v in params.items() if k.endswith("_mm")}
+        if not mm_updates:
+            return CommandResponse(
+                ok=False,
+                reply=_NO_MM_PARAMS_REPLY,
+                action="clarify",
+                session=session,
+                error="No _mm params to scale",
+            )
+        return await apply_param_update(
+            session, settings, project_id, mm_updates,
+            op="resize", action="resize", reply="Resized.",
+        )
+
+    # Mesh lane: fold the stretch into the stored real size, no geometry edit.
+    glb_path = _glb_path_from_url(settings, current.glb_url)
+    if glb_path is None or not glb_path.is_file():
+        return CommandResponse(
+            ok=False,
+            reply="I can't find that model to resize.",
+            action="clarify",
+            session=session,
+            error="Missing GLB on disk",
+        )
+
+    new_base_size_m = _clamp(session.base_size_m * session.scale * factor, SIZE_MIN_M, SIZE_MAX_M)
+    fd, tmp = tempfile.mkstemp(dir=str(settings.projects_dir), suffix=".glb")
+    try:
+        with open(fd, "wb") as fh:
+            fh.write(glb_path.read_bytes())
+        info = projects.append_version(
+            settings, project_id, Path(tmp),
+            op="resize", base_size_m=new_base_size_m,
+        )
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+    restore_version(session, info)
+    return CommandResponse(
+        ok=True,
+        reply="Resized.",
+        action="resize",
+        rebuilt=True,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=session.model_id,
+        session=session,
+        backend="mesh",
+        textured=True,
+        display_size_m=_display_size_m(session),
+        cad_params={},
     )
 
 
@@ -1184,6 +1447,35 @@ async def build_chosen_photo(
             reply_audio_url=audio_url,
             backend="mesh",
         )
+
+    if not chosen.get("build_url"):
+        # Browsed-not-searched: only a Drive thumbnail was fetched so far.
+        # Download and cut out the subject now, on the one photo picked.
+        try:
+            raw, mime = await download_file(file_id, settings)
+        except Exception as exc:
+            logger.warning("Drive download %s failed: %s", file_id, exc)
+            reply = "I couldn't download that photo. Try another."
+            audio_url, _ = await synthesize_speech(reply, settings)
+            return CommandResponse(
+                ok=False,
+                reply=reply,
+                action="clarify",
+                session=session,
+                reply_audio_url=audio_url,
+                backend="mesh",
+            )
+        info = stage_photo(raw, settings, mime=mime, name=chosen.get("name") or "", file_id=file_id)
+        chosen = {
+            **chosen,
+            "preview_url": info["preview_url"],
+            "image_url": info["preview_url"],
+            "build_url": info["build_url"],
+        }
+        session.last_photos = [
+            chosen if p.get("id") == file_id else p for p in session.last_photos
+        ]
+        save_session(session)
 
     prompt = chosen.get("name") or ""
     # The staged cut-out on disk, for the CAD fallback when sculpting is down.

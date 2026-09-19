@@ -25,6 +25,7 @@ import {
   applyTwoHandToPosition,
   isTwoHandActive,
   clampNavScale,
+  stretchFactor,
 } from "./interaction/twoHand.js";
 import { createDimensionsLabel } from "./interaction/dimensionsLabel.js";
 import { createTapeMeasure } from "./interaction/tapeMeasure.js";
@@ -36,7 +37,7 @@ import {
   dragParamValue,
   paramPanelLines,
 } from "./interaction/paramPanel.js";
-import { selectionFromStroke } from "./interaction/selection.js";
+import { selectionFromStroke, isTapRelease } from "./interaction/selection.js";
 import {
   scaleRegion,
   pullRegion,
@@ -412,9 +413,16 @@ let modelBaseMaxDim = 1;
 // Raw GLB bounds and lane of the loaded model, for the real-size label.
 const modelBaseSize = new THREE.Vector3(1, 1, 1);
 let lastBackend = null;
-// Two-hand / wheel zoom. Display only: it lives on modelRoot.scale and is
-// never sent to the server.
+// Mouse-wheel zoom is display only: it lives on modelRoot.scale and is never
+// sent to the server. A two-hand stretch also drives modelRoot.scale live,
+// but on release it POSTs a real resize (see updateTwoHand) and this resets
+// to 1 — the model then shows its new real size with no display multiplier.
 let navScale = 1;
+// navScale when the current two-hand gesture engaged, so its own stretch
+// factor is measured from there, not from 1.
+let navScaleAtTwoHandStart = 1;
+// A release closer to 1x than this is gesture noise, not a resize.
+const RESIZE_FACTOR_EPS = 1e-3;
 
 const dimsLabel = createDimensionsLabel();
 scene.add(dimsLabel.object3d);
@@ -461,6 +469,15 @@ const selectionMarker = new THREE.Mesh(
 );
 selectionMarker.visible = false;
 selectionMarker.renderOrder = 999;
+
+// Same style as selectionMarker, dimmer: where the right hand is currently
+// pointing, before a pinch commits it as an actual selection.
+const hoverMarker = new THREE.Mesh(
+  new THREE.SphereGeometry(0.006, 16, 12),
+  new THREE.MeshBasicMaterial({ color: 0xffee58, transparent: true, opacity: 0.4, depthTest: false })
+);
+hoverMarker.visible = false;
+hoverMarker.renderOrder = 998;
 
 /** A world-space point/direction, expressed in currentModel's own local frame. */
 function toModelLocalPoint(worldPoint) {
@@ -515,6 +532,44 @@ function showSelectionHighlight(selection) {
   selectionMarker.visible = true;
 }
 
+function clearHoverHighlight() {
+  hoverMarker.visible = false;
+  if (hoverMarker.parent) hoverMarker.parent.remove(hoverMarker);
+}
+
+function showHoverHighlight(hit) {
+  if (!currentModel) return;
+  currentModel.add(hoverMarker);
+  hoverMarker.position.set(hit.point.x, hit.point.y, hit.point.z);
+  hoverMarker.scale.setScalar(1);
+  hoverMarker.visible = true;
+}
+
+/** Right hand's target ray hitting the model, in the model's own local frame (like modelHit). */
+function hoverHit() {
+  if (!currentModel) return null;
+  const c = right.controller;
+  c.updateMatrixWorld(true);
+  _rayDir.set(0, 0, -1).transformDirection(c.matrixWorld);
+  return modelHit(new THREE.Vector3().setFromMatrixPosition(c.matrixWorld), _rayDir);
+}
+
+/**
+ * Point-at-model hover: outside every mode that already owns the right hand
+ * (dragging a PARAMS row, taping, the photo picker, an active grab/two-hand),
+ * show where the right hand is pointing so a quick pinch there reads as a
+ * deliberate point-select.
+ */
+function updateSelectionHover() {
+  if (paramDrag || tapeMode || photoPicker.isOpen || grabbing || twoHandOn || selectMode) {
+    clearHoverHighlight();
+    return;
+  }
+  const hit = hoverHit();
+  if (hit) showHoverHighlight(hit);
+  else clearHoverHighlight();
+}
+
 function finishSelectionStroke() {
   if (!strokeHits.length) return;
   const selection = selectionFromStroke(strokeHits);
@@ -542,9 +597,15 @@ function setSelectMode(on) {
   setStatus(on ? "Select mode: pinch a spot on the model." : "Select mode off.", true);
 }
 
-function refreshDimensions() {
+/**
+ * Update the dimensions label. `factor` is the live two-hand stretch since
+ * the current gesture engaged (1 outside a gesture) — the label always shows
+ * the real size the release would actually apply, not the pre-stretch size.
+ */
+function refreshDimensions(factor = 1) {
   if (!currentModel) return;
-  dimsLabel.setSize(realSize(modelBaseSize, realScale()));
+  const size = realSize(modelBaseSize, realScale());
+  dimsLabel.setSize({ x: size.x * factor, y: size.y * factor, z: size.z * factor });
 }
 
 function applyDisplaySize(obj, displaySizeM) {
@@ -563,7 +624,18 @@ async function setModelFromResponse(data) {
   cadParams = data.cad_params || {};
   if (data.session?.project_id) currentProjectId = data.session.project_id;
   if (data.session?.project_id) lastProjectId = data.session.project_id;
-  if (data.action === "find_photos") {
+  if (data.action === "find_photos" || data.action === "browse_photos") {
+    return;
+  }
+  if (data.action === "ui_mode") {
+    // Voice mode switch ("select mode", "tape measure", "done") — no model
+    // change. setSelectMode(false)/setTapeMode already clear their own state.
+    if (data.ui_mode === "lasso") setSelectMode(true);
+    else if (data.ui_mode === "tape") setTapeMode(true);
+    else if (data.ui_mode === "none") {
+      setSelectMode(false);
+      setTapeMode(false);
+    }
     return;
   }
   const newColor = data.color || currentColor;
@@ -729,6 +801,9 @@ const _modelCenter = new THREE.Vector3();
 const _wristQuat = new THREE.Quaternion();
 let wasPinching = { 0: false, 1: false };
 let pinchStartTime = { 0: 0, 1: 0 };
+// Where each pinch began, so a release can be classified as a tap (select)
+// vs. a hold (grab) — see interaction/selection.js:isTapRelease.
+const pinchStartPos = { 0: new THREE.Vector3(), 1: new THREE.Vector3() };
 
 const PINCH_THRESHOLD_START = 0.032;
 const PINCH_THRESHOLD_END = 0.045;
@@ -895,16 +970,25 @@ function pollHand(handEntry, key) {
 
   if (isPinching && !wasPinching[key]) {
     pinchStartTime[key] = now;
+    pinchStartPos[key].copy(pos);
     if (key === 0) percy.beginTalk();
   }
 
   if (key === 1 && isPinching && wasPinching[key] && !grabbing && !twoHandOn && !paramDrag) {
     const duration = now - pinchStartTime[key];
-    if (duration >= PINCH_MIN_DURATION_MS && nearModel(pos, GRAB_RANGE)) {
-      if (activeParamRows.length) {
+    if (activeParamRows.length) {
+      // Dimension-row drag: unchanged, begins as soon as the hysteresis latch
+      // and minimum duration clear — no tap/hold ambiguity to resolve here.
+      if (duration >= PINCH_MIN_DURATION_MS && nearModel(pos, GRAB_RANGE)) {
         const localY = pos.y - paramPanel.sprite.position.y;
         beginParamDrag(handEntry, key, pickRow(activeParamRows, localY));
-      } else {
+      }
+    } else {
+      // Still could be a tap: hold off on grabbing until either the hold has
+      // run past the tap window or the hand has clearly moved off, so a
+      // quick pinch-release can resolve as a point-select instead.
+      const movement = pos.distanceTo(pinchStartPos[key]);
+      if (!isTapRelease(duration, movement) && nearModel(pos, GRAB_RANGE)) {
         beginGrab(handEntry.pinchAnchor, key);
       }
     }
@@ -912,7 +996,20 @@ function pollHand(handEntry, key) {
 
   if (wasOpen && wasPinching[key]) {
     if (key === 0) percy.endTalk();
-    if (grabHandKey === key) endGrab();
+    const wasGrabbingThisHand = grabHandKey === key;
+    const wasDraggingThisHand = Boolean(paramDrag && paramDrag.key === key);
+    if (wasGrabbingThisHand) endGrab();
+    if (key === 1 && !wasGrabbingThisHand && !wasDraggingThisHand && !twoHandOn) {
+      const duration = now - pinchStartTime[key];
+      const movement = pos.distanceTo(pinchStartPos[key]);
+      if (isTapRelease(duration, movement)) {
+        const hit = raycastFromHand(handEntry);
+        if (hit) {
+          strokeHits = [hit];
+          finishSelectionStroke();
+        }
+      }
+    }
     endParamDrag(key);
   }
 
@@ -940,6 +1037,10 @@ function updateTwoHand() {
     percy.cancelTalk();
     prevL.copy(heldPos[0]);
     prevR.copy(heldPos[1]);
+    // The stretch this gesture applies is measured from the zoom level right
+    // now, not from 1 — a second stretch on top of an unreleased one (or a
+    // prior mouse-wheel zoom) should still resize by its own factor only.
+    navScaleAtTwoHandStart = navScale;
     halo.material.opacity = 0.9;
     halo.material.color.setHex(0x00ff88);
     return;
@@ -947,6 +1048,21 @@ function updateTwoHand() {
   if (!held[0] || !held[1]) {
     twoHandOn = false;
     halo.material.color.setHex(0x4f8cff);
+    const factor = stretchFactor(navScaleAtTwoHandStart, navScale);
+    const pid = currentProjectId;
+    if (pid && Math.abs(factor - 1) > RESIZE_FACTOR_EPS) {
+      percy.postResize(pid, factor).then(() => {
+        navScale = 1;
+        modelRoot.scale.setScalar(1);
+        refreshDimensions();
+      });
+    } else {
+      // No real stretch (or no project to resize yet): drop back to the
+      // pre-gesture zoom so the display-only two-hand zoom stays reversible.
+      navScale = navScaleAtTwoHandStart;
+      modelRoot.scale.setScalar(navScale);
+      refreshDimensions();
+    }
     return;
   }
   const t = twoHandTransform(prevL, prevR, heldPos[0], heldPos[1]);
@@ -962,6 +1078,7 @@ function updateTwoHand() {
   modelRoot.scale.setScalar(navScale);
   prevL.copy(heldPos[0]);
   prevR.copy(heldPos[1]);
+  refreshDimensions(stretchFactor(navScaleAtTwoHandStart, navScale));
 }
 
 function tapeHit(origin, dir) {
@@ -1298,6 +1415,7 @@ renderer.setAnimationLoop(() => {
   if (!twoHandOn) updateGrab();
   updateParamPanel();
   updateParamDrag();
+  updateSelectionHover();
   dimsLabel.follow(currentModel, camera);
   tape.update();
   const nowTick = performance.now();
@@ -1318,18 +1436,35 @@ const pointer = new THREE.Vector2();
 const raycaster = new THREE.Raycaster();
 const lastPtr = new THREE.Vector2();
 
-renderer.domElement.addEventListener("pointerdown", (e) => {
-  if (renderer.xr.isPresenting) return;
+// Mouse drag-to-scroll for the photo picker (desktop preview only — VR uses
+// real hand/controller pinch positions via pollHand). We fake a "pinch"
+// world position by raycasting onto the plane the picker cards sit on, then
+// drive the same beginPinch/movePinch/endPinch the hand-tracking path uses.
+let pickerDragging = false;
+const _pickerPlane = new THREE.Plane();
+const _pickerPlaneNormal = new THREE.Vector3();
+const _pickerWorldPos = new THREE.Vector3();
+
+function pointerToPickerWorld(e) {
   pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
   pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
+  _pickerPlaneNormal.set(0, 0, 1).applyQuaternion(camera.quaternion);
+  _pickerPlane.setFromNormalAndCoplanarPoint(_pickerPlaneNormal, photoPicker.group.position);
+  raycaster.ray.intersectPlane(_pickerPlane, _pickerWorldPos);
+  return _pickerWorldPos;
+}
+
+renderer.domElement.addEventListener("pointerdown", (e) => {
+  if (renderer.xr.isPresenting) return;
   if (photoPicker.isOpen) {
-    const hits = raycaster.intersectObjects(photoPicker.cards, true);
-    const card = hits[0]?.object;
-    const fileId = card?.userData?.fileId || card?.parent?.userData?.fileId;
-    if (fileId) buildFromPickedPhoto(fileId);
+    photoPicker.beginPinch(pointerToPickerWorld(e));
+    pickerDragging = true;
     return;
   }
+  pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
+  pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
   if (tapeMode) {
     const hit = currentModel && raycaster.intersectObject(currentModel, true)[0];
     if (hit) tape.place(hit.point);
@@ -1362,10 +1497,20 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
     lastPtr.set(e.clientX, e.clientY);
   }
 });
-window.addEventListener("pointerup", () => {
+window.addEventListener("pointerup", (e) => {
+  if (pickerDragging) {
+    pickerDragging = false;
+    const picked = photoPicker.endPinch(pointerToPickerWorld(e));
+    if (picked) buildFromPickedPhoto(picked);
+    return;
+  }
   desktopMode = null;
 });
 window.addEventListener("pointermove", (e) => {
+  if (pickerDragging) {
+    photoPicker.movePinch(pointerToPickerWorld(e));
+    return;
+  }
   if (!desktopMode || renderer.xr.isPresenting) return;
   const dx = e.clientX - lastPtr.x;
   const dy = e.clientY - lastPtr.y;
@@ -1383,7 +1528,8 @@ renderer.domElement.addEventListener(
   "wheel",
   (e) => {
     if (renderer.xr.isPresenting) return;
-    // Display zoom only, same as the two-hand spread.
+    // Camera/view zoom only — unlike a two-hand stretch, the wheel never
+    // resizes the model's real dimensions.
     navScale = clampNavScale(navScale, Math.exp(-e.deltaY * 0.001));
     modelRoot.scale.setScalar(navScale);
   },
