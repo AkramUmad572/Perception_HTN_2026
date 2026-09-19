@@ -231,3 +231,59 @@ that colours survive.
    Expected conflicts: `run_tests.sh`, `ai/intent.py`, `ai/test_intent.py`, `app/pipeline.py`.
 3. Full `run_tests.sh` after each merge; fix before the next.
 4. Update `ai-docs/README.md`, `09-invariants.md`, `10-file-map.md`, `11-editing-roadmap.md`.
+
+---
+
+## Wave 2 addendum (token-lean: 2 Sonnet agents, no per-agent plans)
+
+Workflow change (user-approved): agents code directly from this addendum, TDD, run **only their own suites**
+while working, and send short reports. The coordinator runs the full suite at merge. Hand off only at ~60% context.
+
+### Shared: `Selection` (defined by WS-FG in `app/models.py`; WS-E does not touch it)
+
+```python
+class Selection(BaseModel):
+    parts: list[str] = []            # GLB node names hit (CAD part names; empty for most sculpts)
+    center: list[float]              # [x,y,z] model-local GLB units (CAD GLB units are metres)
+    normal: list[float]              # outward surface normal at center, model-local
+    radius: float = 0.0              # model-local units; 0 = a point, not a circle
+```
+Sent as a JSON field `selection` on `/api/command` (`CommandRequest.selection: Selection | None`) and as a
+multipart form field `selection` (JSON string) on `/api/voice`. It is passed through to `parse_intent(..., selection=...)`.
+
+### WS-E: CAD params wiring + dimension panel
+
+- Every CAD version records `params = cad.params.extract_params(script)` (`pipeline._record_version`).
+- `CommandResponse.cad_params: dict[str, float] = {}`, filled from the session's current CAD version.
+- `POST /api/projects/{pid}/params` body `{"updates": {name: value}, "session_id": "default"}` → `set_params`
+  → the existing sandbox execute (no LLM) → `append_version(op="param_edit")` → `rebuilt=True`. A `ParamError` →
+  `ok=False, action="clarify", reply=str(err)`.
+- Client `web-client/src/interaction/paramPanel.js`: a floating list of the params for the pointed part
+  (`params_for_part` logic mirrored in JS, or all of them); pinch-drag a row to change the value using `snap(…, 1mm)`,
+  `FINE_MODE_FACTOR` while the left hand pinches; a live label via `formatLength`; POST on release. Main.js: wiring only.
+- Files: `app/models.py` (cad_params only), `app/pipeline.py`, `app/main.py`, `app/test_pipeline.py`,
+  `web-client/src/interaction/paramPanel.js`, `web-client/src/main.js`, `web-client/src/interaction/test_interaction.js`.
+
+### WS-FG: selection, client region ops, mesh booleans wired
+
+- Client `interaction/selection.js`: right ray/finger → short pinch = point, pinch-drag = lasso → `Selection`
+  (snap to a whole part when ≥60% of the stroke hits one node). Highlight until cleared/used. Attach it to the next
+  voice/text command (`PercyAssistant` sends the `selection` form field).
+- Client `interaction/regionOps.js`: pure vertex ops with smooth falloff over the selection: `scaleRegion`,
+  `pullRegion(±)`, `flattenRegion`, `smoothRegion`, `paintRegion`. A small local voice table ("bigger", "smaller",
+  "pull out", "push in", "flatten", "smooth", "paint <colour>") runs them **client-side, with no server call**, then
+  GLTFExporter → `POST /api/projects/{pid}/versions` (op `hand_edit`). The client handles `action="version_saved"`
+  by updating its version pointer only (no reload).
+- Router: when a selection is present on a CAD session, codegen payload gets
+  `"selection": "user pointed at <parts> near (x,y,z) mm"`. On a **mesh** session, a new rung before `clarify_mesh`:
+  hole / loop / flat base (+ optional size in mm) → `Intent(action="mesh_boolean", params={"op": "hole"|"loop"|"flat_base", "diameter_mm"?})`.
+  Without a selection, hole/loop → clarify "Point at where you want it first."; flat base needs no selection.
+- Pipeline `mesh_boolean`: `load_mesh` the current version GLB → op with `units_per_mm = longest_extent /
+  (base_size_m * scale * 1000)` → `export_glb` → `append_version(op="boolean")` → `rebuilt=True`. `BooleanError` →
+  clarify with its message, model unchanged. `clarify_mesh` stays for everything else.
+- Files: `app/models.py` (Selection, CommandRequest.selection), `app/main.py` (/api/voice form field), `ai/intent.py`,
+  `ai/test_intent.py`, `app/pipeline.py`, `app/test_pipeline.py`, `web-client/src/interaction/selection.js`,
+  `regionOps.js`, `test_interaction.js`, `web-client/src/voice/PercyAssistant.js`, `web-client/src/main.js`.
+
+**Expected overlap:** `models.py`, `pipeline.py`, `main.py`, `test_pipeline.py`, `main.js`, `test_interaction.js`:
+all additive; the coordinator resolves them at merge.
