@@ -1388,10 +1388,101 @@ def run_all_tests():
         return 0
 
 
+async def test_undo_redo_restores_session():
+    print("\n=== Test: undo/redo restore follow-up context ===")
+    import shutil
+    from app.pipeline import history_step
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_a")
+        await _run_cad(Intent(action="generate", script="S1", reply="A box."), session, settings, "build me a box")
+        await _run_cad(Intent(action="generate", script="S2", reply="Taller."), session, settings, "make it taller")
+        pid = session.project_id
+
+        r = await _run_cad(Intent(action="undo", params={"steps": 1}, reply="Undone."), session, settings, "undo")
+        if not (r.rebuilt and r.model_id == f"{pid}-v1" and r.glb_url == f"/media/projects/{pid}/v1.glb"):
+            errors.append(f"undo response {r.rebuilt} {r.model_id} {r.glb_url}")
+        if session.last_script != "S1" or session.last_summary != "A box." or session.version != 1:
+            errors.append(f"undo did not restore: {session.last_script} {session.last_summary} {session.version}")
+        if r.action != "undo" or not r.ok:
+            errors.append(f"undo action {r.action} ok={r.ok}")
+
+        again = await _run_cad(Intent(action="undo", params={"steps": 1}), session, settings, "undo")
+        if again.rebuilt or again.action != "noop" or again.reply != "Nothing to undo." or not again.ok:
+            errors.append(f"undo at v1: {again.action} {again.reply} rebuilt={again.rebuilt}")
+
+        r = await _run_cad(Intent(action="redo", params={"steps": 1}, reply="Redone."), session, settings, "redo")
+        if not r.rebuilt or r.model_id != f"{pid}-v2" or session.last_script != "S2":
+            errors.append(f"redo {r.model_id} {session.last_script}")
+
+        empty = SessionState(session_id="ws_a_empty")
+        r = await _run_cad(Intent(action="undo", params={"steps": 1}), empty, settings, "undo")
+        if r.rebuilt or r.action != "noop" or r.reply != "There's nothing to undo yet.":
+            errors.append(f"no project: {r.action} {r.reply}")
+
+        with patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+             patch("app.pipeline.save_session"):
+            r = await history_step(session, settings, "nope", "undo", 1)
+            if r.ok or r.action != "clarify":
+                errors.append(f"unknown project: ok={r.ok} action={r.action}")
+            r = await history_step(session, settings, pid, "undo", 1)
+            if not r.rebuilt or r.model_id != f"{pid}-v1":
+                errors.append(f"history_step undo {r.model_id}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("undo/redo restore follow-up context", errors)
+
+
+async def test_save_client_version():
+    print("\n=== Test: client version save ===")
+    import shutil
+    from app import projects
+    from app.pipeline import save_client_version
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_a")
+        await _run_cad(Intent(action="generate", script="S1", reply="A box."), session, settings, "build me a box")
+        await _run_cad(Intent(action="generate", script="S2", reply="Taller."), session, settings, "make it taller")
+        pid = session.project_id
+        with patch("app.pipeline.save_session"):
+            r = await save_client_version(session, settings, pid, b"glTF" + bytes(40), "hand_edit", "Moved it.")
+            if r.action != "version_saved" or r.rebuilt is not False or not r.ok:
+                errors.append(f"response {r.action} rebuilt={r.rebuilt} ok={r.ok}")
+            if r.model_id != f"{pid}-v3" or r.glb_url != f"/media/projects/{pid}/v3.glb":
+                errors.append(f"ids {r.model_id} {r.glb_url}")
+            if not (settings.projects_dir / pid / "v3.glb").is_file() or session.version != 3:
+                errors.append("v3 not stored / session not moved")
+            v3 = projects.get_version(settings, pid, 3)
+            if not v3 or v3.op != "hand_edit" or v3.script != "S2" or v3.summary != "Moved it.":
+                errors.append(f"v3 meta {v3}")
+
+            bad = await save_client_version(session, settings, pid, b"not a glb at all", "hand_edit")
+            if bad.ok or bad.action != "clarify" or projects.current_version(settings, pid).version != 3:
+                errors.append(f"bad upload accepted: {bad.action}")
+
+            odd = await save_client_version(session, settings, pid, b"glTF" + bytes(40), "rm -rf")
+            if projects.get_version(settings, pid, 4).op != "hand_edit":
+                errors.append("unknown op not normalised to hand_edit")
+            del odd
+
+            missing = await save_client_version(session, settings, "nope", b"glTF" + bytes(40), "hand_edit")
+            if missing.ok or missing.action != "clarify":
+                errors.append("unknown project accepted")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("client version save", errors)
+
+
 WS_A_TESTS = [
     test_builds_record_project_versions,
     test_missing_glb_keeps_legacy_url,
     test_photo_build_records_project,
+    test_undo_redo_restores_session,
+    test_save_client_version,
 ]
 
 

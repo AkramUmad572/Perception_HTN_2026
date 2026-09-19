@@ -393,6 +393,30 @@ async def apply_intent(
             response_backend = session.last_backend
             save_session(session)
 
+    elif action in ("undo", "redo"):
+        # History steps reload a stored version through the normal swap path.
+        project_id = intent.params.get("project_id") or session.project_id
+        try:
+            steps = max(1, int(intent.params.get("steps") or 1))
+        except (TypeError, ValueError):
+            steps = 1
+        mover = projects.undo if action == "undo" else projects.redo
+        info = mover(settings, project_id, steps) if project_id else None
+        if info is None:
+            if not project_id or projects.current_version(settings, project_id) is None:
+                intent.reply = f"There's nothing to {action} yet."
+            else:
+                intent.reply = f"Nothing to {action}."
+            action = "noop"
+            response_backend = session.last_backend
+        else:
+            restore_version(session, info)
+            rebuilt = True
+            result_model_id = session.model_id
+            response_backend = info.kind
+            textured = info.kind == "mesh"
+            intent.reply = "Undone." if action == "undo" else "Redone."
+
     elif action == "generate":
         if not intent.script:
             intent.reply = "No code was generated."
@@ -602,6 +626,95 @@ async def apply_intent(
         backend=response_backend,
         display_size_m=_display_size_m(session),
         candidates=candidates if action == "find_photos" else [],
+    )
+
+
+_CLIENT_OPS = {
+    "generate", "set_material", "hand_edit", "param_edit",
+    "boolean", "semantic_edit", "photo", "script",
+}
+_NO_HISTORY_REPLY = "I can't find that model's history."
+
+
+async def history_step(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    direction: str,
+    steps: int = 1,
+) -> CommandResponse:
+    """Undo/redo for a named project (the HTTP route). Voice goes via apply_intent."""
+    if projects.current_version(settings, project_id) is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+    intent = Intent(
+        action="redo" if direction == "redo" else "undo",
+        params={"steps": steps, "project_id": project_id},
+    )
+    return await apply_intent(intent, session, settings)
+
+
+async def save_client_version(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    glb_bytes: bytes,
+    op: str = "hand_edit",
+    summary: str | None = None,
+) -> CommandResponse:
+    """
+    Store a GLB the client already shows (a hand edit) as the next version.
+
+    Returns rebuilt=False with action="version_saved": the client has the
+    geometry already, so it must only move its version pointer, not reload.
+    Silent on purpose — this fires on every drag release.
+    """
+    import tempfile
+
+    if projects.current_version(settings, project_id) is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+    if len(glb_bytes) < 12 or glb_bytes[:4] != b"glTF":
+        return CommandResponse(
+            ok=False,
+            reply="That edit didn't save. Try again.",
+            action="clarify",
+            session=session,
+            error="Upload is not a binary glTF (.glb) file",
+        )
+    fd, tmp = tempfile.mkstemp(dir=str(settings.projects_dir), suffix=".glb")
+    try:
+        with open(fd, "wb") as fh:
+            fh.write(glb_bytes)
+        meta: dict = {"op": op if op in _CLIENT_OPS else "hand_edit"}
+        if summary:
+            meta["summary"] = summary
+        info = projects.append_version(settings, project_id, Path(tmp), **meta)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    restore_version(session, info)
+    return CommandResponse(
+        ok=True,
+        reply="Saved.",
+        action="version_saved",
+        rebuilt=False,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=session.model_id,
+        session=session,
+        backend=info.kind,
+        textured=info.kind == "mesh",
+        display_size_m=_display_size_m(session),
     )
 
 
