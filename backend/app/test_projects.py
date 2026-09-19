@@ -264,6 +264,101 @@ def test_cleanup():
     return t
 
 
+# ============================================================================
+# Task 8: routes, media mount, cleanup task
+# ============================================================================
+
+def test_routes():
+    print("\n=== Test: project routes ===")
+    from unittest.mock import AsyncMock, patch
+
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+    import app.session as session_mod
+    from app import projects
+
+    s, root = _tmp_settings()
+    t = (0, 0)
+    real_projects_dir = main.settings.projects_dir
+    try:
+        main.settings.projects_dir = s.projects_dir
+        with patch.object(session_mod, "SESSION_FILE", root / "sessions.json"), \
+             patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))):
+            client = TestClient(main.app)  # no `with`: lifespan (cleanup) not started
+            pid = projects.create_project(s, "mesh", _glb(s.glb_dir, "a.glb"), mesh_prompt="a corgi").project_id
+
+            r = client.get(f"/api/projects/{pid}").json()
+            t = _add(t, _check("GET project", r.get("ok") is True and len(r.get("versions", [])) == 1, r))
+
+            r = client.post(
+                f"/api/projects/{pid}/versions",
+                files={"glb": ("edit.glb", b"glTF" + bytes(40), "model/gltf-binary")},
+                data={"op": "hand_edit", "summary": "Pulled the ear.", "session_id": "ws_a_route"},
+            ).json()
+            t = _add(t, _check(
+                "POST versions -> version_saved",
+                r.get("action") == "version_saved" and r.get("rebuilt") is False
+                and r.get("model_id") == f"{pid}-v2",
+                r,
+            ))
+
+            r = client.post(f"/api/projects/{pid}/undo", json={"steps": 1, "session_id": "ws_a_route"}).json()
+            t = _add(t, _check(
+                "POST undo swaps to v1",
+                r.get("rebuilt") is True and r.get("glb_url") == f"/media/projects/{pid}/v1.glb"
+                and r.get("model_id") == f"{pid}-v1",
+                r,
+            ))
+            r = client.post(f"/api/projects/{pid}/redo", json={"session_id": "ws_a_route"}).json()
+            t = _add(t, _check("POST redo -> v2", r.get("model_id") == f"{pid}-v2", r))
+
+            r = client.get("/api/projects/nope").json()
+            t = _add(t, _check("GET unknown", r.get("ok") is False, r))
+            r = client.post("/api/projects/nope/undo", json={"steps": 1}).json()
+            t = _add(t, _check("undo unknown -> clarify", r.get("ok") is False and r.get("action") == "clarify", r))
+            r = client.post(
+                f"/api/projects/{pid}/versions",
+                files={"glb": ("x.glb", b"nope", "model/gltf-binary")},
+                data={"op": "hand_edit"},
+            )
+            t = _add(t, _check(
+                "bad upload -> clarify, not 500",
+                r.status_code == 200 and r.json().get("action") == "clarify",
+                r.status_code,
+            ))
+
+        mount = next((m for m in main.app.routes if getattr(m, "path", "") == "/media/projects"), None)
+        t = _add(t, _check(
+            "/media/projects mounted on projects_dir",
+            mount is not None and Path(mount.app.directory) == Path(real_projects_dir),
+        ))
+    finally:
+        main.settings.projects_dir = real_projects_dir
+        shutil.rmtree(root, ignore_errors=True)
+    return t
+
+
+def test_cleanup_task_runs_on_startup():
+    print("\n=== Test: cleanup runs on startup ===")
+    import time
+    from unittest.mock import MagicMock, patch
+
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+
+    fake = MagicMock(return_value={"audio": 0, "ref": 0, "projects": 0})
+    with patch.object(main.projects, "cleanup", fake):
+        with TestClient(main.app):
+            deadline = time.time() + 2.0
+            while not fake.called and time.time() < deadline:
+                time.sleep(0.02)
+    t = _check("cleanup called at startup", fake.called)
+    t = _add(t, _check("hourly interval", main.CLEANUP_INTERVAL_S == 3600))
+    return t
+
+
 def run_all_tests():
     print("=" * 60)
     print("PROJECT / VERSION TESTS")
@@ -294,6 +389,8 @@ TESTS = [
     test_prune,
     test_undo_redo,
     test_cleanup,
+    test_routes,
+    test_cleanup_task_runs_on_startup,
 ]
 
 
