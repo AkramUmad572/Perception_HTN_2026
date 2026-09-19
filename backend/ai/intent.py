@@ -492,6 +492,39 @@ def _check_scale_only(text: str) -> Intent | None:
     return None
 
 
+# Undo / redo over the project's version history (app/projects.py). The whole
+# utterance must be the command, so "go back to the round one" still reaches
+# codegen as a real edit request.
+_HISTORY_NUMS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "twice": 2, "thrice": 3}
+_HISTORY_RE = re.compile(
+    r"^(?:(?:hey\s+)?percy[,.]?\s+)?"
+    r"(?:please\s+)?(?:(?:can|could) you\s+)?"
+    r"(?P<verb>undo|redo|go back|go forward|step back)"
+    r"(?:\s+(?:that|it|this|the last (?:change|edit|step)))?"
+    r"(?:\s+(?P<n>\d+|one|two|three|four|five|twice|thrice)"
+    r"(?:\s+(?:steps?|times|changes?|edits?|versions?))?)?"
+    r"(?:\s+please)?[\s.!?]*$",
+    re.I,
+)
+
+
+def _check_history(text: str) -> Intent | None:
+    """'undo', 'go back two', 'redo' — a history step, no network call."""
+    m = _HISTORY_RE.match(text.strip())
+    if not m:
+        return None
+    verb = m.group("verb").lower()
+    action = "redo" if verb in ("redo", "go forward") else "undo"
+    raw = (m.group("n") or "").lower()
+    steps = int(raw) if raw.isdigit() else _HISTORY_NUMS.get(raw, 1)
+    steps = max(1, min(steps, 20))
+    return Intent(
+        action=action,
+        params={"steps": steps},
+        reply="Undone." if action == "undo" else "Redone.",
+    )
+
+
 def _build_user_payload(
     text: str,
     current_script: str | None = None,
@@ -903,6 +936,12 @@ async def parse_intent(
     t0 = time.perf_counter()
     cleaned = _normalize_transcript(text)
     logger.info("Intent parsing: %r", cleaned)
+
+    # Undo / redo sits above every other rung: it never needs the network.
+    history_intent = _check_history(cleaned)
+    if history_intent:
+        logger.info("Fast path: %s x%d", history_intent.action, history_intent.params["steps"])
+        return history_intent, (time.perf_counter() - t0) * 1000
 
     if is_photo_search(cleaned):
         query = photo_query(cleaned)

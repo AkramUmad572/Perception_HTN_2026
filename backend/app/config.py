@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     # Reference photos for image-to-3D. three.ws fetches these by URL, so they
     # have to be reachable from outside this machine.
     ref_dir: Path = STORAGE / "ref"
+    # Per-object version history: projects/<project_id>/v<N>.glb + info.json.
+    projects_dir: Path = STORAGE / "projects"
     prefer_cadquery: bool = True
 
 
@@ -57,4 +59,5 @@ def get_settings() -> Settings:
     settings.glb_dir.mkdir(parents=True, exist_ok=True)
     settings.audio_dir.mkdir(parents=True, exist_ok=True)
     settings.ref_dir.mkdir(parents=True, exist_ok=True)
+    settings.projects_dir.mkdir(parents=True, exist_ok=True)
     return settings

@@ -7,9 +7,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ai.intent import extract_named_color
+from ai.intent import _is_new_object_request, extract_named_color
+from app import projects
 from app.config import Settings
-from app.models import CommandResponse, Intent, SessionState
+from app.models import CommandResponse, Intent, SessionState, VersionInfo
 from app.session import save_session
 from cad import DEFAULTS
 from cad.sandbox import execute_cadquery_script
@@ -76,6 +77,88 @@ def _mesh_size_m(size_mm: float | None) -> float:
 
 def _display_size_m(session: SessionState) -> float:
     return _clamp(session.base_size_m * session.scale, SIZE_MIN_M, SIZE_MAX_M)
+
+
+# Which VersionInfo.op a rebuilding action records.
+_VERSION_OPS = {
+    "generate": "generate",
+    "set_material": "set_material",
+    "execute_script": "script",
+    "create": "generate",
+    "modify": "generate",
+}
+
+
+def _versioned_model_id(info: VersionInfo) -> str:
+    return f"{info.project_id}-v{info.version}"
+
+
+def _record_version(
+    session: SessionState,
+    settings: Settings,
+    model_id: str | None,
+    op: str,
+    new_object: bool = False,
+) -> str | None:
+    """
+    Move a freshly built GLB into the session's project as a new version.
+
+    A new object (or a lane change, or no live project) starts a project;
+    anything else appends. On success the session points at the version file
+    and the versioned model_id is returned — always new, so the client swaps.
+    Best effort: if the GLB is not on disk or anything fails, returns None and
+    the legacy /media/glb URL stays in place.
+    """
+    if not model_id:
+        return None
+    try:
+        src = Path(settings.glb_dir) / f"{model_id}.glb"
+        if not src.is_file():
+            return None
+        kind = session.last_backend if session.last_backend in ("cad", "mesh") else "cad"
+        meta = {
+            "op": op,
+            "summary": session.last_summary,
+            "script": session.last_script if kind == "cad" else None,
+            "mesh_prompt": session.last_mesh_prompt if kind == "mesh" else None,
+            "color": session.color,
+            "base_size_m": session.base_size_m,
+        }
+        info = None
+        if not new_object and session.project_id:
+            current = projects.current_version(settings, session.project_id)
+            if current is not None and current.kind == kind:
+                info = projects.append_version(settings, session.project_id, src, **meta)
+        if info is None:
+            info = projects.create_project(settings, kind, src, **meta)
+    except Exception as exc:
+        logger.warning("Could not record a version for %s: %s", model_id, exc)
+        return None
+    session.project_id = info.project_id
+    session.version = info.version
+    session.model_id = _versioned_model_id(info)
+    session.glb_url = info.glb_url
+    save_session(session)
+    return session.model_id
+
+
+def restore_version(session: SessionState, info: VersionInfo) -> None:
+    """Point the session at a stored version and restore its follow-up context."""
+    session.project_id = info.project_id
+    session.version = info.version
+    session.model_id = _versioned_model_id(info)
+    session.glb_url = info.glb_url
+    session.template = None
+    session.params = {}
+    session.last_backend = info.kind
+    session.last_script = info.script
+    session.last_summary = info.summary
+    session.last_mesh_prompt = info.mesh_prompt
+    if info.color:
+        session.color = info.color
+    if info.base_size_m:
+        session.base_size_m = info.base_size_m
+    save_session(session)
 
 
 async def _execute_with_retry(
@@ -310,6 +393,30 @@ async def apply_intent(
             response_backend = session.last_backend
             save_session(session)
 
+    elif action in ("undo", "redo"):
+        # History steps reload a stored version through the normal swap path.
+        project_id = intent.params.get("project_id") or session.project_id
+        try:
+            steps = max(1, int(intent.params.get("steps") or 1))
+        except (TypeError, ValueError):
+            steps = 1
+        mover = projects.undo if action == "undo" else projects.redo
+        info = mover(settings, project_id, steps) if project_id else None
+        if info is None:
+            if not project_id or projects.current_version(settings, project_id) is None:
+                intent.reply = f"There's nothing to {action} yet."
+            else:
+                intent.reply = f"Nothing to {action}."
+            action = "noop"
+            response_backend = session.last_backend
+        else:
+            restore_version(session, info)
+            rebuilt = True
+            result_model_id = session.model_id
+            response_backend = info.kind
+            textured = info.kind == "mesh"
+            intent.reply = "Undone." if action == "undo" else "Redone."
+
     elif action == "generate":
         if not intent.script:
             intent.reply = "No code was generated."
@@ -484,6 +591,16 @@ async def apply_intent(
 
         save_session(session)
 
+    if rebuilt and result_model_id and action in _VERSION_OPS:
+        new_object = action == "create" or (
+            action == "generate" and _is_new_object_request(transcript or "")
+        )
+        versioned = _record_version(
+            session, settings, result_model_id, _VERSION_OPS[action], new_object=new_object
+        )
+        if versioned:
+            result_model_id = versioned
+
     t0 = time.perf_counter()
     audio_url, tts_ms = await synthesize_speech(intent.reply, settings)
     latency["tts_ms"] = tts_ms if tts_ms else (time.perf_counter() - t0) * 1000
@@ -509,6 +626,95 @@ async def apply_intent(
         backend=response_backend,
         display_size_m=_display_size_m(session),
         candidates=candidates if action == "find_photos" else [],
+    )
+
+
+_CLIENT_OPS = {
+    "generate", "set_material", "hand_edit", "param_edit",
+    "boolean", "semantic_edit", "photo", "script",
+}
+_NO_HISTORY_REPLY = "I can't find that model's history."
+
+
+async def history_step(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    direction: str,
+    steps: int = 1,
+) -> CommandResponse:
+    """Undo/redo for a named project (the HTTP route). Voice goes via apply_intent."""
+    if projects.current_version(settings, project_id) is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+    intent = Intent(
+        action="redo" if direction == "redo" else "undo",
+        params={"steps": steps, "project_id": project_id},
+    )
+    return await apply_intent(intent, session, settings)
+
+
+async def save_client_version(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    glb_bytes: bytes,
+    op: str = "hand_edit",
+    summary: str | None = None,
+) -> CommandResponse:
+    """
+    Store a GLB the client already shows (a hand edit) as the next version.
+
+    Returns rebuilt=False with action="version_saved": the client has the
+    geometry already, so it must only move its version pointer, not reload.
+    Silent on purpose — this fires on every drag release.
+    """
+    import tempfile
+
+    if projects.current_version(settings, project_id) is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+    if len(glb_bytes) < 12 or glb_bytes[:4] != b"glTF":
+        return CommandResponse(
+            ok=False,
+            reply="That edit didn't save. Try again.",
+            action="clarify",
+            session=session,
+            error="Upload is not a binary glTF (.glb) file",
+        )
+    fd, tmp = tempfile.mkstemp(dir=str(settings.projects_dir), suffix=".glb")
+    try:
+        with open(fd, "wb") as fh:
+            fh.write(glb_bytes)
+        meta: dict = {"op": op if op in _CLIENT_OPS else "hand_edit"}
+        if summary:
+            meta["summary"] = summary
+        info = projects.append_version(settings, project_id, Path(tmp), **meta)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    restore_version(session, info)
+    return CommandResponse(
+        ok=True,
+        reply="Saved.",
+        action="version_saved",
+        rebuilt=False,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=session.model_id,
+        session=session,
+        backend=info.kind,
+        textured=info.kind == "mesh",
+        display_size_m=_display_size_m(session),
     )
 
 
@@ -598,6 +804,9 @@ async def build_from_image(
                 text_prompt, session, settings, latency, use_nvidia=False
             )
             if ok:
+                model_id = _record_version(
+                    session, settings, model_id, "photo", new_object=True
+                ) or model_id
                 reply = (
                     "The photo engine was busy, so I sculpted it from "
                     "what I saw in the picture."
@@ -630,6 +839,9 @@ async def build_from_image(
                 image_path, session, settings, latency, hint=prompt
             )
             if ok:
+                model_id = _record_version(
+                    session, settings, model_id, "photo", new_object=True
+                ) or model_id
                 reply = "The sculptor was down, so I modelled it in CAD instead."
                 audio_url, tts_ms = (
                     await synthesize_speech(reply, settings) if speak else (None, 0)
@@ -678,6 +890,9 @@ async def build_from_image(
     session.base_size_m = MESH_DEFAULT_M
     session.scale = 1.0
     save_session(session)
+    model_id = _record_version(
+        session, settings, result["model_id"], "photo", new_object=True
+    ) or result["model_id"]
 
     reply = "Built that from your photo."
     audio_url, tts_ms = await synthesize_speech(reply, settings) if speak else (None, 0)
@@ -690,7 +905,7 @@ async def build_from_image(
         rebuilt=True,
         color=session.color,
         glb_url=session.glb_url,
-        model_id=result["model_id"],
+        model_id=model_id,
         reply_audio_url=audio_url,
         session=session,
         latency_ms=latency,
@@ -793,6 +1008,7 @@ async def execute_script_direct(
     )
 
     if success:
+        model_id = _record_version(session, settings, model_id, "script") or model_id
         return CommandResponse(
             ok=True,
             transcript=None,

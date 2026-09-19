@@ -502,6 +502,7 @@ def test_parse_intent_mesh_routes_without_llm():
         meshy_api_key="",
         nvidia_api_key="",
         three_ws_enabled=False,
+        hf_space_enabled=False,
         gemini_api_key="",
         openai_api_key="",
     )
@@ -674,6 +675,77 @@ def test_photo_search_fast_path():
     return passed, failed
 
 
+def test_history_rung():
+    """'undo' / 'go back two' / 'redo' finish in the router with no network call."""
+    print("\n=== Test: undo/redo rung ===")
+    import asyncio
+    from types import SimpleNamespace
+
+    passed = failed = 0
+    settings = SimpleNamespace(
+        meshy_api_key="",
+        nvidia_api_key="",
+        three_ws_enabled=True,
+        hf_space_enabled=True,
+        gemini_api_key="",
+        openai_api_key="",
+    )
+
+    async def _parse(text, backend="cad"):
+        return (
+            await intent_mod.parse_intent(
+                text,
+                settings,
+                None,
+                {},
+                current_script="result = 1" if backend == "cad" else None,
+                last_backend=backend,
+                last_mesh_prompt="a corgi" if backend == "mesh" else None,
+            )
+        )[0]
+
+    positives = [
+        ("undo", "undo", 1),
+        ("Undo.", "undo", 1),
+        ("undo that", "undo", 1),
+        ("go back", "undo", 1),
+        ("go back two", "undo", 2),
+        ("go back 3 steps", "undo", 3),
+        ("undo twice", "undo", 2),
+        ("please undo the last change", "undo", 1),
+        ("redo", "redo", 1),
+        ("go forward two", "redo", 2),
+        ("Hey Percy, undo", "undo", 1),
+    ]
+    for text, action, steps in positives:
+        got = asyncio.run(_parse(text))
+        if got.action == action and got.params.get("steps") == steps:
+            print(f"  [ok] {text!r} → {action} x{steps}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} → {got.action} {got.params}")
+            failed += 1
+
+    mesh = asyncio.run(_parse("undo", backend="mesh"))
+    if mesh.action == "undo":
+        print("  [ok] undo on a mesh session hits the rung")
+        passed += 1
+    else:
+        print(f"  [FAIL] mesh undo → {mesh.action}")
+        failed += 1
+
+    for text in ("go back to the round one", "undo the hole and make it taller", "build me a redo button"):
+        got = intent_mod._check_history(intent_mod._normalize_transcript(text))
+        if got is None:
+            print(f"  [ok] {text!r} is not a history command")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} → {got.action}")
+            failed += 1
+
+    return passed, failed
+
+
 # ============================================================================
 # Run All Tests
 # ============================================================================
@@ -692,9 +764,10 @@ def run_all_tests():
     m_pass, m_fail = test_parse_intent_mesh_routes_without_llm()
     s_pass, s_fail = test_scale_fast_path()
     ph_pass, ph_fail = test_photo_search_fast_path()
+    h_pass, h_fail = test_history_rung()
 
-    total_pass = w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass
-    total_fail = w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail
+    total_pass = w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass + h_pass
+    total_fail = w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail + h_fail
     
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -707,6 +780,7 @@ def run_all_tests():
     print(f"Mesh parse_intent:          {m_pass}/{m_pass + m_fail} passed")
     print(f"Resize fast path:           {s_pass}/{s_pass + s_fail} passed")
     print(f"Photo search:               {ph_pass}/{ph_pass + ph_fail} passed")
+    print(f"Undo/redo rung:             {h_pass}/{h_pass + h_fail} passed")
     print(f"TOTAL:                      {total_pass}/{total_pass + total_fail} passed")
     
     if total_fail > 0:
