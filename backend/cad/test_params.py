@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cad.params import ParamError, extract_params, set_params  # noqa: E402
+from cad.params import ParamError, extract_params, params_for_part, set_params  # noqa: E402
 
 
 # ── extract_params ────────────────────────────────────────────────────────────
@@ -153,6 +153,53 @@ def test_set_error_is_atomic_and_speakable():
         assert bad not in msg, (bad, msg)
     msg2 = _raises(set_params, "result = 1\n", {"a_mm": 3})
     assert "_" not in msg2 and "PARAMS" not in msg2, msg2
+
+
+# ── params_for_part ───────────────────────────────────────────────────────────
+
+P = {
+    "ear_length_mm": 16.0,
+    "ear_base_r_mm": 5.5,
+    "head_radius_mm": 16.0,
+    "earring_d_mm": 3.0,
+    "wheel_radius_mm": 7.0,
+    "wheel_fl_offset_mm": 22.0,
+}
+EAR = {"ear_length_mm": 16.0, "ear_base_r_mm": 5.5}
+
+
+def test_part_prefix_needs_underscore():
+    assert params_for_part(P, "ear") == EAR
+
+
+def test_part_left_right_uses_base_name():
+    assert params_for_part(P, "ear_l") == EAR
+    assert params_for_part(P, "ear_r") == EAR
+    assert params_for_part(P, "ear_left") == EAR
+    assert params_for_part(P, "ear_right") == EAR
+
+
+def test_part_exact_and_specific():
+    assert params_for_part(P, "head") == {"head_radius_mm": 16.0}
+    assert params_for_part(P, "wheel_fl") == {"wheel_fl_offset_mm": 22.0}
+    assert params_for_part(P, "wheel") == {"wheel_radius_mm": 7.0, "wheel_fl_offset_mm": 22.0}
+
+
+def test_part_dedupe_suffix():
+    assert params_for_part(P, "wheel_2") == {"wheel_radius_mm": 7.0, "wheel_fl_offset_mm": 22.0}
+
+
+def test_part_specific_keys_combine_with_base():
+    p = {"ear_l_tilt_mm": 2.0, "ear_length_mm": 16.0, "ear_r_tilt_mm": 3.0}
+    assert params_for_part(p, "ear_l") == {"ear_l_tilt_mm": 2.0, "ear_length_mm": 16.0, "ear_r_tilt_mm": 3.0}
+
+
+def test_part_no_match_and_no_mutation():
+    before = dict(P)
+    assert params_for_part(P, "tail") == {}
+    assert params_for_part(P, "") == {}
+    assert params_for_part({}, "ear") == {}
+    assert P == before
 
 
 # ── runner ────────────────────────────────────────────────────────────────────

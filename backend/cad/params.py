@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import math
+import re
 
 
 class ParamError(ValueError):
@@ -156,3 +157,19 @@ def set_params(script: str, updates: dict[str, float]) -> str:
     for start, end, text in sorted(edits, reverse=True):
         data = data[:start] + text + data[end:]
     return data.decode("utf-8")
+
+
+# A mirrored or duplicated part shares its base's dimensions: "ear_l" / "ear_r"
+# use "ear_*", and "wheel_2" (the sandbox's duplicate-name suffix) uses "wheel_*".
+_SIDE_SUFFIX_RE = re.compile(r"_(?:l|r|left|right|\d+)$")
+
+
+def params_for_part(params: dict[str, float], part: str) -> dict[str, float]:
+    """The PARAMS entries that belong to one GLB part name (a new dict, input untouched)."""
+    if not part:
+        return {}
+    prefixes = {f"{part}_"}
+    base = _SIDE_SUFFIX_RE.sub("", part)
+    if base and base != part:
+        prefixes.add(f"{base}_")
+    return {k: v for k, v in params.items() if any(k.startswith(p) for p in prefixes)}
