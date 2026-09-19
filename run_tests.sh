@@ -31,6 +31,19 @@ else
 fi
 cd ..
 
+# Test 1b: CAD PARAMS (extract / rewrite / prompt examples)
+echo ""
+echo ">>> Running CAD PARAMS Tests..."
+echo ""
+cd backend
+if python3 -m cad.test_params; then
+    echo "CAD PARAMS tests: PASSED"
+else
+    echo "CAD PARAMS tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+cd ..
+
 # Test 2: Speech/STT tests
 echo ""
 echo ">>> Running Speech/STT Tests..."
