@@ -234,6 +234,94 @@ def _is_solid(part: trimesh.Trimesh, whole: trimesh.Trimesh) -> bool:
     return part.volume > 1e-6 * scale
 
 
+MSG_NO_SIZE = "I don't know this model's real size yet, so I can't size that."
+MSG_HOLE_SIZE = "The hole needs a size bigger than zero."
+MSG_HOLE_DEPTH = "The hole needs a depth bigger than zero."
+MSG_NO_DIRECTION = "I couldn't tell which way to drill."
+MSG_CUT_FAILED = "The cut didn't work on this shape. The model is unchanged."
+MSG_HOLE_MISSED = "That spot missed the model, so there was nothing to drill."
+# Below this relative volume change the boolean did nothing: the tool missed.
+MIN_VOLUME_CHANGE = 1e-6
+CUTTER_SECTIONS = 48
+
+
+def drill_hole(
+    mesh: trimesh.Trimesh,
+    center,
+    direction,
+    diameter_mm: float,
+    units_per_mm: float,
+    depth_mm: float | None = None,
+) -> trimesh.Trimesh:
+    """
+    Bore a round hole at ``center`` (a surface point) along ``direction``
+    (pointing into the model). ``depth_mm=None`` drills all the way through.
+    """
+    units = _units(units_per_mm)
+    if not _positive(diameter_mm):
+        raise BooleanError(MSG_HOLE_SIZE)
+    if depth_mm is not None and not _positive(depth_mm):
+        raise BooleanError(MSG_HOLE_DEPTH)
+    axis = _unit(direction, MSG_NO_DIRECTION)
+    c = np.asarray(center, dtype=float)
+
+    solid = repair(mesh)
+    radius = diameter_mm / 2.0 * units
+    if depth_mm is None:
+        reach = 2.0 * float(np.linalg.norm(solid.extents)) + np.linalg.norm(c - solid.centroid)
+        segment = [c - axis * reach, c + axis * reach]
+    else:
+        # Start a little outside the surface so the mouth of the hole is clean.
+        lead = max(radius, units)
+        segment = [c - axis * lead, c + axis * depth_mm * units]
+    cutter = trimesh.creation.cylinder(radius=radius, segment=segment, sections=CUTTER_SECTIONS)
+
+    out = _boolean(solid, cutter, "difference")
+    if abs(solid.volume - out.volume) <= MIN_VOLUME_CHANGE * solid.volume:
+        raise BooleanError(MSG_HOLE_MISSED)
+    return _transfer_colors(out, solid)
+
+
+def _units(units_per_mm) -> float:
+    if not _positive(units_per_mm):
+        raise BooleanError(MSG_NO_SIZE)
+    return float(units_per_mm)
+
+
+def _positive(value) -> bool:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return bool(np.isfinite(v) and v > 0)
+
+
+def _unit(vector, message: str) -> np.ndarray:
+    try:
+        v = np.asarray(vector, dtype=float).reshape(3)
+    except (TypeError, ValueError) as exc:
+        raise BooleanError(message) from exc
+    n = float(np.linalg.norm(v))
+    if not np.isfinite(n) or n < 1e-12:
+        raise BooleanError(message)
+    return v / n
+
+
+def _boolean(solid: trimesh.Trimesh, tool: trimesh.Trimesh, op: str) -> trimesh.Trimesh:
+    """Run one manifold boolean; any failure becomes a speakable error."""
+    try:
+        if op == "difference":
+            out = solid.difference(tool, engine="manifold")
+        else:
+            out = solid.union(tool, engine="manifold")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("manifold %s failed: %s", op, exc)
+        raise BooleanError(MSG_CUT_FAILED) from exc
+    if not isinstance(out, trimesh.Trimesh) or len(out.faces) == 0 or not out.is_watertight:
+        raise BooleanError(MSG_CUT_FAILED)
+    return out
+
+
 def _transfer_colors(dst: trimesh.Trimesh, src: trimesh.Trimesh) -> trimesh.Trimesh:
     """Give every vertex of dst the colour of the nearest vertex of src."""
     from scipy.spatial import cKDTree

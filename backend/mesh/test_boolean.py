@@ -242,6 +242,82 @@ def test_repair_hopeless_raises_speakable(tmp: Path) -> tuple[int, int]:
     return p + p2, f + f2
 
 
+# ---------------------------------------------------------------- drill_hole
+
+UNITS = 0.01  # model units per mm: a unit sphere stands in for a 20 cm sculpt
+
+
+def _all_known_colors(mesh: trimesh.Trimesh) -> tuple[bool, str]:
+    rgb = np.asarray(mesh.visual.vertex_colors)[:, :3]
+    ok = np.all((rgb == RED).all(axis=1) | (rgb == BLUE).all(axis=1))
+    return bool(ok), f"colours present: {np.unique(rgb, axis=0).tolist()}"
+
+
+def test_drill_through_sphere(tmp: Path) -> tuple[int, int]:
+    print("\ndrill_hole straight through a sphere")
+    s = _sphere()
+    out = boolean.drill_hole(s, (0, 1, 0), (0, -1, 0), diameter_mm=20, units_per_mm=UNITS)
+    removed = s.volume - out.volume
+    p, f = _solid_check("watertight, smaller", out, s.volume - removed, 1e-9)
+    # A 0.1-radius bore through a 2-long chord removes about pi * 0.01 * 2.
+    p2, f2 = _check("removed ~0.06", 0.04 < removed < 0.08, f"removed={removed:.4f}")
+    # The bore wall sits at 20 mm / 2 * 0.01 = 0.1 units from the axis: no
+    # vertex is closer, and the wall's own vertices sit right at it.
+    radial = np.linalg.norm(out.vertices[:, [0, 2]], axis=1)
+    p3, f3 = _check(
+        "bore radius from units_per_mm",
+        abs(radial.min() - 0.1) < 0.001,
+        f"closest vertex to axis at {radial.min():.4f}",
+    )
+    return p + p2 + p3, f + f2 + f3
+
+
+def test_drill_blind_is_shallower(tmp: Path) -> tuple[int, int]:
+    print("\ndrill_hole with a depth stops partway")
+    s = _sphere()
+    through = s.volume - boolean.drill_hole(s, (0, 1, 0), (0, -1, 0), 20, UNITS).volume
+    blind_mesh = boolean.drill_hole(s, (0, 1, 0), (0, -1, 0), 20, UNITS, depth_mm=50)
+    blind = s.volume - blind_mesh.volume
+    p, f = _check("blind removes less", 0 < blind < through * 0.5, f"{blind=:.4f} {through=:.4f}")
+    p2, f2 = _check("still watertight", blind_mesh.is_watertight)
+    return p + p2, f + f2
+
+
+def test_drill_repaired_sculpt(tmp: Path) -> tuple[int, int]:
+    print("\ndrill_hole into a sculpt that needed repair")
+    out = boolean.drill_hole(_big_hole(), (0, 0, 1), (0, 0, -1), 20, UNITS)
+    return _check("watertight after repair + drill", out.is_watertight and out.volume > 3.0)
+
+
+def test_drill_keeps_texture_colors(tmp: Path) -> tuple[int, int]:
+    print("\ndrill_hole keeps the textured box's colours")
+    mesh = boolean.load_mesh(_textured_box_glb(tmp / "tex.glb"))
+    out = boolean.drill_hole(mesh, (-0.25, 0.5, 0), (0, -1, 0), 20, UNITS)
+    p, f = _check("hole cut", out.is_watertight and out.volume < 0.99, f"volume={out.volume}")
+    ok, why = _colors_split_by_x(out)
+    p2, f2 = _check("red/blue split survives", ok, why)
+    ok, why = _all_known_colors(out)
+    p3, f3 = _check("new faces take original colours", ok, why)
+    dest = tmp / "drilled.glb"
+    boolean.export_glb(out, dest)
+    ok, why = _colors_split_by_x(boolean.load_mesh(dest))
+    p4, f4 = _check("colours survive export", ok, why)
+    return p + p2 + p3 + p4, f + f2 + f3 + f4
+
+
+def test_drill_errors_speakable(tmp: Path) -> tuple[int, int]:
+    print("\ndrill_hole rejects bad input with speakable reasons")
+    s = _sphere()
+    results = [
+        _expect_error("miss", lambda: boolean.drill_hole(s, (5, 5, 5), (0, -1, 0), 20, UNITS, 10)),
+        _expect_error("zero diameter", lambda: boolean.drill_hole(s, (0, 1, 0), (0, -1, 0), 0, UNITS)),
+        _expect_error("no real size", lambda: boolean.drill_hole(s, (0, 1, 0), (0, -1, 0), 20, 0)),
+        _expect_error("no direction", lambda: boolean.drill_hole(s, (0, 1, 0), (0, 0, 0), 20, UNITS)),
+        _expect_error("negative depth", lambda: boolean.drill_hole(s, (0, 1, 0), (0, -1, 0), 20, UNITS, -3)),
+    ]
+    return sum(r[0] for r in results), sum(r[1] for r in results)
+
+
 # ---------------------------------------------------------------- runner
 
 TESTS = [
@@ -257,6 +333,11 @@ TESTS = [
     test_repair_drops_debris,
     test_repair_keeps_colors,
     test_repair_hopeless_raises_speakable,
+    test_drill_through_sphere,
+    test_drill_blind_is_shallower,
+    test_drill_repaired_sculpt,
+    test_drill_keeps_texture_colors,
+    test_drill_errors_speakable,
 ]
 
 
