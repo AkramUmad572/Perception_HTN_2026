@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.claude/worktrees/
+web-client/node_modules/
+web-client/.iwsdk/
+web-client/dist/
+backend/.env
+backend/storage/*/*
+!backend/storage/*/.gitkeep
+backend/storage/sessions.json
