@@ -57,6 +57,19 @@ else
 fi
 cd ..
 
+# Test 3b: Project / version history tests
+echo ""
+echo ">>> Running Projects Tests..."
+echo ""
+cd backend
+if python3 -m app.test_projects; then
+    echo "Projects tests: PASSED"
+else
+    echo "Projects tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+cd ..
+
 # Test 4: Client model update tests
 echo ""
 echo ">>> Running Client Model Update Tests..."
