@@ -582,6 +582,42 @@ def _check_history(text: str) -> Intent | None:
     )
 
 
+# Client UI mode switches ("select mode", "tape measure", "done") — a headset
+# voice shortcut for the same modes the V/T keys and HTML buttons toggle.
+# Whole-utterance match, no network; the client applies `params["mode"]`.
+_UI_MODE_MAP = {
+    "select mode": "lasso",
+    "circle mode": "lasso",
+    "tape measure": "tape",
+    "measure mode": "tape",
+    "done": "none",
+    "cancel": "none",
+    "exit mode": "none",
+    "clear selection": "none",
+}
+_UI_MODE_RE = re.compile(
+    r"^(?:(?:hey\s+)?percy[,.]?\s+)?(?:please\s+)?"
+    r"(?P<phrase>select mode|circle mode|tape measure|measure mode|exit mode|"
+    r"clear selection|done|cancel)"
+    r"(?:\s+please)?[\s.!?]*$",
+    re.I,
+)
+_UI_MODE_REPLIES = {
+    "lasso": "Select mode.",
+    "tape": "Tape measure.",
+    "none": "Okay.",
+}
+
+
+def _check_ui_mode(text: str) -> Intent | None:
+    """'select mode' / 'tape measure' / 'done' — a client UI switch, no network call."""
+    m = _UI_MODE_RE.match(text.strip())
+    if not m:
+        return None
+    mode = _UI_MODE_MAP[m.group("phrase").lower()]
+    return Intent(action="ui_mode", params={"mode": mode}, reply=_UI_MODE_REPLIES[mode])
+
+
 # Absolute size ("make it 8 cm tall"). Sculpts only: a sculpt has no real size,
 # so this sets one. CAD keeps going through codegen, where the millimetres live.
 _SIZE_UNITS: tuple[tuple[str, float, str], ...] = (
@@ -1169,6 +1205,11 @@ async def parse_intent(
     if history_intent:
         logger.info("Fast path: %s x%d", history_intent.action, history_intent.params["steps"])
         return history_intent, (time.perf_counter() - t0) * 1000
+
+    ui_mode_intent = _check_ui_mode(cleaned)
+    if ui_mode_intent:
+        logger.info("Fast path: ui_mode %s", ui_mode_intent.params["mode"])
+        return ui_mode_intent, (time.perf_counter() - t0) * 1000
 
     if is_photo_search(cleaned):
         query = photo_query(cleaned)
