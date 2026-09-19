@@ -1,6 +1,6 @@
 """Reference-photo search: Drive listing + visual match."""
 
-from photos.drive import download_file, list_images
+from photos.drive import download_file, list_images, preview_url
 from photos.search import find_photos, is_photo_search, photo_query
 
 __all__ = [
@@ -9,4 +9,5 @@ __all__ = [
     "is_photo_search",
     "list_images",
     "photo_query",
+    "preview_url",
 ]

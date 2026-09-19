@@ -20,7 +20,7 @@ from mesh.factory import (
     generate_mesh_glb_from_image,
     mesh_ready,
 )
-from photos.drive import download_file, list_images
+from photos.drive import download_file, list_images, preview_url
 from photos.search import find_photos
 from photos.stage import stage_photo
 from voice.speech import synthesize_speech
@@ -378,8 +378,8 @@ async def apply_intent(
                 intent.reply = f"Found {n}. Pinch to pick one."
 
     elif action == "browse_photos":
-        # Just a listing — no ranking, no per-photo download. Drive's own
-        # thumbnail serves the picker; the pick itself downloads full-res.
+        # Listing only. Cards load /api/photos/{id}/preview, which the backend
+        # fetches from Drive and serves — the headset never talks to Google.
         response_backend = "mesh"
         try:
             files = await list_images(settings)
@@ -393,11 +393,11 @@ async def apply_intent(
             {
                 "id": f["id"],
                 "name": f.get("name") or "photo",
-                "preview_url": f.get("thumbnail_link") or "",
-                "image_url": f.get("thumbnail_link") or "",
+                "preview_url": preview_url(f["id"]),
+                "image_url": preview_url(f["id"]),
             }
             for f in files
-            if f.get("thumbnail_link")
+            if f.get("id")
         ]
         session.last_photos = candidates
         save_session(session)

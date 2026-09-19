@@ -7,7 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,6 +26,7 @@ from app.pipeline import (
 )
 from app.session import clear_session, get_session
 from mesh.refimage import isolate_subject
+from photos.drive import ensure_local_file, valid_file_id
 from voice.speech import transcribe_audio
 
 logging.basicConfig(level=logging.INFO)
@@ -224,6 +225,29 @@ async def image_to_3d(
             error=str(exc),
             latency_ms={"total_ms": (time.perf_counter() - t_all) * 1000},
         )
+
+
+@app.get("/api/photos/{file_id}/preview")
+async def photo_preview(file_id: str):
+    """
+    Drive photo for the AR picker.
+
+    The headset loads this same-origin URL. We fetch the file from Google
+    (API key cannot use alt=media, so we fall back to the public export)
+    and cache it under storage/ref.
+    """
+    if not valid_file_id(file_id):
+        raise HTTPException(status_code=400, detail="Invalid file id")
+    try:
+        path, mime = await ensure_local_file(file_id, settings)
+    except Exception as exc:
+        logger.warning("Drive preview %s failed: %s", file_id, exc)
+        raise HTTPException(status_code=404, detail="Photo unavailable") from exc
+    return FileResponse(
+        path,
+        media_type=mime,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @app.post("/api/photos/confirm", response_model=CommandResponse)
