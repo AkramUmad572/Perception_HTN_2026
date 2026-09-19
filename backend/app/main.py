@@ -21,11 +21,13 @@ from app.models import (
     CommandRequest,
     CommandResponse,
     HistoryRequest,
+    ParamUpdateRequest,
     PhotoChooseRequest,
     ScriptRequest,
 )
 from app.pipeline import (
     apply_intent,
+    apply_param_update,
     build_chosen_photo,
     build_from_image,
     confirm_chosen_photo,
@@ -202,6 +204,26 @@ async def project_save_version(
         return CommandResponse(
             ok=False,
             reply="That edit didn't save. Try again.",
+            action="clarify",
+            session=session,
+            error=str(exc),
+        )
+
+
+@app.post("/api/projects/{project_id}/params", response_model=CommandResponse)
+async def project_update_params(project_id: str, body: ParamUpdateRequest):
+    """
+    Rewrite named PARAMS on the project's current CAD script and rerun the
+    sandbox — no LLM. Fired on drag release from the client's dimension panel.
+    """
+    session = get_session(body.session_id)
+    try:
+        return await apply_param_update(session, settings, project_id, body.updates)
+    except Exception as exc:
+        logger.exception("Param update failed: %s", exc)
+        return CommandResponse(
+            ok=False,
+            reply="That change didn't save. Try again.",
             action="clarify",
             session=session,
             error=str(exc),
