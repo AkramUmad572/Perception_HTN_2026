@@ -6,6 +6,7 @@
 
 import { voiceState } from "./VoiceState.js";
 import { PTTRecorder } from "./PTTRecorder.js";
+import { parseRegionCommand } from "../interaction/regionOps.js";
 
 const API_BASE = "";
 const SESSION_ID = "default";
@@ -26,12 +27,43 @@ export class PercyAssistant {
     this.onStatusMessage = options.onStatusMessage || (() => {});
     this.onTalkingChange = options.onTalkingChange || (() => {});
     this.onPhotoCandidates = options.onPhotoCandidates || (() => {});
+    // Applies a parsed region command (regionOps.js) to the loaded model and
+    // saves the result as a new version. When set, a text/voice command that
+    // matches the local table runs here instead of /api/command — no LLM
+    // round trip for "bigger" / "pull it out" / etc. on a selection.
+    this.onRegionCommand = options.onRegionCommand || null;
 
     this.recorder = new PTTRecorder();
     this.recorder.onMaxHold = () => this.endTalk();
     this.replyAudio = null;
     this.started = false;
     this._ending = false;
+    // What the user last pointed at (interaction/selection.js). Consumed by
+    // the next voice or text command, then cleared.
+    this.selection = null;
+    // Called once the pending selection is consumed (sent or dropped), so
+    // main.js can clear the in-world highlight.
+    this.onSelectionCleared = options.onSelectionCleared || (() => {});
+  }
+
+  /** Attach a Selection to the next voice/text command; cleared once sent. */
+  setSelection(selection) {
+    this.selection = selection || null;
+  }
+
+  clearSelection() {
+    if (!this.selection) return;
+    this.selection = null;
+    this.onSelectionCleared();
+  }
+
+  _takeSelection() {
+    const selection = this.selection;
+    if (selection) {
+      this.selection = null;
+      this.onSelectionCleared();
+    }
+    return selection;
   }
 
   async start() {
@@ -168,6 +200,8 @@ export class PercyAssistant {
     const form = new FormData();
     form.append("audio", blob, `utterance.${ext}`);
     form.append("session_id", SESSION_ID);
+    const selection = this._takeSelection();
+    if (selection) form.append("selection", JSON.stringify(selection));
 
     return this._fetchJson(`${API_BASE}/api/voice`, { method: "POST", body: form });
   }
@@ -175,14 +209,33 @@ export class PercyAssistant {
   async sendTextCommand(text) {
     if (voiceState.isMuted) return null;
 
+    // A region edit on an active selection runs client-side (regionOps.js),
+    // with no LLM round trip: parse the small local table first.
+    const regionCmd = this.selection ? parseRegionCommand(text) : null;
+    if (regionCmd && this.onRegionCommand) {
+      const selection = this._takeSelection();
+      voiceState.toThinking();
+      this.onStatusMessage(`Applying "${text}"…`, true);
+      try {
+        const result = await this.onRegionCommand(regionCmd, selection, text);
+        await this._handleResponse(result);
+        return result;
+      } catch (e) {
+        voiceState.toError(e.message);
+        this.onStatusMessage(`Error: ${e.message}`, false);
+        setTimeout(() => voiceState.toIdle(), 3000);
+        return null;
+      }
+    }
+
     voiceState.toThinking();
     this.onStatusMessage(`Looking that up… ("${text}")`, true);
 
     try {
-      const result = await this._postJson(`${API_BASE}/api/command`, {
-        text,
-        session_id: SESSION_ID,
-      });
+      const body = { text, session_id: SESSION_ID };
+      const selection = this._takeSelection();
+      if (selection) body.selection = selection;
+      const result = await this._postJson(`${API_BASE}/api/command`, body);
       await this._handleResponse(result);
       return result;
     } catch (e) {
