@@ -58,6 +58,15 @@ export function labelPosition(min, max, right, margin = 0.03) {
   return { x: c.x + right.x * d, y: c.y + right.y * d, z: c.z + right.z * d };
 }
 
+/**
+ * Multiplier from raw GLB bounds to real size. CAD GLBs are exported in real
+ * metres, so the display clamp (0.04–1 m) must not leak into the label; a
+ * sculpt has no real size except the one its display scale gives it.
+ */
+export function realScaleFor(backend, objectScale) {
+  return backend === "cad" ? 1 : objectScale;
+}
+
 /** Tape measure: which endpoint the next pinch places. */
 export function tapeNextStep(state) {
   return state.hasStart && !state.hasEnd ? "end" : "start";

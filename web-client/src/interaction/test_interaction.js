@@ -14,6 +14,7 @@ import {
   realSize,
   labelPosition,
   tapeNextStep,
+  realScaleFor,
 } from "./measure.js";
 import {
   twoHandTransform,
@@ -104,6 +105,12 @@ test("tapeNextStep alternates start / end", () => {
   eq(tapeNextStep({ hasStart: false, hasEnd: false }), "start");
   eq(tapeNextStep({ hasStart: true, hasEnd: false }), "end");
   eq(tapeNextStep({ hasStart: true, hasEnd: true }), "start");
+});
+
+test("realScaleFor: CAD GLBs are already metres, sculpts use their display scale", () => {
+  eq(realScaleFor("cad", 0.5), 1);
+  eq(realScaleFor("mesh", 0.5), 0.5);
+  eq(realScaleFor(undefined, 0.5), 0.5);
 });
 
 console.log("\n=== twoHand.js ===");

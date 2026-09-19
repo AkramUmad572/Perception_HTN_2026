@@ -17,6 +17,16 @@ import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { PercyAssistant } from "./voice/PercyAssistant.js";
 import { voiceState, VoiceStates } from "./voice/VoiceState.js";
 import { PhotoPicker } from "./PhotoPicker.js";
+import { realSize, realScaleFor } from "./interaction/measure.js";
+import {
+  twoHandTransform,
+  midpoint,
+  applyTwoHandToPosition,
+  isTwoHandActive,
+  clampNavScale,
+} from "./interaction/twoHand.js";
+import { createDimensionsLabel } from "./interaction/dimensionsLabel.js";
+import { createTapeMeasure } from "./interaction/tapeMeasure.js";
 
 // Desktop XR emulation is injected by @iwsdk/vite-plugin-dev (localhost only).
 // Quest / LAN IP keep native WebXR — do not manually install IWER here.
@@ -382,6 +392,30 @@ let lastTextured = false;
 // just moves this number.
 const DEFAULT_DISPLAY_SIZE_M = 0.22;
 let modelBaseMaxDim = 1;
+// Raw GLB bounds and lane of the loaded model, for the real-size label.
+const modelBaseSize = new THREE.Vector3(1, 1, 1);
+let lastBackend = null;
+// Two-hand / wheel zoom. Display only: it lives on modelRoot.scale and is
+// never sent to the server.
+let navScale = 1;
+
+const dimsLabel = createDimensionsLabel();
+scene.add(dimsLabel.object3d);
+
+function realScale() {
+  return currentModel ? realScaleFor(lastBackend, currentModel.scale.x) : 1;
+}
+
+// modelRoot-local distances are display metres; divide the display scale out.
+const tape = createTapeMeasure(scene, modelRoot, {
+  toReal: (d) => (currentModel ? (d / currentModel.scale.x) * realScale() : d),
+});
+let tapeMode = false;
+
+function refreshDimensions() {
+  if (!currentModel) return;
+  dimsLabel.setSize(realSize(modelBaseSize, realScale()));
+}
 
 function applyDisplaySize(obj, displaySizeM) {
   obj.scale.setScalar(displaySizeM / modelBaseMaxDim);
@@ -418,6 +452,7 @@ async function setModelFromResponse(data) {
       const box = new THREE.Box3().setFromObject(sceneObj);
       const size = box.getSize(new THREE.Vector3());
       modelBaseMaxDim = Math.max(size.x, size.y, size.z) || 1;
+      modelBaseSize.copy(size);
       applyDisplaySize(sceneObj, displaySizeM);
 
       const textured = Boolean(data.textured || data.backend === "mesh");
@@ -451,6 +486,9 @@ async function setModelFromResponse(data) {
       modelRoot.add(currentModel);
       lastLoadedGlbUrl = newGlbUrl;
       lastModelId = newModelId;
+      lastBackend = data.backend || (textured ? "mesh" : "cad");
+      refreshDimensions();
+      tape.clear();
       photoPicker.hide();
 
       if (wasGrabbing && savedOffset && savedSource) {
@@ -471,6 +509,7 @@ async function setModelFromResponse(data) {
   } else if (data.action === "set_scale" && currentModel) {
     // Resizing a sculpt ships no new GLB — rescale what is already loaded.
     applyDisplaySize(currentModel, displaySizeM);
+    refreshDimensions();
     console.log("[Percy] Resized to", displaySizeM.toFixed(3), "m");
   } else if (data.color && currentModel && !lastTextured) {
     // Color-only update (no new model) - apply hologram paint on CAD only
@@ -555,6 +594,18 @@ const PINCH_THRESHOLD_END = 0.045;
 const PINCH_MIN_DURATION_MS = 50;
 const GRAB_RANGE = 0.20;
 
+// Two-hand mode and the tape measure use a proper hysteresis latch per hand
+// (on below START, off above END), separate from the one-hand grab logic.
+const held = { 0: false, 1: false };
+const heldPos = { 0: new THREE.Vector3(), 1: new THREE.Vector3() };
+let twoHandOn = false;
+const prevL = new THREE.Vector3();
+const prevR = new THREE.Vector3();
+const _yawQuat = new THREE.Quaternion();
+const _up = new THREE.Vector3(0, 1, 0);
+const tapeRaycaster = new THREE.Raycaster();
+const _rayDir = new THREE.Vector3();
+
 function modelInteractTarget() {
   return currentModel || (placeholder.visible ? placeholder : null);
 }
@@ -630,11 +681,17 @@ function updateGrab() {
   tempMatrix.multiplyMatrices(grabSource.matrixWorld, grabOffset);
   const s = new THREE.Vector3();
   tempMatrix.decompose(modelRoot.position, modelRoot.quaternion, s);
-  modelRoot.scale.set(1, 1, 1);
+  modelRoot.scale.setScalar(navScale);
 }
 
 function pollHand(handEntry, key) {
   const gap = updatePinchAnchor(handEntry);
+  const wasHeld = held[key];
+  if (gap === null) held[key] = false;
+  else if (gap < PINCH_THRESHOLD_START) held[key] = true;
+  else if (gap > PINCH_THRESHOLD_END) held[key] = false;
+  if (gap !== null) heldPos[key].copy(handEntry.pinchAnchor.position);
+
   if (gap === null) {
     if (wasPinching[key]) {
       if (key === 0) percy.endTalk();
@@ -665,6 +722,12 @@ function pollHand(handEntry, key) {
     return;
   }
 
+  if (key === 1 && tapeMode) {
+    if (held[1] && !wasHeld) placeTapePointFromHand(handEntry);
+    wasPinching[key] = isPinching;
+    return;
+  }
+
   if (key === 1 && !grabbing) {
     getModelCenter(_modelCenter);
     const dist = pos.distanceTo(_modelCenter);
@@ -678,7 +741,7 @@ function pollHand(handEntry, key) {
     if (key === 0) percy.beginTalk();
   }
 
-  if (key === 1 && isPinching && wasPinching[key] && !grabbing) {
+  if (key === 1 && isPinching && wasPinching[key] && !grabbing && !twoHandOn) {
     const duration = now - pinchStartTime[key];
     if (duration >= PINCH_MIN_DURATION_MS && nearModel(pos, GRAB_RANGE)) {
       beginGrab(handEntry.pinchAnchor, key);
@@ -693,6 +756,80 @@ function pollHand(handEntry, key) {
   wasPinching[key] = isPinching;
 }
 
+/**
+ * Both hands pinching near the model: spread zooms, twist turns about vertical,
+ * moving both carries it. Engaging needs both pinches near the model; once
+ * engaged it continues while both are held, so the hands can spread apart.
+ */
+function updateTwoHand() {
+  if (!twoHandOn) {
+    const active = isTwoHandActive({
+      leftPinching: held[0],
+      rightPinching: held[1],
+      leftNear: held[0] && nearModel(heldPos[0], GRAB_RANGE),
+      rightNear: held[1] && nearModel(heldPos[1], GRAB_RANGE),
+      tapeMode,
+    });
+    if (!active) return;
+    twoHandOn = true;
+    if (grabbing) endGrab();
+    // The left pinch started push-to-talk; this was a gesture, not speech.
+    percy.cancelTalk();
+    prevL.copy(heldPos[0]);
+    prevR.copy(heldPos[1]);
+    halo.material.opacity = 0.9;
+    halo.material.color.setHex(0x00ff88);
+    return;
+  }
+  if (!held[0] || !held[1]) {
+    twoHandOn = false;
+    halo.material.color.setHex(0x4f8cff);
+    return;
+  }
+  const t = twoHandTransform(prevL, prevR, heldPos[0], heldPos[1]);
+  const newScale = clampNavScale(navScale, t.scale);
+  const p = applyTwoHandToPosition(modelRoot.position, midpoint(prevL, prevR), {
+    ...t,
+    scale: newScale / navScale,
+  });
+  modelRoot.position.set(p.x, p.y, p.z);
+  _yawQuat.setFromAxisAngle(_up, t.yaw);
+  modelRoot.quaternion.premultiply(_yawQuat);
+  navScale = newScale;
+  modelRoot.scale.setScalar(navScale);
+  prevL.copy(heldPos[0]);
+  prevR.copy(heldPos[1]);
+}
+
+function tapeHit(origin, dir) {
+  if (!currentModel) return null;
+  tapeRaycaster.set(origin, dir.clone().normalize());
+  return tapeRaycaster.intersectObject(currentModel, true)[0]?.point || null;
+}
+
+/** Controller target ray first; for a pinch touching the model, aim at its centre. */
+function placeTapePointFromHand(handEntry) {
+  const c = handEntry.controller;
+  c.updateMatrixWorld(true);
+  _rayDir.set(0, 0, -1).transformDirection(c.matrixWorld);
+  let point = tapeHit(new THREE.Vector3().setFromMatrixPosition(c.matrixWorld), _rayDir);
+  if (!point) {
+    const from = handEntry.pinchAnchor.position;
+    getModelCenter(_modelCenter);
+    point = tapeHit(from, _modelCenter.clone().sub(from));
+  }
+  if (point) tape.place(point);
+  else setStatus("Point at the model to measure.", false);
+}
+
+function setTapeMode(on) {
+  tapeMode = on;
+  if (!on) tape.clear();
+  if (on && grabbing) endGrab();
+  document.getElementById("tapeButton")?.classList.toggle("active", on);
+  setStatus(on ? "Tape measure: pinch two points on the model." : "Tape measure off.", true);
+}
+
 left.controller.addEventListener("selectstart", () => {
   percy.beginTalk();
 });
@@ -704,6 +841,11 @@ right.controller.addEventListener("selectstart", () => {
   right.controller.getWorldPosition(_pinch);
   if (photoPicker.isOpen) {
     photoPicker.beginPinch(_pinch);
+    return;
+  }
+  // Hand input also fires select events; hands place tape points in pollHand.
+  if (tapeMode) {
+    if (!right.hand.joints?.["index-finger-tip"]) placeTapePointFromHand(right);
     return;
   }
   if (nearModel(_pinch, GRAB_RANGE)) beginGrab(right.controller, -1);
@@ -785,12 +927,15 @@ renderer.setAnimationLoop(() => {
 
   pollHand(left, 0);
   pollHand(right, 1);
-  updateGrab();
+  updateTwoHand();
+  if (!twoHandOn) updateGrab();
+  dimsLabel.follow(currentModel, camera);
+  tape.update();
   const nowTick = performance.now();
   photoPicker.tick((nowTick - lastTick) / 1000);
   lastTick = nowTick;
 
-  if (!grabbing) {
+  if (!grabbing && !twoHandOn) {
     const decay = 0.92;
     halo.material.opacity *= decay;
     if (halo.material.opacity < 0.01) halo.material.opacity = 0;
@@ -816,6 +961,11 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
     if (fileId) buildFromPickedPhoto(fileId);
     return;
   }
+  if (tapeMode) {
+    const hit = currentModel && raycaster.intersectObject(currentModel, true)[0];
+    if (hit) tape.place(hit.point);
+    return;
+  }
   const target = modelInteractTarget();
   if (target && raycaster.intersectObject(target, true).length) {
     desktopMode = e.shiftKey ? "spin" : "move";
@@ -839,9 +989,24 @@ window.addEventListener("pointermove", (e) => {
   }
 });
 
+renderer.domElement.addEventListener(
+  "wheel",
+  (e) => {
+    if (renderer.xr.isPresenting) return;
+    // Display zoom only, same as the two-hand spread.
+    navScale = clampNavScale(navScale, Math.exp(-e.deltaY * 0.001));
+    modelRoot.scale.setScalar(navScale);
+  },
+  { passive: true }
+);
+
 window.addEventListener("keydown", (e) => {
   if (e.key === "m" || e.key === "M") {
     percy.toggleMute();
+    return;
+  }
+  if ((e.key === "t" || e.key === "T") && !e.repeat) {
+    setTapeMode(!tapeMode);
     return;
   }
   if (e.code === "Space" && !e.repeat) {
@@ -854,6 +1019,11 @@ window.addEventListener("keyup", (e) => {
     e.preventDefault();
     percy.endTalk();
   }
+});
+
+document.getElementById("tapeButton")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  setTapeMode(!tapeMode);
 });
 
 const micButton = document.getElementById("micButton");
@@ -909,6 +1079,10 @@ window.PerceptionCAD = {
   onVoiceStateChange: (callback) => voiceState.subscribe(callback),
   
   isGrabbing: () => grabbing,
+  isTwoHand: () => twoHandOn,
+  setTapeMode,
+  getTapeDistanceM: () => tape.distance(),
+  getNavScale: () => navScale,
   placeModelInFrontOfUser,
   clearStaleGrabRefs: clearStaleGrabRefs,
   rebindGrabAfterMeshSwap: () => {

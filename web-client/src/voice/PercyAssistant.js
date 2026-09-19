@@ -70,6 +70,7 @@ export class PercyAssistant {
   async beginTalk() {
     if (!this.started || voiceState.isMuted) return;
     if (voiceState.isListening || voiceState.isThinking) return;
+    this._cancelPending = false;
 
     if (this.replyAudio) {
       try {
@@ -80,6 +81,13 @@ export class PercyAssistant {
 
     try {
       await this.recorder.start();
+      if (this._cancelPending) {
+        // cancelTalk() arrived while the mic was still opening.
+        this._cancelPending = false;
+        this.recorder.abort();
+        this.onTalkingChange(false);
+        return;
+      }
       voiceState.toListening();
       this.onTalkingChange(true);
       this.onStatusMessage("Listening… hold to talk, release to send.", true);
@@ -88,6 +96,19 @@ export class PercyAssistant {
       voiceState.toError("Microphone access required");
       this.onStatusMessage("Mic access required. Allow and retry.", false);
     }
+  }
+
+  /**
+   * Drop the current hold without sending it. Used when a left-hand pinch
+   * turns out to be half of a two-hand gesture rather than push-to-talk.
+   */
+  cancelTalk() {
+    this._cancelPending = true;
+    if (!voiceState.isListening || this._ending) return;
+    this._cancelPending = false;
+    this.recorder.abort();
+    voiceState.toIdle();
+    this.onTalkingChange(false);
   }
 
   async endTalk() {
