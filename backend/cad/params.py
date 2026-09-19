@@ -14,6 +14,7 @@ run on every drag of a dimension handle.
 from __future__ import annotations
 
 import ast
+import math
 
 
 class ParamError(ValueError):
@@ -82,3 +83,76 @@ def extract_params(script: str) -> dict[str, float]:
     if not items:
         return {}
     return {k: v for k, _, v in items}
+
+
+def _spoken(name: str) -> str:
+    """``ear_length_mm`` -> ``ear length``: dimension names are read aloud."""
+    words = [w for w in str(name).split("_") if w]
+    if len(words) > 1 and words[-1].lower() in ("mm", "cm", "m", "deg"):
+        words = words[:-1]
+    return " ".join(words) or "that"
+
+
+def _format_value(v: float) -> str:
+    v = round(float(v), 4)
+    if v.is_integer():
+        return str(int(v))
+    return repr(v)
+
+
+def _valid_value(v: object) -> float | None:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    f = float(v)
+    if not math.isfinite(f) or f <= 0:
+        return None
+    return f
+
+
+def _line_starts(data: bytes) -> list[int]:
+    """Byte offset where each 1-based line begins; index with ``lineno - 1``.
+
+    Matches the tokenizer: ``\\n``, ``\\r\\n`` and a lone ``\\r`` all end a line.
+    """
+    starts = [0]
+    n = len(data)
+    for i, b in enumerate(data):
+        if b == 0x0A or (b == 0x0D and (i + 1 >= n or data[i + 1] != 0x0A)):
+            starts.append(i + 1)
+    return starts
+
+
+def set_params(script: str, updates: dict[str, float]) -> str:
+    """
+    Rewrite the given PARAMS values, leaving every other byte of ``script`` intact.
+
+    Every update is validated before anything is rewritten: either all values
+    land or ``ParamError`` is raised. ``ast`` column offsets count UTF-8 bytes,
+    so the splice works on the encoded script.
+    """
+    if not updates:
+        return script
+    items = _parse_params(script)
+    if items is None:
+        raise ParamError("This model has no named dimensions I can change.")
+    known = {k for k, _, _ in items}
+    clean: dict[str, float] = {}
+    for name, value in updates.items():
+        if name not in known:
+            raise ParamError(f"This model has no dimension called {_spoken(name)}.")
+        v = _valid_value(value)
+        if v is None:
+            raise ParamError(f"The {_spoken(name)} has to be a positive number.")
+        clean[name] = v
+
+    data = script.encode("utf-8")
+    starts = _line_starts(data)
+    edits: list[tuple[int, int, bytes]] = []
+    for key, node, _ in items:
+        if key in clean:
+            start = starts[node.lineno - 1] + node.col_offset
+            end = starts[node.end_lineno - 1] + node.end_col_offset
+            edits.append((start, end, _format_value(clean[key]).encode("utf-8")))
+    for start, end, text in sorted(edits, reverse=True):
+        data = data[:start] + text + data[end:]
+    return data.decode("utf-8")

@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cad.params import ParamError, extract_params  # noqa: E402
+from cad.params import ParamError, extract_params, set_params  # noqa: E402
 
 
 # ── extract_params ────────────────────────────────────────────────────────────
@@ -62,6 +62,97 @@ def test_extract_never_executes():
         'data = open("/etc/passwd").read()\n'
     )
     assert extract_params(s) == {"a_mm": 7.0}
+
+
+# ── set_params ────────────────────────────────────────────────────────────────
+
+SCRIPT = (
+    "import cadquery as cq\n"
+    "\n"
+    "PARAMS = {\n"
+    "    # ears  \n"
+    '    "ear_length_mm": 16,   # tall\n'
+    '    "head_radius_mm": 16.0,\n'
+    '    "tip_r_mm" : 0.7 ,\n'
+    "}\n"
+    "\n"
+    'head = cq.Workplane("XY").sphere(PARAMS["head_radius_mm"])  \n'
+    'ear = PARAMS["ear_length_mm"] * 1  # 16 stays 16 here\n'
+    "result = head\n"
+)
+
+
+def _raises(fn, *a):
+    try:
+        fn(*a)
+    except ParamError as e:
+        return str(e)
+    raise AssertionError(f"expected ParamError for {a[1:]!r}")
+
+
+def test_set_single_value_byte_preserving():
+    new = set_params(SCRIPT, {"ear_length_mm": 20})
+    assert new == SCRIPT.replace('"ear_length_mm": 16,', '"ear_length_mm": 20,', 1), new
+    assert extract_params(new)["ear_length_mm"] == 20.0
+
+
+def test_set_multiple_values():
+    new = set_params(SCRIPT, {"head_radius_mm": 18.5, "tip_r_mm": 1})
+    expected = SCRIPT.replace('"head_radius_mm": 16.0,', '"head_radius_mm": 18.5,').replace(
+        '"tip_r_mm" : 0.7 ,', '"tip_r_mm" : 1 ,'
+    )
+    assert new == expected, new
+
+
+def test_set_formatting():
+    s = 'PARAMS = {"a_mm": 1}\n'
+    assert set_params(s, {"a_mm": 2.5}) == 'PARAMS = {"a_mm": 2.5}\n'
+    assert set_params(s, {"a_mm": 12.0}) == 'PARAMS = {"a_mm": 12}\n'
+    assert set_params(s, {"a_mm": 0.1 + 0.2}) == 'PARAMS = {"a_mm": 0.3}\n'
+
+
+def test_set_non_ascii_before_value():
+    s = 'PARAMS = {"größe_mm": 5, "b_mm": 3}  # größe\nx = "ü"\n'
+    new = set_params(s, {"b_mm": 9})
+    assert new == 'PARAMS = {"größe_mm": 5, "b_mm": 9}  # größe\nx = "ü"\n', new
+    new2 = set_params(s, {"größe_mm": 7})
+    assert new2 == s.replace('"größe_mm": 5', '"größe_mm": 7'), new2
+
+
+def test_set_crlf_line_endings():
+    s = 'import math\r\nPARAMS = {\r\n    "a_mm": 1,\r\n    "b_mm": 2,\r\n}\r\n'
+    assert set_params(s, {"b_mm": 30}) == s.replace('"b_mm": 2', '"b_mm": 30')
+
+
+def test_set_replaces_negative_literal():
+    assert set_params('PARAMS = {"o_mm": -3}\n', {"o_mm": 4}) == 'PARAMS = {"o_mm": 4}\n'
+
+
+def test_set_empty_updates_is_identity():
+    assert set_params(SCRIPT, {}) == SCRIPT
+
+
+def test_set_duplicate_keys_all_rewritten():
+    s = 'PARAMS = {"a_mm": 1, "a_mm": 2}\n'
+    assert set_params(s, {"a_mm": 5}) == 'PARAMS = {"a_mm": 5, "a_mm": 5}\n'
+
+
+def test_set_errors():
+    _raises(set_params, SCRIPT, {"nope_mm": 3})
+    _raises(set_params, "result = 1\n", {"a_mm": 3})
+    _raises(set_params, 'x = 1\nPARAMS = {"a_mm": x}\n', {"a_mm": 3})
+    _raises(set_params, "PARAMS = {\n", {"a_mm": 3})
+    for bad in (0, -1, float("nan"), float("inf"), True, "5", None):
+        _raises(set_params, SCRIPT, {"ear_length_mm": bad})
+
+
+def test_set_error_is_atomic_and_speakable():
+    msg = _raises(set_params, SCRIPT, {"ear_length_mm": 20, "ear_width_mm": 3})
+    assert "ear width" in msg, msg
+    for bad in ("ParamError", "/", "_mm", "`", "*"):
+        assert bad not in msg, (bad, msg)
+    msg2 = _raises(set_params, "result = 1\n", {"a_mm": 3})
+    assert "_" not in msg2 and "PARAMS" not in msg2, msg2
 
 
 # ── runner ────────────────────────────────────────────────────────────────────
