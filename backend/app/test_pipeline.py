@@ -1470,6 +1470,13 @@ def run_all_tests():
             total_pass += p
             total_fail += f
 
+        # === WS-E: CAD params wiring ===
+        print("\n--- CAD Params Tests ---")
+        for test in WS_E_TESTS:
+            p, f = loop.run_until_complete(test())
+            total_pass += p
+            total_fail += f
+
         p, f = loop.run_until_complete(test_absolute_size_sets_longest_edge())
         total_pass += p
         total_fail += f
@@ -1597,6 +1604,166 @@ WS_A_TESTS = [
     test_photo_build_records_project,
     test_undo_redo_restores_session,
     test_save_client_version,
+]
+
+
+# ============================================================================
+# WS-E: CAD params wiring
+# ============================================================================
+
+_PARAM_SCRIPT = (
+    'import cadquery as cq\n'
+    'PARAMS = {"width_mm": 10, "height_mm": 5}\n'
+    'result = cq.Workplane("XY").box(PARAMS["width_mm"], PARAMS["height_mm"], 2)\n'
+)
+
+
+def _fake_sandbox_exec(model_id="param_built_1"):
+    """Stand-in for cad.sandbox.execute_cadquery_script: writes a fake GLB."""
+
+    def run(script, output_dir, timeout=45.0, color="#C0C0C0", flatten_color=True):
+        (Path(output_dir) / f"{model_id}.glb").write_bytes(b"glTF" + bytes(20))
+        return {"ok": True, "model_id": model_id, "exec_ms": 1.0}
+
+    return run
+
+
+async def test_generate_records_and_returns_cad_params():
+    """A CAD build with PARAMS records them on the version and echoes them back."""
+    print("\n=== Test: generate records and returns cad_params ===")
+    import shutil
+    from app import projects
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_e")
+        r = await _run_cad(
+            Intent(action="generate", script=_PARAM_SCRIPT, reply="A box."),
+            session, settings, "build me a box",
+        )
+        want = {"width_mm": 10.0, "height_mm": 5.0}
+        if r.cad_params != want:
+            errors.append(f"response cad_params {r.cad_params}")
+        v1 = projects.get_version(settings, session.project_id, 1)
+        if not v1 or v1.params != want:
+            errors.append(f"v1.params {v1.params if v1 else None}")
+
+        no_params = await _run_cad(
+            Intent(action="generate", script="import cadquery as cq\nresult = cq.Workplane('XY').box(1,1,1)\n", reply="Plain."),
+            session, settings, "build a plain box",
+        )
+        if no_params.cad_params != {}:
+            errors.append(f"script without PARAMS should give {{}}: {no_params.cad_params}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("generate records and returns cad_params", errors)
+
+
+async def test_param_update_rebuilds_and_versions():
+    """A drag-release param update reruns the sandbox and appends a param_edit version."""
+    print("\n=== Test: param update rebuilds and records a version ===")
+    import shutil
+    from app import projects
+    from app.pipeline import apply_param_update
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_e")
+        await _run_cad(
+            Intent(action="generate", script=_PARAM_SCRIPT, reply="A box."),
+            session, settings, "build me a box",
+        )
+        pid = session.project_id
+
+        with patch("app.pipeline.execute_cadquery_script", side_effect=_fake_sandbox_exec()), \
+             patch("app.pipeline.save_session"):
+            r = await apply_param_update(session, settings, pid, {"width_mm": 20})
+
+        if not r.ok or not r.rebuilt or r.action != "param_edit":
+            errors.append(f"response ok={r.ok} rebuilt={r.rebuilt} action={r.action}")
+        if r.model_id != f"{pid}-v2" or r.glb_url != f"/media/projects/{pid}/v2.glb":
+            errors.append(f"ids {r.model_id} {r.glb_url}")
+        want = {"width_mm": 20.0, "height_mm": 5.0}
+        if r.cad_params != want:
+            errors.append(f"cad_params {r.cad_params}")
+        v2 = projects.get_version(settings, pid, 2)
+        if not v2 or v2.op != "param_edit" or v2.params != want:
+            errors.append(f"v2 meta {v2}")
+        if not v2 or '"width_mm": 20' not in (v2.script or ""):
+            errors.append(f"v2.script not rewritten: {v2.script if v2 else None}")
+        if session.version != 2 or session.last_script != (v2.script if v2 else None):
+            errors.append("session not moved to the new version")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("param update rebuilds and records a version", errors)
+
+
+async def test_param_update_bad_value_clarifies_and_leaves_model():
+    """An unknown dimension or a non-positive value comes back as a clarify, unchanged."""
+    print("\n=== Test: param update bad value clarifies ===")
+    import shutil
+    from app import projects
+    from app.pipeline import apply_param_update
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_e")
+        await _run_cad(
+            Intent(action="generate", script=_PARAM_SCRIPT, reply="A box."),
+            session, settings, "build me a box",
+        )
+        pid = session.project_id
+
+        with patch("app.pipeline.save_session"):
+            unknown = await apply_param_update(session, settings, pid, {"depth_mm": 4})
+            if unknown.ok or unknown.action != "clarify" or "no dimension called" not in unknown.reply:
+                errors.append(f"unknown dimension: ok={unknown.ok} action={unknown.action} reply={unknown.reply!r}")
+
+            negative = await apply_param_update(session, settings, pid, {"width_mm": -5})
+            if negative.ok or negative.action != "clarify" or "positive number" not in negative.reply:
+                errors.append(f"negative value: ok={negative.ok} reply={negative.reply!r}")
+
+            if projects.current_version(settings, pid).version != 1:
+                errors.append("a rejected update must not create a new version")
+
+            missing = await apply_param_update(session, settings, "nope", {"width_mm": 5})
+            if missing.ok or missing.action != "clarify":
+                errors.append(f"unknown project: ok={missing.ok} action={missing.action}")
+
+            no_script_session = SessionState(session_id="ws_e_mesh")
+            mesh_r = await _execute_mesh_stub(no_script_session, settings)
+            mesh_pid = no_script_session.project_id
+            if mesh_pid:
+                mesh_reply = await apply_param_update(no_script_session, settings, mesh_pid, {"a_mm": 1})
+                if mesh_reply.ok or mesh_reply.action != "clarify":
+                    errors.append(f"mesh project should clarify: {mesh_reply.action}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("param update bad value clarifies", errors)
+
+
+async def _execute_mesh_stub(session, settings):
+    """Records a mesh version directly (skips the real mesh generator)."""
+    from app.pipeline import _record_version
+
+    model_id = "mesh_built_1"
+    (settings.glb_dir / f"{model_id}.glb").write_bytes(b"glTF" + bytes(20))
+    session.last_backend = "mesh"
+    session.last_script = None
+    session.last_mesh_prompt = "a duck"
+    session.model_id = model_id
+    session.glb_url = f"/media/glb/{model_id}.glb"
+    _record_version(session, settings, model_id, "generate", new_object=True)
+    return session
+
+
+WS_E_TESTS = [
+    test_generate_records_and_returns_cad_params,
+    test_param_update_rebuilds_and_versions,
+    test_param_update_bad_value_clarifies_and_leaves_model,
 ]
 
 

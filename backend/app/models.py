@@ -55,6 +55,12 @@ class HistoryRequest(BaseModel):
     session_id: str = "default"
 
 
+class ParamUpdateRequest(BaseModel):
+    """Body of POST /api/projects/{project_id}/params: a dimension panel drag release."""
+    updates: dict[str, float]
+    session_id: str = "default"
+
+
 class VersionInfo(BaseModel):
     """One saved state of a project. Stored in storage/projects/<id>/info.json."""
     project_id: str
@@ -116,3 +122,6 @@ class CommandResponse(BaseModel):
     candidates: list[dict[str, Any]] = Field(default_factory=list)
     # Set when the work runs detached; poll /api/jobs/{job_id} for the result.
     job_id: str | None = None
+    # The session's current CAD version's named dimensions (empty for mesh, or
+    # a CAD script with no PARAMS). Drives the client's dimension panel.
+    cad_params: dict[str, float] = Field(default_factory=dict)

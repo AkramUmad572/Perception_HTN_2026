@@ -13,6 +13,9 @@ from app.config import Settings
 from app.models import CommandResponse, Intent, SessionState, VersionInfo
 from app.session import save_session
 from cad import DEFAULTS
+from cad.params import ParamError
+from cad.params import extract_params as extract_cad_params
+from cad.params import set_params as set_cad_params
 from cad.sandbox import execute_cadquery_script
 from cad.builder import merge_params, build_model
 from mesh.factory import (
@@ -93,6 +96,13 @@ def _versioned_model_id(info: VersionInfo) -> str:
     return f"{info.project_id}-v{info.version}"
 
 
+def _cad_params(session: SessionState) -> dict[str, float]:
+    """The session's current CAD script's named dimensions, for CommandResponse.cad_params."""
+    if session.last_backend != "cad" or not session.last_script:
+        return {}
+    return extract_cad_params(session.last_script)
+
+
 def _record_version(
     session: SessionState,
     settings: Settings,
@@ -120,6 +130,7 @@ def _record_version(
             "op": op,
             "summary": session.last_summary,
             "script": session.last_script if kind == "cad" else None,
+            "params": extract_cad_params(session.last_script) if kind == "cad" and session.last_script else {},
             "mesh_prompt": session.last_mesh_prompt if kind == "mesh" else None,
             "color": session.color,
             "base_size_m": session.base_size_m,
@@ -687,6 +698,7 @@ async def apply_intent(
         backend=response_backend,
         display_size_m=_display_size_m(session),
         candidates=candidates if action == "find_photos" else [],
+        cad_params=_cad_params(session),
     )
 
 
@@ -776,6 +788,106 @@ async def save_client_version(
         backend=info.kind,
         textured=info.kind == "mesh",
         display_size_m=_display_size_m(session),
+        cad_params=_cad_params(session),
+    )
+
+
+_NO_PARAMS_REPLY = "This model has no named dimensions I can change."
+
+
+async def apply_param_update(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    updates: dict[str, float],
+) -> CommandResponse:
+    """
+    Drag-release from the client's dimension panel: rewrite named PARAMS in the
+    project's current CAD script and rerun the sandbox. No LLM involved.
+
+    Returns rebuilt=True with a fresh model_id/glb_url on success, same
+    contract as any other rebuild. A ParamError (unknown dimension, or a value
+    that isn't a positive number) comes back as a clarify with its message —
+    the model is left untouched.
+    """
+    current = projects.current_version(settings, project_id)
+    if current is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+    if current.kind != "cad" or not current.script:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_PARAMS_REPLY,
+            action="clarify",
+            session=session,
+            error="Not a CAD project, or it has no stored script",
+        )
+
+    try:
+        new_script = set_cad_params(current.script, updates)
+    except ParamError as err:
+        return CommandResponse(
+            ok=False,
+            reply=str(err),
+            action="clarify",
+            session=session,
+            error=str(err),
+        )
+
+    latency: dict[str, float] = {}
+    color = current.color or session.color or "#C0C0C0"
+    t0 = time.perf_counter()
+    result = execute_cadquery_script(
+        script=new_script,
+        output_dir=settings.glb_dir,
+        timeout=45.0,
+        color=color,
+        flatten_color=True,
+    )
+    latency["cad_ms"] = result.get("exec_ms", (time.perf_counter() - t0) * 1000)
+    if not result.get("ok"):
+        return CommandResponse(
+            ok=False,
+            reply="That change didn't build. Try a different value.",
+            action="clarify",
+            session=session,
+            error=result.get("error", "sandbox execution failed"),
+            latency_ms=latency,
+        )
+
+    model_id = result["model_id"]
+    src = Path(settings.glb_dir) / f"{model_id}.glb"
+    new_params = extract_cad_params(new_script)
+    info = projects.append_version(
+        settings,
+        project_id,
+        src,
+        op="param_edit",
+        script=new_script,
+        params=new_params,
+        color=color,
+        base_size_m=_cad_size_m(settings, model_id),
+    )
+    restore_version(session, info)
+    return CommandResponse(
+        ok=True,
+        reply="Updated.",
+        action="param_edit",
+        rebuilt=True,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=session.model_id,
+        session=session,
+        latency_ms=latency,
+        backend="cad",
+        textured=False,
+        display_size_m=_display_size_m(session),
+        cad_params=new_params,
     )
 
 
@@ -1084,6 +1196,7 @@ async def execute_script_direct(
             latency_ms=latency,
             textured=False,
             backend="cad",
+            cad_params=_cad_params(session),
         )
     else:
         return CommandResponse(

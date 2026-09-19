@@ -27,6 +27,14 @@ import {
 } from "./interaction/twoHand.js";
 import { createDimensionsLabel } from "./interaction/dimensionsLabel.js";
 import { createTapeMeasure } from "./interaction/tapeMeasure.js";
+import { makeTextSprite } from "./interaction/textSprite.js";
+import {
+  paramsForPart,
+  paramRows,
+  pickRow,
+  dragParamValue,
+  paramPanelLines,
+} from "./interaction/paramPanel.js";
 
 // Desktop XR emulation is injected by @iwsdk/vite-plugin-dev (localhost only).
 // Quest / LAN IP keep native WebXR — do not manually install IWER here.
@@ -402,6 +410,17 @@ let navScale = 1;
 const dimsLabel = createDimensionsLabel();
 scene.add(dimsLabel.object3d);
 
+// CAD PARAMS dimension panel: the pointed part's named dimensions, pinch-drag
+// a row to change it (left-hand pinch = fine mode), POST on release.
+let cadParams = {};
+let currentProjectId = null;
+let activeParamRows = [];
+let paramDrag = null; // { anchor, key, rowIndex, name, baseValueMm, startY, liveValue }
+const paramPanel = makeTextSprite({ widthM: 0.16, aspect: 0.5 });
+paramPanel.sprite.visible = false;
+scene.add(paramPanel.sprite);
+const paramRaycaster = new THREE.Raycaster();
+
 function realScale() {
   return currentModel ? realScaleFor(lastBackend, currentModel.scale.x) : 1;
 }
@@ -430,6 +449,8 @@ function applyDisplaySize(obj, displaySizeM) {
 }
 
 async function setModelFromResponse(data) {
+  cadParams = data.cad_params || {};
+  if (data.session?.project_id) currentProjectId = data.session.project_id;
   if (data.action === "find_photos") {
     return;
   }
@@ -702,6 +723,7 @@ function pollHand(handEntry, key) {
     if (wasPinching[key]) {
       if (key === 0) percy.endTalk();
       if (grabHandKey === key) endGrab();
+      endParamDrag(key);
     }
     wasPinching[key] = false;
     pinchStartTime[key] = 0;
@@ -747,16 +769,22 @@ function pollHand(handEntry, key) {
     if (key === 0) percy.beginTalk();
   }
 
-  if (key === 1 && isPinching && wasPinching[key] && !grabbing && !twoHandOn) {
+  if (key === 1 && isPinching && wasPinching[key] && !grabbing && !twoHandOn && !paramDrag) {
     const duration = now - pinchStartTime[key];
     if (duration >= PINCH_MIN_DURATION_MS && nearModel(pos, GRAB_RANGE)) {
-      beginGrab(handEntry.pinchAnchor, key);
+      if (activeParamRows.length) {
+        const localY = pos.y - paramPanel.sprite.position.y;
+        beginParamDrag(handEntry, key, pickRow(activeParamRows, localY));
+      } else {
+        beginGrab(handEntry.pinchAnchor, key);
+      }
     }
   }
 
   if (wasOpen && wasPinching[key]) {
     if (key === 0) percy.endTalk();
     if (grabHandKey === key) endGrab();
+    endParamDrag(key);
   }
 
   wasPinching[key] = isPinching;
@@ -811,6 +839,77 @@ function tapeHit(origin, dir) {
   if (!currentModel) return null;
   tapeRaycaster.set(origin, dir.clone().normalize());
   return tapeRaycaster.intersectObject(currentModel, true)[0]?.point || null;
+}
+
+/** Right hand's target ray hitting the model: the point and its named part, if any. */
+function pointedPartHit() {
+  if (!currentModel || lastBackend !== "cad") return null;
+  const c = right.controller;
+  c.updateMatrixWorld(true);
+  _rayDir.set(0, 0, -1).transformDirection(c.matrixWorld);
+  paramRaycaster.set(new THREE.Vector3().setFromMatrixPosition(c.matrixWorld), _rayDir.clone().normalize());
+  const hit = paramRaycaster.intersectObject(currentModel, true)[0];
+  if (!hit) return null;
+  let node = hit.object;
+  while (node && !node.name && node.parent) node = node.parent;
+  return { point: hit.point, part: node?.name || "" };
+}
+
+/** Show the pointed part's dimensions (or all of them if the part has none of its own). */
+function updateParamPanel() {
+  if (paramDrag) return; // the live label during a drag stays as-is
+  const hit = !grabbing && !twoHandOn && !tapeMode && !photoPicker.isOpen ? pointedPartHit() : null;
+  if (!hit) {
+    paramPanel.sprite.visible = false;
+    activeParamRows = [];
+    return;
+  }
+  const specific = paramsForPart(cadParams, hit.part);
+  const rows = paramRows(Object.keys(specific).length ? specific : cadParams);
+  activeParamRows = rows;
+  if (!rows.length) {
+    paramPanel.sprite.visible = false;
+    return;
+  }
+  paramPanel.setText(paramPanelLines(rows));
+  paramPanel.sprite.position.copy(hit.point);
+  paramPanel.sprite.position.y += 0.05;
+  paramPanel.sprite.visible = true;
+}
+
+function beginParamDrag(handEntry, key, rowIndex) {
+  const row = activeParamRows[rowIndex];
+  if (!row) return;
+  paramDrag = {
+    anchor: handEntry.pinchAnchor,
+    key,
+    rowIndex,
+    name: row.name,
+    baseValueMm: row.value,
+    startY: handEntry.pinchAnchor.position.y,
+    liveValue: row.value,
+  };
+  halo.material.opacity = 0.9;
+  halo.material.color.setHex(0xffd54f);
+}
+
+function updateParamDrag() {
+  if (!paramDrag) return;
+  const deltaM = paramDrag.anchor.position.y - paramDrag.startY;
+  const value = dragParamValue(paramDrag.baseValueMm, deltaM, held[0]);
+  paramDrag.liveValue = value;
+  const rows = activeParamRows.map((r, i) => (i === paramDrag.rowIndex ? { ...r, value } : r));
+  paramPanel.setText(paramPanelLines(rows, paramDrag.rowIndex));
+}
+
+function endParamDrag(key) {
+  if (!paramDrag || paramDrag.key !== key) return;
+  const { name, liveValue, baseValueMm } = paramDrag;
+  paramDrag = null;
+  halo.material.color.setHex(0x4f8cff);
+  if (currentProjectId && liveValue !== baseValueMm) {
+    percy.postParamUpdate(currentProjectId, { [name]: liveValue });
+  }
 }
 
 /** Controller target ray first; for a pinch touching the model, aim at its centre. */
@@ -935,6 +1034,8 @@ renderer.setAnimationLoop(() => {
   pollHand(right, 1);
   updateTwoHand();
   if (!twoHandOn) updateGrab();
+  updateParamPanel();
+  updateParamDrag();
   dimsLabel.follow(currentModel, camera);
   tape.update();
   const nowTick = performance.now();
