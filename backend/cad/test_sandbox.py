@@ -278,6 +278,79 @@ result = assy
     return passed, failed
 
 
+def _gltf_json(glb_path):
+    """The JSON chunk of a binary glTF (12-byte header, then chunk length + type)."""
+    import json
+    import struct
+
+    data = Path(glb_path).read_bytes()
+    (length,) = struct.unpack("<I", data[12:16])
+    return json.loads(data[20:20 + length])
+
+
+def test_assembly_glb_node_names():
+    """Each assy.add(name=...) must reach the GLB as a mesh node of that exact name.
+
+    The client raycasts a node, reads its name, and maps it to the part's PARAMS
+    (cad/params.py:params_for_part). Checked on both colour paths, because
+    flatten_color=True re-exports through _paint_glb.
+    """
+    import tempfile
+
+    import numpy as np
+    import trimesh
+
+    script = '''
+import cadquery as cq
+PARAMS = {"base_width_mm": 20, "peg_radius_mm": 3}
+base = cq.Workplane("XY").box(PARAMS["base_width_mm"], 10, 4)
+peg = (cq.Workplane("XY").transformed(offset=(0, 0, 2))
+       .circle(PARAMS["peg_radius_mm"]).extrude(6))
+assy = cq.Assembly()
+assy.add(base, name="base", color=cq.Color("#E53935"))
+assy.add(peg, name="peg", color=cq.Color("#1E88E5"))
+result = assy
+'''
+    passed = 0
+    failed = 0
+    out = Path(tempfile.mkdtemp())
+
+    for flatten in (False, True):
+        label = f"flatten_color={flatten}"
+        res = execute_cadquery_script(script, output_dir=out, flatten_color=flatten)
+        if not res.get("ok"):
+            print(f"  [FAIL] {label}: export failed: {res}")
+            failed += 1
+            continue
+        gltf = _gltf_json(res["glb_path"])
+        names = sorted(n.get("name") for n in gltf.get("nodes", []) if "mesh" in n)
+        if names == ["base", "peg"]:
+            print(f"  [ok] {label}: GLB mesh nodes named {names}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {label}: expected mesh nodes ['base', 'peg'], got {names}")
+            failed += 1
+
+        scene = trimesh.load(res["glb_path"])
+        extent = float(np.max(scene.extents))
+        watertight = all(g.is_watertight for g in scene.geometry.values())
+        colours = {
+            tuple(int(x) for x in np.asarray(g.visual.vertex_colors)[0][:3])
+            for g in scene.geometry.values()
+        }
+        want_colours = 1 if flatten else 2
+        if extent < 0.1 and watertight and len(colours) == want_colours:
+            print(f"  [ok] {label}: metres ({extent:.3f}), watertight, {len(colours)} colour(s)")
+            passed += 1
+        else:
+            print(
+                f"  [FAIL] {label}: extent={extent} watertight={watertight} colours={colours}"
+            )
+            failed += 1
+
+    return passed, failed
+
+
 def run_all_tests():
     """Run all sandbox tests."""
     print("=" * 60)
@@ -289,9 +362,10 @@ def run_all_tests():
     b_pass, b_fail = test_builtin_blocked()
     h_pass, h_fail = test_hex_to_rgb()
     a_pass, a_fail = test_assembly_part_colors()
-    
-    total_pass = v_pass + s_pass + b_pass + h_pass + a_pass
-    total_fail = v_fail + s_fail + b_fail + h_fail + a_fail
+    n_pass, n_fail = test_assembly_glb_node_names()
+
+    total_pass = v_pass + s_pass + b_pass + h_pass + a_pass + n_pass
+    total_fail = v_fail + s_fail + b_fail + h_fail + a_fail + n_fail
     
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -301,6 +375,7 @@ def run_all_tests():
     print(f"Builtin blocking:  {b_pass}/{b_pass + b_fail} passed")
     print(f"Hex color bake:    {h_pass}/{h_pass + h_fail} passed")
     print(f"Assembly colors:   {a_pass}/{a_pass + a_fail} passed")
+    print(f"GLB part names:    {n_pass}/{n_pass + n_fail} passed")
     print(f"TOTAL:             {total_pass}/{total_pass + total_fail} passed")
     
     if total_fail > 0:

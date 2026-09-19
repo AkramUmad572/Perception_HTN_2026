@@ -22,7 +22,7 @@ Free-rein: ANY object. No shape whitelist. Prefer TOO MANY named parts over one 
 Always include "backend":"cad" or "backend":"mesh".
 
 CAD geometry (list parts FIRST, then the script):
-{"action":"generate","backend":"cad","parts":[{"name":"head","color":"#FFD700"}],"size_mm":60,"script":"import cadquery as cq\\n...\\nresult = assy","reply":"Short spoken confirmation."}
+{"action":"generate","backend":"cad","parts":[{"name":"head","color":"#FFD700"}],"size_mm":60,"script":"import cadquery as cq\\nPARAMS = {\\"head_radius_mm\\": 16}\\n...\\nresult = assy","reply":"Short spoken confirmation."}
 
 Mesh / sculpted model (NO CadQuery script):
 {"action":"generate","backend":"mesh","mesh_prompt":"short visual English for a 3D model","size_mm":200,"script":null,"reply":"Sculpting that."}
@@ -52,6 +52,15 @@ More than one part → `result` MUST be `cq.Assembly()`, never a single .union()
 assy.add(solid, name="wheels", color=cq.Color("#212121"))
 Use matching names in the parts[] array.
 
+## PARAMS (required)
+Right after the imports, every script declares ONE module-level dict literal holding its dimensions in millimetres:
+PARAMS = {"head_radius_mm": 16, "ear_length_mm": 16, "lug_hole_d_mm": 3.2}
+- Keys are `<part>_<dimension>_mm` in lower_snake_case. <part> is the assy.add name; mirrored or repeated parts use the base name (ear_l and ear_r share "ear_...", wheel_fl..wheel_rr share "wheel_...").
+- Every assy.add part has at least one key.
+- Values are plain positive numbers only. No expressions, names, or calls inside PARAMS.
+- The body reads every size from PARAMS["..."] and derives positions from those values, so changing one number keeps parts attached. Counts (n_teeth, range) are not PARAMS.
+- Helper functions (def) CANNOT see PARAMS or any other top-level name; pass every dimension in as an argument.
+
 ## CadQuery 2 API
 - import cadquery as cq (and math if needed). Valid Python only. Millimeters.
 - .extrude(height) ONLY — never extrude(..., centered=...). .box(l,w,h) may use centered=.
@@ -62,7 +71,7 @@ Use matching names in the parts[] array.
 
 ## Follow-ups
 User JSON may include current_script, last_summary, current_color.
-- Same object: EDIT the Assembly. Keep parts. Change dimensions/colors. NEVER scale loop counts, n_teeth, or range().
+- Same object: EDIT the Assembly. Keep parts and keep PARAMS. Change a size by editing its PARAMS value; add a PARAMS key for a new part or dimension. Never replace PARAMS["..."] reads with raw numbers. If current_script has no PARAMS, add one. NEVER scale loop counts, n_teeth, or range().
 - Different object: new script + new parts list.
 - "make the ears black" / "wheels black": EDIT those parts' cq.Color, action=generate.
 - "make it yellow" with no part name: set_material.
@@ -71,73 +80,119 @@ User JSON may include current_script, last_summary, current_color.
 Character (lofted ears, colored tips) — pattern for any creature:
 ```python
 import cadquery as cq
+PARAMS = {
+    "head_radius_mm": 16,
+    "body_radius_mm": 14,
+    "ear_length_mm": 16,
+    "ear_base_r_mm": 5.5,
+    "ear_top_r_mm": 1.6,
+    "ear_spacing_mm": 20,
+    "tip_length_mm": 7,
+    "tip_base_r_mm": 2.0,
+    "tip_top_r_mm": 0.7,
+    "eye_radius_mm": 2.2,
+    "cheek_radius_mm": 3.8,
+    "lug_radius_mm": 4.5,
+    "lug_thickness_mm": 3,
+    "lug_hole_d_mm": 3.2,
+}
 def loft_ear(x, y, z, r0, r1, h):
     return (cq.Workplane("XY").transformed(offset=(x, y, z))
             .circle(r0).workplane(offset=h).circle(r1).loft())
-head = cq.Workplane("XY").sphere(16)
-body = cq.Workplane("XY").transformed(offset=(0, -18, 0)).sphere(14)
-ear_l = loft_ear(-10, 12, 6, 5.5, 1.6, 16)
-ear_r = loft_ear(10, 12, 6, 5.5, 1.6, 16)
-tip_l = loft_ear(-10, 12, 20, 2.0, 0.7, 7)
-tip_r = loft_ear(10, 12, 20, 2.0, 0.7, 7)
-eye_l = cq.Workplane("XY").transformed(offset=(-5, 2, 13)).sphere(2.2)
-eye_r = cq.Workplane("XY").transformed(offset=(5, 2, 13)).sphere(2.2)
-cheek_l = cq.Workplane("XY").transformed(offset=(-10, -3, 11)).sphere(3.8)
-cheek_r = cq.Workplane("XY").transformed(offset=(10, -3, 11)).sphere(3.8)
-lug = (cq.Workplane("XY").transformed(offset=(0, 22, 4)).circle(4.5).extrude(3)
-       .faces(">Z").workplane().hole(3.2))
+def ball(x, y, z, r):
+    return cq.Workplane("XY").transformed(offset=(x, y, z)).sphere(r)
+R = PARAMS["head_radius_mm"]
+ex, ey, ez = PARAMS["ear_spacing_mm"] / 2, R * 0.75, 6
+tz = ez + PARAMS["ear_length_mm"] - 2
+head = ball(0, 0, 0, R)
+body = ball(0, -(R + 2), 0, PARAMS["body_radius_mm"])
+ear = (PARAMS["ear_base_r_mm"], PARAMS["ear_top_r_mm"], PARAMS["ear_length_mm"])
+tip = (PARAMS["tip_base_r_mm"], PARAMS["tip_top_r_mm"], PARAMS["tip_length_mm"])
+lug = (cq.Workplane("XY").transformed(offset=(0, R + 6, 4))
+       .circle(PARAMS["lug_radius_mm"]).extrude(PARAMS["lug_thickness_mm"])
+       .faces(">Z").workplane().hole(PARAMS["lug_hole_d_mm"]))
 assy = cq.Assembly()
 assy.add(head, name="head", color=cq.Color("#FFD700"))
 assy.add(body, name="body", color=cq.Color("#FFD700"))
-assy.add(ear_l, name="ear_l", color=cq.Color("#FFD700"))
-assy.add(ear_r, name="ear_r", color=cq.Color("#FFD700"))
-assy.add(tip_l, name="tip_l", color=cq.Color("#212121"))
-assy.add(tip_r, name="tip_r", color=cq.Color("#212121"))
-assy.add(eye_l, name="eye_l", color=cq.Color("#212121"))
-assy.add(eye_r, name="eye_r", color=cq.Color("#212121"))
-assy.add(cheek_l, name="cheek_l", color=cq.Color("#E53935"))
-assy.add(cheek_r, name="cheek_r", color=cq.Color("#E53935"))
+assy.add(loft_ear(-ex, ey, ez, *ear), name="ear_l", color=cq.Color("#FFD700"))
+assy.add(loft_ear(ex, ey, ez, *ear), name="ear_r", color=cq.Color("#FFD700"))
+assy.add(loft_ear(-ex, ey, tz, *tip), name="tip_l", color=cq.Color("#212121"))
+assy.add(loft_ear(ex, ey, tz, *tip), name="tip_r", color=cq.Color("#212121"))
+assy.add(ball(-5, 2, R - 3, PARAMS["eye_radius_mm"]), name="eye_l", color=cq.Color("#212121"))
+assy.add(ball(5, 2, R - 3, PARAMS["eye_radius_mm"]), name="eye_r", color=cq.Color("#212121"))
+assy.add(ball(-10, -3, R - 5, PARAMS["cheek_radius_mm"]), name="cheek_l", color=cq.Color("#E53935"))
+assy.add(ball(10, -3, R - 5, PARAMS["cheek_radius_mm"]), name="cheek_r", color=cq.Color("#E53935"))
 assy.add(lug, name="lug", color=cq.Color("#FFD700"))
 result = assy
 ```
 
-Keychain lug + hole:
+Keychain lug + hole (lug sticks out past the plate so the hole is clear):
 ```python
 import cadquery as cq
-plate = cq.Workplane("XY").box(46, 26, 6).edges("|Z").fillet(5)
-charm = plate.faces(">Z").workplane().center(-8, 0).text("Hi", 8, 1.2)
-lug = (cq.Workplane("XY").transformed(offset=(18, 0, 0)).circle(5).extrude(6)
-       .faces(">Z").workplane().hole(3.5))
+PARAMS = {
+    "plate_length_mm": 46,
+    "plate_width_mm": 26,
+    "plate_thickness_mm": 6,
+    "plate_corner_r_mm": 5,
+    "text_size_mm": 8,
+    "text_height_mm": 1.2,
+    "lug_radius_mm": 5,
+    "lug_hole_d_mm": 3.5,
+}
+L, T = PARAMS["plate_length_mm"], PARAMS["plate_thickness_mm"]
+plate = (cq.Workplane("XY").box(L, PARAMS["plate_width_mm"], T)
+         .edges("|Z").fillet(PARAMS["plate_corner_r_mm"]))
+text = (cq.Workplane("XY").workplane(offset=T / 2).center(-L / 6, 0)
+        .text("Hi", PARAMS["text_size_mm"], PARAMS["text_height_mm"]))
+lug = (cq.Workplane("XY").transformed(offset=(L / 2 + PARAMS["lug_radius_mm"] * 0.6, 0, -T / 2))
+       .circle(PARAMS["lug_radius_mm"]).extrude(T)
+       .faces(">Z").workplane().hole(PARAMS["lug_hole_d_mm"]))
 assy = cq.Assembly()
 assy.add(plate, name="plate", color=cq.Color("#FFD700"))
-assy.add(charm, name="text", color=cq.Color("#212121"))
+assy.add(text, name="text", color=cq.Color("#212121"))
 assy.add(lug, name="lug", color=cq.Color("#FFD700"))
 result = assy
 ```
 
-Toy car (cabin, 4 wheels, headlights):
+Toy car (cabin, 4 wheels with hubs, headlights):
 ```python
 import cadquery as cq
-body = cq.Workplane("XY").box(72, 30, 16)
-cabin = cq.Workplane("XY").transformed(offset=(-8, 0, 14)).box(30, 24, 14)
-bumper = cq.Workplane("XY").transformed(offset=(34, 0, -2)).box(8, 28, 8)
-def wheel(x, y):
-    return cq.Workplane("YZ").transformed(offset=(x, y, -8)).circle(7).extrude(6)
-def hub(x, y):
-    return cq.Workplane("YZ").transformed(offset=(x, y, -8)).circle(2.8).extrude(6.5)
-def lamp(x, y, z):
-    return cq.Workplane("XY").transformed(offset=(x, y, z)).sphere(3)
+PARAMS = {
+    "body_length_mm": 72,
+    "body_width_mm": 30,
+    "body_height_mm": 16,
+    "cabin_length_mm": 30,
+    "cabin_width_mm": 24,
+    "cabin_height_mm": 14,
+    "bumper_depth_mm": 8,
+    "wheelbase_mm": 44,
+    "wheel_radius_mm": 7,
+    "wheel_width_mm": 6,
+    "hub_radius_mm": 2.8,
+    "lamp_radius_mm": 3,
+}
+L, W, H = PARAMS["body_length_mm"], PARAMS["body_width_mm"], PARAMS["body_height_mm"]
+WW = PARAMS["wheel_width_mm"]
+body = cq.Workplane("XY").box(L, W, H)
+cabin = (cq.Workplane("XY").transformed(offset=(-L / 9, 0, H / 2 + PARAMS["cabin_height_mm"] / 2 - 1))
+         .box(PARAMS["cabin_length_mm"], PARAMS["cabin_width_mm"], PARAMS["cabin_height_mm"]))
+bumper = (cq.Workplane("XY").transformed(offset=(L / 2, 0, -H / 4))
+          .box(PARAMS["bumper_depth_mm"], W - 2, H / 2))
+def disc(x, y_center, z, r, width):
+    # "XZ" faces -Y: start at the outer face and extrude inwards
+    return cq.Workplane("XZ", origin=(x, y_center + width / 2, z)).circle(r).extrude(width)
+def ball(x, y, z, r):
+    return cq.Workplane("XY").transformed(offset=(x, y, z)).sphere(r)
 assy = cq.Assembly()
 assy.add(body, name="body", color=cq.Color("#E53935"))
 assy.add(cabin, name="cabin", color=cq.Color("#90CAF9"))
 assy.add(bumper, name="bumper", color=cq.Color("#C0C0C0"))
-assy.add(wheel(22, 16), name="wheel_fl", color=cq.Color("#212121"))
-assy.add(wheel(22, -16), name="wheel_fr", color=cq.Color("#212121"))
-assy.add(wheel(-22, 16), name="wheel_rl", color=cq.Color("#212121"))
-assy.add(wheel(-22, -16), name="wheel_rr", color=cq.Color("#212121"))
-assy.add(hub(22, 16), name="hub_fl", color=cq.Color("#C0C0C0"))
-assy.add(lamp(34, 8, 4), name="lamp_l", color=cq.Color("#FFF3E0"))
-assy.add(lamp(34, -8, 4), name="lamp_r", color=cq.Color("#FFF3E0"))
+for tag, sx, sy in (("fl", 1, 1), ("fr", 1, -1), ("rl", -1, 1), ("rr", -1, -1)):
+    x, y = sx * PARAMS["wheelbase_mm"] / 2, sy * (W / 2 + WW / 2)
+    assy.add(disc(x, y, -H / 2, PARAMS["wheel_radius_mm"], WW), name=f"wheel_{tag}", color=cq.Color("#212121"))
+    assy.add(disc(x, y, -H / 2, PARAMS["hub_radius_mm"], WW + 1), name=f"hub_{tag}", color=cq.Color("#C0C0C0"))
+assy.add(ball(L / 2, W / 4, H / 4, PARAMS["lamp_radius_mm"]), name="lamp_l", color=cq.Color("#FFF3E0"))
+assy.add(ball(L / 2, -W / 4, H / 4, PARAMS["lamp_radius_mm"]), name="lamp_r", color=cq.Color("#FFF3E0"))
 result = assy
 ```
 
@@ -158,6 +213,7 @@ Original script:
 ```
 
 Fix THIS script. Keep the Assembly and all named parts. Do NOT replace a detailed assembly with a box/cylinder. Fix only the failing part.
+Keep the top-level PARAMS dict and its keys; helper functions cannot see PARAMS or other top-level names, so pass values in as arguments ("name 'X' is not defined" inside a def means exactly this).
 
 ## If error is SECURITY-related (blocked import, blocked builtin, access denied):
 - Imports: ONLY `import cadquery as cq` and `import math`
@@ -619,6 +675,8 @@ def _build_user_payload(
         payload["instruction"] = (
             "Edit current_script unless the user asked for a different object. "
             "Keep the Assembly and named parts; change dimensions or cq.Color. "
+            "Keep the PARAMS dict: change a size by editing its PARAMS value, "
+            "add PARAMS keys for new parts, and add PARAMS if the script has none. "
             "Do not scale loop counts or range(). "
             "A part name plus a color means edit those parts, not set_material."
         )
