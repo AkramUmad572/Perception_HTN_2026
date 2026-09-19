@@ -78,6 +78,54 @@ def _display_size_m(session: SessionState) -> float:
     return _clamp(session.base_size_m * session.scale, SIZE_MIN_M, SIZE_MAX_M)
 
 
+_AXIS_INDEX = {"width": 0, "height": 1, "depth": 2}  # GLB is Y-up
+
+
+def _glb_path_from_url(settings: Settings, glb_url: str | None) -> Path | None:
+    """Local file behind a served GLB URL, or None when it cannot be resolved."""
+    if not glb_url:
+        return None
+    path = glb_url.split("?", 1)[0]
+    if path.startswith("/media/glb/"):
+        return Path(settings.glb_dir) / path[len("/media/glb/"):]
+    projects_dir = getattr(settings, "projects_dir", None)
+    if path.startswith("/media/projects/") and isinstance(projects_dir, Path):
+        return projects_dir / path[len("/media/projects/"):]
+    return None
+
+
+def _axis_fraction(glb_path: Path | None, axis: str | None) -> float:
+    """
+    Extent along `axis` as a fraction of the longest extent (1.0 if unknown).
+
+    base_size_m is the longest edge, so "8 cm tall" on a wide model needs this
+    ratio to land the height, not the width, on 8 cm.
+    """
+    idx = _AXIS_INDEX.get(axis or "")
+    if idx is None or glb_path is None:
+        return 1.0
+    try:
+        import trimesh
+
+        lo, hi = trimesh.load(str(glb_path)).bounds
+        extents = hi - lo
+        longest = float(max(extents))
+        part = float(extents[idx])
+    except Exception as exc:
+        logger.info("Could not measure %s for axis %s: %s", glb_path, axis, exc)
+        return 1.0
+    if longest <= 0 or part <= 0:
+        return 1.0
+    return part / longest
+
+
+_CAD_ABSOLUTE_SIZE_REPLY = (
+    "I keep CAD parts at their real size. Ask me to change the dimension "
+    "and I'll rebuild it."
+)
+_SIZE_CLAMPED_REPLY = "That's outside what I can show, so I went as far as I can."
+
+
 async def _execute_with_retry(
     script: str,
     original_text: str,
@@ -301,12 +349,25 @@ async def apply_intent(
             error_msg = "No model to resize. Build something first."
             intent.reply = error_msg
             action = "clarify"
+        elif intent.params.get("target_m") is not None and session.last_backend != "mesh":
+            # CAD is shown life size; a display scale would make its mm lie.
+            intent.reply = _CAD_ABSOLUTE_SIZE_REPLY
+            action = "clarify"
         else:
-            factor = float(intent.params.get("factor") or 1.0)
-            session.scale = _clamp(
-                session.scale * factor, SIZE_MIN_M / session.base_size_m,
-                SIZE_MAX_M / session.base_size_m,
-            )
+            low = SIZE_MIN_M / session.base_size_m
+            high = SIZE_MAX_M / session.base_size_m
+            target_m = intent.params.get("target_m")
+            if target_m is not None:
+                fraction = _axis_fraction(
+                    _glb_path_from_url(settings, session.glb_url),
+                    intent.params.get("axis"),
+                )
+                wanted = float(target_m) / (session.base_size_m * fraction)
+            else:
+                wanted = session.scale * float(intent.params.get("factor") or 1.0)
+            session.scale = _clamp(wanted, low, high)
+            if target_m is not None and abs(session.scale - wanted) > 1e-9:
+                intent.reply = _SIZE_CLAMPED_REPLY
             response_backend = session.last_backend
             save_session(session)
 
