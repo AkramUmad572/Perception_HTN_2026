@@ -159,9 +159,13 @@ def set_params(script: str, updates: dict[str, float]) -> str:
     return data.decode("utf-8")
 
 
-# A mirrored or duplicated part shares its base's dimensions: "ear_l" / "ear_r"
-# use "ear_*", and "wheel_2" (the sandbox's duplicate-name suffix) uses "wheel_*".
-_SIDE_SUFFIX_RE = re.compile(r"_(?:l|r|left|right|\d+)$")
+# A mirrored, repeated or duplicated part shares its base's dimensions:
+# "ear_l"/"ear_r" use "ear_*", "wheel_fl" uses "wheel_*", and "wheel_2" (also the
+# sandbox's duplicate-name suffix) uses "wheel_*". Suffixes strip repeatedly, so
+# "ear_l_2" still reaches "ear_*".
+_SIDE_SUFFIX_RE = re.compile(
+    r"_(?:l|r|left|right|fl|fr|rl|rr|front|rear|back|\d+)$"
+)
 
 
 def params_for_part(params: dict[str, float], part: str) -> dict[str, float]:
@@ -169,7 +173,11 @@ def params_for_part(params: dict[str, float], part: str) -> dict[str, float]:
     if not part:
         return {}
     prefixes = {f"{part}_"}
-    base = _SIDE_SUFFIX_RE.sub("", part)
-    if base and base != part:
+    base = part
+    while True:
+        shorter = _SIDE_SUFFIX_RE.sub("", base)
+        if not shorter or shorter == base:
+            break
+        base = shorter
         prefixes.add(f"{base}_")
     return {k: v for k, v in params.items() if any(k.startswith(p) for p in prefixes)}
