@@ -25,6 +25,17 @@ import {
   NAV_SCALE_MIN,
   NAV_SCALE_MAX,
 } from "./twoHand.js";
+import {
+  paramsForPart,
+  spokenParamName,
+  paramRows,
+  rowOffsetY,
+  pickRow,
+  dragParamValue,
+  paramLabel,
+  paramPanelLines,
+  PARAM_ROW_SPACING,
+} from "./paramPanel.js";
 
 const assert = (condition, message) => {
   if (!condition) throw new Error(`ASSERTION FAILED: ${message}`);
@@ -185,6 +196,84 @@ test("clampNavScale keeps the zoom in range", () => {
   eq(clampNavScale(9, 2), 10);
   eq(clampNavScale(0.2, 0.1), 0.1);
   assert(near(clampNavScale(1, 1.5), 1.5), "in range");
+});
+
+console.log("\n=== paramPanel.js ===");
+
+test("paramsForPart matches a plain prefix", () => {
+  const params = { ear_length_mm: 16, ear_width_mm: 8, head_radius_mm: 20 };
+  eq(JSON.stringify(paramsForPart(params, "ear")), JSON.stringify({ ear_length_mm: 16, ear_width_mm: 8 }));
+});
+
+test("paramsForPart strips a mirrored/repeated side suffix", () => {
+  const params = { ear_length_mm: 16, ear_width_mm: 8, head_radius_mm: 20 };
+  eq(JSON.stringify(paramsForPart(params, "ear_l")), JSON.stringify({ ear_length_mm: 16, ear_width_mm: 8 }));
+  eq(JSON.stringify(paramsForPart(params, "ear_r")), JSON.stringify({ ear_length_mm: 16, ear_width_mm: 8 }));
+
+  const wheel = { wheel_diameter_mm: 40 };
+  eq(JSON.stringify(paramsForPart(wheel, "wheel_fl")), JSON.stringify({ wheel_diameter_mm: 40 }));
+  eq(JSON.stringify(paramsForPart(wheel, "wheel_2")), JSON.stringify({ wheel_diameter_mm: 40 }));
+  // Repeated stripping: "ear_l_2" still reaches "ear_*".
+  eq(JSON.stringify(paramsForPart({ ear_length_mm: 16 }, "ear_l_2")), JSON.stringify({ ear_length_mm: 16 }));
+});
+
+test("paramsForPart is empty for no part or no match", () => {
+  eq(JSON.stringify(paramsForPart({ a_mm: 1 }, "")), "{}");
+  eq(JSON.stringify(paramsForPart({ a_mm: 1 }, "b")), "{}");
+  eq(JSON.stringify(paramsForPart({}, "a")), "{}");
+});
+
+test("spokenParamName drops the trailing unit", () => {
+  eq(spokenParamName("ear_length_mm"), "ear length");
+  eq(spokenParamName("head_radius_deg"), "head radius");
+  eq(spokenParamName("width_mm"), "width");
+  eq(spokenParamName("mm"), "mm");
+  eq(spokenParamName(""), "that");
+});
+
+test("paramRows is sorted for a stable layout", () => {
+  const rows = paramRows({ b_mm: 2, a_mm: 1 });
+  eq(JSON.stringify(rows), JSON.stringify([{ name: "a_mm", value: 1 }, { name: "b_mm", value: 2 }]));
+});
+
+test("rowOffsetY centres the rows, top first", () => {
+  eq(PARAM_ROW_SPACING, 0.035);
+  assert(near(rowOffsetY(0, 1), 0), "single row centred");
+  assert(near(rowOffsetY(0, 2), PARAM_ROW_SPACING / 2), "row 0 is on top");
+  assert(near(rowOffsetY(1, 2), -PARAM_ROW_SPACING / 2), "row 1 is below");
+});
+
+test("pickRow finds the nearest row", () => {
+  const rows = paramRows({ a_mm: 1, b_mm: 2, c_mm: 3 });
+  eq(pickRow(rows, rowOffsetY(0, 3)), 0);
+  eq(pickRow(rows, rowOffsetY(2, 3)), 2);
+  eq(pickRow(rows, 0), 1);
+  eq(pickRow([], 0), -1);
+});
+
+test("dragParamValue moves by hand delta, snapped to 1 mm", () => {
+  eq(dragParamValue(10, 0.005, false), 15);
+  eq(dragParamValue(10, -0.003, false), 7);
+});
+
+test("dragParamValue halves the delta in fine mode", () => {
+  eq(dragParamValue(10, 0.01, true), 11);
+});
+
+test("dragParamValue never drops to zero or below", () => {
+  eq(dragParamValue(2, -0.05, false), 1);
+});
+
+test("paramLabel formats name and value together", () => {
+  eq(paramLabel("ear_length_mm", 16), "ear length: 1.6 cm");
+  eq(paramLabel("head_radius_mm", 4), "head radius: 4.0 mm");
+});
+
+test("paramPanelLines marks the active row", () => {
+  const rows = paramRows({ a_mm: 1, b_mm: 2 });
+  const lines = paramPanelLines(rows, 1);
+  eq(lines[0], "a: 1.0 mm");
+  eq(lines[1], "> b: 2.0 mm");
 });
 
 console.log("\n" + "=".repeat(60));
