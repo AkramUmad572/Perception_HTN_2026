@@ -15,6 +15,15 @@ import {
   labelPosition,
   tapeNextStep,
 } from "./measure.js";
+import {
+  twoHandTransform,
+  midpoint,
+  applyTwoHandToPosition,
+  isTwoHandActive,
+  clampNavScale,
+  NAV_SCALE_MIN,
+  NAV_SCALE_MAX,
+} from "./twoHand.js";
 
 const assert = (condition, message) => {
   if (!condition) throw new Error(`ASSERTION FAILED: ${message}`);
@@ -95,6 +104,80 @@ test("tapeNextStep alternates start / end", () => {
   eq(tapeNextStep({ hasStart: false, hasEnd: false }), "start");
   eq(tapeNextStep({ hasStart: true, hasEnd: false }), "end");
   eq(tapeNextStep({ hasStart: true, hasEnd: true }), "start");
+});
+
+console.log("\n=== twoHand.js ===");
+
+test("still hands produce the identity transform", () => {
+  const t = twoHandTransform(v(-0.1, 0, 0), v(0.1, 0, 0), v(-0.1, 0, 0), v(0.1, 0, 0));
+  assert(near(t.scale, 1) && near(t.yaw, 0) && nearVec(t.translate, v(0, 0, 0)), JSON.stringify(t));
+});
+
+test("spreading the hands scales by the span ratio", () => {
+  const t = twoHandTransform(v(-0.1, 0, 0), v(0.1, 0, 0), v(-0.2, 0, 0), v(0.2, 0, 0));
+  assert(near(t.scale, 2), `scale ${t.scale}`);
+  assert(near(t.yaw, 0), `yaw ${t.yaw}`);
+});
+
+test("moving both hands translates by the midpoint delta", () => {
+  const t = twoHandTransform(v(-0.1, 0, 0), v(0.1, 0, 0), v(0, 0, 0), v(0.2, 0, 0));
+  assert(nearVec(t.translate, v(0.1, 0, 0)), JSON.stringify(t.translate));
+  assert(near(t.scale, 1), `scale ${t.scale}`);
+});
+
+test("twisting about vertical gives yaw (Three.js Y convention)", () => {
+  // Right hand swings from +x to -z: heading pi/2 -> pi, so yaw = +pi/2.
+  const t = twoHandTransform(v(-0.1, 0, 0), v(0.1, 0, 0), v(0, 0, 0.1), v(0, 0, -0.1));
+  assert(near(t.yaw, Math.PI / 2), `yaw ${t.yaw}`);
+  assert(near(t.scale, 1), `scale ${t.scale}`);
+});
+
+test("yaw wraps into (-pi, pi]", () => {
+  // Heading from just under +pi to just over -pi is a tiny turn, not ~2pi.
+  const t = twoHandTransform(v(0, 0, 0), v(0.01, 0, -1), v(0, 0, 0), v(-0.01, 0, -1));
+  assert(Math.abs(t.yaw) < 0.1, `yaw ${t.yaw}`);
+});
+
+test("degenerate previous span keeps scale 1", () => {
+  const t = twoHandTransform(v(0, 0, 0), v(0, 0, 0), v(-0.1, 0, 0), v(0.1, 0, 0));
+  assert(near(t.scale, 1) && near(t.yaw, 0), JSON.stringify(t));
+});
+
+test("a vertical-only span gives no yaw", () => {
+  const t = twoHandTransform(v(0, 0, 0), v(0, 0.2, 0), v(0, 0, 0), v(0, 0.2, 0.00001));
+  assert(near(t.yaw, 0), `yaw ${t.yaw}`);
+});
+
+test("midpoint averages the hands", () => {
+  assert(nearVec(midpoint(v(0, 0, 0), v(0.2, 0.4, -0.2)), v(0.1, 0.2, -0.1)), "mid");
+});
+
+test("applyTwoHandToPosition scales about the hands then translates", () => {
+  const p = applyTwoHandToPosition(v(0.1, 0, 0), v(0, 0, 0), { scale: 2, yaw: 0, translate: v(0, 0.1, 0) });
+  assert(nearVec(p, v(0.2, 0.1, 0)), JSON.stringify(p));
+});
+
+test("applyTwoHandToPosition rotates about world Y", () => {
+  const p = applyTwoHandToPosition(v(0, 0, 0.1), v(0, 0, 0), { scale: 1, yaw: Math.PI / 2, translate: v(0, 0, 0) });
+  assert(nearVec(p, v(0.1, 0, 0)), JSON.stringify(p));
+});
+
+test("two-hand mode needs both hands pinching near the model, tape off", () => {
+  const on = { leftPinching: true, rightPinching: true, leftNear: true, rightNear: true, tapeMode: false };
+  eq(isTwoHandActive(on), true);
+  eq(isTwoHandActive({ ...on, leftPinching: false }), false);
+  eq(isTwoHandActive({ ...on, rightPinching: false }), false);
+  eq(isTwoHandActive({ ...on, leftNear: false }), false);
+  eq(isTwoHandActive({ ...on, rightNear: false }), false);
+  eq(isTwoHandActive({ ...on, tapeMode: true }), false);
+});
+
+test("clampNavScale keeps the zoom in range", () => {
+  eq(NAV_SCALE_MIN, 0.1);
+  eq(NAV_SCALE_MAX, 10);
+  eq(clampNavScale(9, 2), 10);
+  eq(clampNavScale(0.2, 0.1), 0.1);
+  assert(near(clampNavScale(1, 1.5), 1.5), "in range");
 });
 
 console.log("\n" + "=".repeat(60));
