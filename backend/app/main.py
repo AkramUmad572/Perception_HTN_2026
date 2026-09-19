@@ -24,12 +24,14 @@ from app.models import (
     HistoryRequest,
     ParamUpdateRequest,
     PhotoChooseRequest,
+    ResizeRequest,
     ScriptRequest,
     Selection,
 )
 from app.pipeline import (
     apply_intent,
     apply_param_update,
+    apply_resize,
     build_chosen_photo,
     build_from_image,
     confirm_chosen_photo,
@@ -243,6 +245,27 @@ async def project_update_params(project_id: str, body: ParamUpdateRequest):
         return CommandResponse(
             ok=False,
             reply="That change didn't save. Try again.",
+            action="clarify",
+            session=session,
+            error=str(exc),
+        )
+
+
+@app.post("/api/projects/{project_id}/resize", response_model=CommandResponse)
+async def project_resize(project_id: str, body: ResizeRequest):
+    """
+    Two-hand-stretch release: scale the project's real dimensions by `factor`.
+    CAD rewrites every "_mm" PARAM and rebuilds; a sculpt folds the factor
+    into its stored real size. No LLM.
+    """
+    session = get_session(body.session_id)
+    try:
+        return await apply_resize(session, settings, project_id, body.factor)
+    except Exception as exc:
+        logger.exception("Resize failed: %s", exc)
+        return CommandResponse(
+            ok=False,
+            reply="That resize didn't save. Try again.",
             action="clarify",
             session=session,
             error=str(exc),

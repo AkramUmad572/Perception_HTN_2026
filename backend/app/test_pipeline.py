@@ -1510,7 +1510,14 @@ def run_all_tests():
         p, f = loop.run_until_complete(test_absolute_size_clamps_and_says_so())
         total_pass += p
         total_fail += f
-        
+
+        # === Resize: two-hand-stretch → real dimension change ===
+        print("\n--- Resize Tests ---")
+        for test in RESIZE_TESTS:
+            p, f = loop.run_until_complete(test())
+            total_pass += p
+            total_fail += f
+
     finally:
         loop.close()
     
@@ -1778,10 +1785,33 @@ async def _execute_mesh_stub(session, settings):
     return session
 
 
+async def test_ui_mode_is_a_silent_passthrough():
+    """ui_mode never touches the model; it just echoes params['mode'] back."""
+    print("\n=== Test: ui_mode is a no-model passthrough ===")
+    from app.pipeline import apply_intent
+
+    errors = []
+    session = SessionState(session_id="ws_ui", last_backend="mesh", model_id="m1", glb_url="/media/glb/m1.glb")
+    with patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+         patch("app.pipeline.save_session"):
+        r = await apply_intent(
+            Intent(action="ui_mode", params={"mode": "lasso"}, reply="Select mode."),
+            session, _mock_settings(), transcript="select mode",
+        )
+    if r.rebuilt or r.action != "ui_mode" or r.ui_mode != "lasso":
+        errors.append(f"rebuilt={r.rebuilt} action={r.action} ui_mode={r.ui_mode}")
+    if r.backend != "mesh":
+        errors.append(f"backend {r.backend} should stay the session's own backend")
+    if r.model_id != "m1" or r.glb_url != "/media/glb/m1.glb":
+        errors.append("model/glb should be untouched")
+    return _report("ui_mode is a no-model passthrough", errors)
+
+
 WS_E_TESTS = [
     test_generate_records_and_returns_cad_params,
     test_param_update_rebuilds_and_versions,
     test_param_update_bad_value_clarifies_and_leaves_model,
+    test_ui_mode_is_a_silent_passthrough,
 ]
 
 
@@ -1962,6 +1992,193 @@ WS_FG_TESTS = [
     test_mesh_boolean_requires_mesh_session,
     test_mesh_boolean_missing_glb_clarifies,
     test_mesh_boolean_records_project_version,
+]
+
+
+# ============================================================================
+# Resize: two-hand-stretch release → real dimension change
+# ============================================================================
+
+
+async def _resize_cad_project(settings):
+    """A CAD project (one version) whose PARAMS end in _mm."""
+    session = SessionState(session_id="ws_resize_cad")
+    await _run_cad(
+        Intent(action="generate", script=_PARAM_SCRIPT, reply="A box."),
+        session, settings, "build me a box",
+    )
+    return session
+
+
+def _resize_mesh_project(settings, base_size_m=0.2, scale=1.0):
+    """A mesh project (one version) pointing at a real box GLB."""
+    from app import projects
+
+    session = _boolean_mesh_session(settings, base_size_m=base_size_m, scale=scale)
+    info = projects.create_project(
+        settings, "mesh", Path(settings.glb_dir) / "m1.glb",
+        op="generate", mesh_prompt="a duck", color="#FFFFFF", base_size_m=base_size_m,
+    )
+    session.project_id = info.project_id
+    session.version = info.version
+    session.model_id = f"{info.project_id}-v1"
+    session.glb_url = info.glb_url
+    return session, info.project_id
+
+
+async def test_resize_cad_scales_mm_params_and_rebuilds():
+    print("\n=== Test: resize scales every _mm PARAM and rebuilds ===")
+    import shutil
+    from app import projects
+    from app.pipeline import apply_resize
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = await _resize_cad_project(settings)
+        pid = session.project_id
+
+        with patch("app.pipeline.execute_cadquery_script", side_effect=_fake_sandbox_exec()), \
+             patch("app.pipeline.save_session"):
+            r = await apply_resize(session, settings, pid, 2.0)
+
+        if not r.ok or not r.rebuilt or r.action != "resize":
+            errors.append(f"ok={r.ok} rebuilt={r.rebuilt} action={r.action}")
+        want = {"width_mm": 20.0, "height_mm": 10.0}
+        if r.cad_params != want:
+            errors.append(f"cad_params {r.cad_params}")
+        v2 = projects.get_version(settings, pid, 2)
+        if not v2 or v2.op != "resize" or v2.params != want:
+            errors.append(f"v2 {v2}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("resize scales every _mm PARAM and rebuilds", errors)
+
+
+async def test_resize_cad_no_mm_params_clarifies():
+    print("\n=== Test: resize with no _mm PARAMS clarifies ===")
+    import shutil
+    from app.pipeline import apply_resize
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_resize_cad2")
+        no_mm_script = (
+            'import cadquery as cq\n'
+            'PARAMS = {"count": 4}\n'
+            'result = cq.Workplane("XY").box(1, 1, 1)\n'
+        )
+        await _run_cad(
+            Intent(action="generate", script=no_mm_script, reply="A box."),
+            session, settings, "build me a box",
+        )
+        pid = session.project_id
+        r = await apply_resize(session, settings, pid, 2.0)
+        if r.ok or r.action != "clarify" or "no measurements" not in r.reply:
+            errors.append(f"ok={r.ok} action={r.action} reply={r.reply!r}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("resize with no _mm PARAMS clarifies", errors)
+
+
+async def test_resize_mesh_folds_factor_into_base_size():
+    print("\n=== Test: resize folds factor into a sculpt's base_size_m ===")
+    import shutil
+    from app import projects
+    from app.pipeline import apply_resize
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session, pid = _resize_mesh_project(settings, base_size_m=0.2, scale=1.5)
+        with patch("app.pipeline.save_session"):
+            r = await apply_resize(session, settings, pid, 2.0)
+
+        if not r.ok or not r.rebuilt or r.action != "resize" or r.backend != "mesh":
+            errors.append(f"ok={r.ok} rebuilt={r.rebuilt} action={r.action} backend={r.backend}")
+        want_base = 0.2 * 1.5 * 2.0
+        v2 = projects.get_version(settings, pid, 2)
+        if not v2 or v2.op != "resize" or abs((v2.base_size_m or 0) - want_base) > 1e-6:
+            errors.append(f"v2 {v2}")
+        if session.scale != 1.0:
+            errors.append(f"session.scale not reset: {session.scale}")
+        if abs(session.base_size_m - want_base) > 1e-6:
+            errors.append(f"session.base_size_m {session.base_size_m} != {want_base}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("resize folds factor into a sculpt's base_size_m", errors)
+
+
+async def test_resize_noop_factors_leave_history_untouched():
+    print("\n=== Test: resize no-op factors leave the model and history untouched ===")
+    import shutil
+    from app import projects
+    from app.pipeline import apply_resize
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = await _resize_cad_project(settings)
+        pid = session.project_id
+        for bad_factor in (0.0, -1.0, float("nan"), float("inf"), 1.01, 0.99):
+            r = await apply_resize(session, settings, pid, bad_factor)
+            if not r.ok or r.action != "noop" or r.rebuilt:
+                errors.append(f"factor={bad_factor}: ok={r.ok} action={r.action} rebuilt={r.rebuilt}")
+        if projects.current_version(settings, pid).version != 1:
+            errors.append("a no-op factor must not create a new version")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("resize no-op factors leave the model and history untouched", errors)
+
+
+async def test_resize_undo_restores_previous_size_both_lanes():
+    print("\n=== Test: undo after a resize restores the previous size (both lanes) ===")
+    import shutil
+    from cad.params import extract_params as extract_cad_params
+    from app.pipeline import apply_resize, history_step
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        # --- mesh lane ---
+        mesh_session, mesh_pid = _resize_mesh_project(settings, base_size_m=0.2, scale=1.0)
+        with patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+             patch("app.pipeline.save_session"):
+            await apply_resize(mesh_session, settings, mesh_pid, 3.0)
+            undone = await history_step(mesh_session, settings, mesh_pid, "undo")
+        if not undone.ok or not undone.rebuilt:
+            errors.append(f"mesh undo response: ok={undone.ok} rebuilt={undone.rebuilt}")
+        if abs(mesh_session.base_size_m - 0.2) > 1e-6 or mesh_session.scale != 1.0:
+            errors.append(f"mesh undo: base={mesh_session.base_size_m} scale={mesh_session.scale}")
+
+        # --- CAD lane ---
+        cad_session = await _resize_cad_project(settings)
+        pid = cad_session.project_id
+        with patch("app.pipeline.execute_cadquery_script", side_effect=_fake_sandbox_exec("resize_cad_1")), \
+             patch("app.pipeline.save_session"):
+            await apply_resize(cad_session, settings, pid, 2.0)
+        with patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+             patch("app.pipeline.save_session"):
+            await history_step(cad_session, settings, pid, "undo")
+        if cad_session.last_script != _PARAM_SCRIPT:
+            errors.append("cad undo did not restore the original script")
+        want = {"width_mm": 10.0, "height_mm": 5.0}
+        if extract_cad_params(cad_session.last_script or "") != want:
+            errors.append("cad undo did not restore original PARAMS")
+        if cad_session.scale != 1.0:
+            errors.append(f"cad undo scale {cad_session.scale}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("undo after a resize restores the previous size (both lanes)", errors)
+
+
+RESIZE_TESTS = [
+    test_resize_cad_scales_mm_params_and_rebuilds,
+    test_resize_cad_no_mm_params_clarifies,
+    test_resize_mesh_folds_factor_into_base_size,
+    test_resize_noop_factors_leave_history_untouched,
+    test_resize_undo_restores_previous_size_both_lanes,
 ]
 
 

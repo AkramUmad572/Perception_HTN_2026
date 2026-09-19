@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -181,6 +183,9 @@ def restore_version(session: SessionState, info: VersionInfo) -> None:
         session.color = info.color
     if info.base_size_m:
         session.base_size_m = info.base_size_m
+    # Every stored version's base_size_m is already its real size; any display
+    # multiplier from an earlier voice resize belongs to a different version.
+    session.scale = 1.0
     save_session(session)
 
 
@@ -591,6 +596,11 @@ async def apply_intent(
                 size_mm=intent.size_mm,
             )
 
+    elif action == "ui_mode":
+        # A client UI switch ("select mode", "tape measure", "done") — no
+        # model change, just echoes intent.params["mode"] back on the response.
+        response_backend = session.last_backend
+
     elif action == "set_scale":
         # Resizing a sculpt is a display change, not a reason to spend 90s
         # rebuilding a model that would come back looking different anyway.
@@ -917,6 +927,7 @@ async def apply_intent(
         display_size_m=_display_size_m(session),
         candidates=candidates if action in ("find_photos", "browse_photos") else [],
         cad_params=_cad_params(session),
+        ui_mode=intent.params.get("mode") if action == "ui_mode" else None,
     )
 
 
@@ -965,8 +976,6 @@ async def save_client_version(
     geometry already, so it must only move its version pointer, not reload.
     Silent on purpose — this fires on every drag release.
     """
-    import tempfile
-
     if projects.current_version(settings, project_id) is None:
         return CommandResponse(
             ok=False,
@@ -1018,10 +1027,17 @@ async def apply_param_update(
     settings: Settings,
     project_id: str,
     updates: dict[str, float],
+    op: str = "param_edit",
+    action: str = "param_edit",
+    reply: str = "Updated.",
 ) -> CommandResponse:
     """
-    Drag-release from the client's dimension panel: rewrite named PARAMS in the
-    project's current CAD script and rerun the sandbox. No LLM involved.
+    Rewrite named PARAMS in the project's current CAD script and rerun the
+    sandbox. No LLM involved.
+
+    Drag-release from the client's dimension panel (the default op/action), or
+    a two-hand-stretch resize (apply_resize passes op="resize") — same rewrite
+    path either way, just a different version op and spoken reply.
 
     Returns rebuilt=True with a fresh model_id/glb_url on success, same
     contract as any other rebuild. A ParamError (unknown dimension, or a value
@@ -1085,7 +1101,7 @@ async def apply_param_update(
         settings,
         project_id,
         src,
-        op="param_edit",
+        op=op,
         script=new_script,
         params=new_params,
         color=color,
@@ -1094,8 +1110,8 @@ async def apply_param_update(
     restore_version(session, info)
     return CommandResponse(
         ok=True,
-        reply="Updated.",
-        action="param_edit",
+        reply=reply,
+        action=action,
         rebuilt=True,
         color=session.color,
         glb_url=session.glb_url,
@@ -1106,6 +1122,113 @@ async def apply_param_update(
         textured=False,
         display_size_m=_display_size_m(session),
         cad_params=new_params,
+    )
+
+
+# A two-hand stretch within this of 1.0x is not a resize (jitter / release wobble).
+RESIZE_NOOP_TOLERANCE = 0.02
+_NO_MM_PARAMS_REPLY = "This model has no measurements I can scale. Ask me to make it bigger instead."
+_RESIZE_NOOP_REPLY = "That's already about that size."
+
+
+async def apply_resize(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    factor: float,
+) -> CommandResponse:
+    """
+    Two-hand-stretch release: change the model's real dimensions, not just the
+    display zoom (the client resets its own zoom to 1 after this succeeds).
+
+    CAD: every PARAMS key ending in "_mm" is multiplied by `factor` and the
+    sandbox reruns — reuses apply_param_update's rewrite path with op="resize".
+    A CAD model with no "_mm" params has nothing to scale and clarifies.
+
+    Mesh: no geometry rebuild — the version's base_size_m absorbs the current
+    display scale times `factor`, and the session's scale resets to 1 so the
+    new version already reads at its full real size.
+
+    Factor <= 0, non-finite, or within ±2% of 1 is a silent no-op: no version,
+    no model change.
+    """
+    if not math.isfinite(factor) or factor <= 0 or abs(factor - 1.0) <= RESIZE_NOOP_TOLERANCE:
+        return CommandResponse(
+            ok=True,
+            reply=_RESIZE_NOOP_REPLY,
+            action="noop",
+            color=session.color,
+            glb_url=session.glb_url,
+            model_id=session.model_id,
+            session=session,
+            backend=session.last_backend,
+            display_size_m=_display_size_m(session),
+            cad_params=_cad_params(session),
+        )
+
+    current = projects.current_version(settings, project_id)
+    if current is None:
+        return CommandResponse(
+            ok=False,
+            reply=_NO_HISTORY_REPLY,
+            action="clarify",
+            session=session,
+            error=f"Unknown project {project_id}",
+        )
+
+    if current.kind == "cad":
+        params = extract_cad_params(current.script or "")
+        mm_updates = {k: v * factor for k, v in params.items() if k.endswith("_mm")}
+        if not mm_updates:
+            return CommandResponse(
+                ok=False,
+                reply=_NO_MM_PARAMS_REPLY,
+                action="clarify",
+                session=session,
+                error="No _mm params to scale",
+            )
+        return await apply_param_update(
+            session, settings, project_id, mm_updates,
+            op="resize", action="resize", reply="Resized.",
+        )
+
+    # Mesh lane: fold the stretch into the stored real size, no geometry edit.
+    glb_path = _glb_path_from_url(settings, current.glb_url)
+    if glb_path is None or not glb_path.is_file():
+        return CommandResponse(
+            ok=False,
+            reply="I can't find that model to resize.",
+            action="clarify",
+            session=session,
+            error="Missing GLB on disk",
+        )
+
+    new_base_size_m = _clamp(session.base_size_m * session.scale * factor, SIZE_MIN_M, SIZE_MAX_M)
+    fd, tmp = tempfile.mkstemp(dir=str(settings.projects_dir), suffix=".glb")
+    try:
+        with open(fd, "wb") as fh:
+            fh.write(glb_path.read_bytes())
+        info = projects.append_version(
+            settings, project_id, Path(tmp),
+            op="resize", base_size_m=new_base_size_m,
+        )
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+    restore_version(session, info)
+    return CommandResponse(
+        ok=True,
+        reply="Resized.",
+        action="resize",
+        rebuilt=True,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=session.model_id,
+        session=session,
+        backend="mesh",
+        textured=True,
+        display_size_m=_display_size_m(session),
+        cad_params={},
     )
 
 

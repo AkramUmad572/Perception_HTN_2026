@@ -70,12 +70,18 @@ class ParamUpdateRequest(BaseModel):
     session_id: str = "default"
 
 
+class ResizeRequest(BaseModel):
+    """Body of POST /api/projects/{project_id}/resize: a two-hand-stretch release."""
+    factor: float
+    session_id: str = "default"
+
+
 class VersionInfo(BaseModel):
     """One saved state of a project. Stored in storage/projects/<id>/info.json."""
     project_id: str
     version: int  # 1-based, monotonically increasing, never reused
     kind: str  # "cad" | "mesh"
-    # generate | set_material | hand_edit | param_edit | boolean | semantic_edit | photo | script
+    # generate | set_material | hand_edit | param_edit | boolean | semantic_edit | photo | script | resize
     op: str
     glb_url: str  # /media/projects/<project_id>/v<version>.glb
     summary: str | None = None
@@ -134,3 +140,6 @@ class CommandResponse(BaseModel):
     # The session's current CAD version's named dimensions (empty for mesh, or
     # a CAD script with no PARAMS). Drives the client's dimension panel.
     cad_params: dict[str, float] = Field(default_factory=dict)
+    # Set when action == "ui_mode": "lasso" | "tape" | "none". The client
+    # calls setSelectMode/setTapeMode accordingly.
+    ui_mode: str | None = None
