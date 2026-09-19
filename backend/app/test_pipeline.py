@@ -1108,6 +1108,176 @@ async def test_cad_generate_still_uses_sandbox():
     print("  [ok] CAD generate uses sandbox only")
     return 1, 0
 
+# ============================================================================
+# WS-A: project versions
+# ============================================================================
+
+def _version_settings():
+    """Mock settings with real temp dirs so GLBs can actually move into projects."""
+    import tempfile
+
+    root = Path(tempfile.mkdtemp(prefix="ws_a_pipe_"))
+    settings = _mock_settings()
+    settings.glb_dir = root / "glb"
+    settings.projects_dir = root / "projects"
+    settings.ref_dir = root / "ref"
+    for d in (settings.glb_dir, settings.projects_dir, settings.ref_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    return settings, root
+
+
+def _fake_executor(cfg):
+    """Stand-in for _execute_with_retry that writes a GLB like the sandbox does."""
+    counter = {"n": 0}
+
+    async def run(script, original_text, session, settings, latency, flatten_color=True):
+        counter["n"] += 1
+        model_id = f"built{counter['n']}"
+        (cfg.glb_dir / f"{model_id}.glb").write_bytes(b"glTF" + bytes(20))
+        session.template = None
+        session.params = {}
+        session.model_id = model_id
+        session.glb_url = f"/media/glb/{model_id}.glb"
+        session.last_script = script
+        session.last_backend = "cad"
+        session.last_mesh_prompt = None
+        return True, model_id, None
+
+    return run
+
+
+async def _run_cad(intent, session, settings, transcript):
+    with patch("app.pipeline._execute_with_retry", side_effect=_fake_executor_for(settings)), \
+         patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+         patch("app.pipeline.save_session"):
+        return await apply_intent(intent, session, settings, transcript=transcript)
+
+
+_EXECUTORS: dict = {}
+
+
+def _fake_executor_for(settings):
+    key = id(settings)
+    if key not in _EXECUTORS:
+        _EXECUTORS[key] = _fake_executor(settings)
+    return _EXECUTORS[key]
+
+
+def _report(name, errors):
+    if errors:
+        print(f"  [FAIL] {name}")
+        for e in errors:
+            print(f"    - {e}")
+        return 0, 1
+    print(f"  [ok] {name}")
+    return 1, 0
+
+
+async def test_builds_record_project_versions():
+    """Every rebuild lands in a project; follow-ups append, new objects start a project."""
+    import shutil
+    from app import projects
+
+    print("\n=== Test: builds record project versions ===")
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_a")
+        r1 = await _run_cad(
+            Intent(action="generate", script="S1", reply="A box."), session, settings, "build me a box"
+        )
+        pid = session.project_id
+        if not pid:
+            errors.append("session.project_id not set")
+        else:
+            if r1.model_id != f"{pid}-v1":
+                errors.append(f"model_id {r1.model_id!r} != {pid}-v1")
+            if r1.glb_url != f"/media/projects/{pid}/v1.glb":
+                errors.append(f"glb_url {r1.glb_url!r}")
+            if not (settings.projects_dir / pid / "v1.glb").is_file():
+                errors.append("v1.glb not on disk")
+            if session.version != 1 or not r1.rebuilt:
+                errors.append(f"version={session.version} rebuilt={r1.rebuilt}")
+            v1 = projects.get_version(settings, pid, 1)
+            if not v1 or v1.script != "S1" or v1.summary != "A box." or v1.op != "generate":
+                errors.append(f"v1 meta wrong: {v1}")
+
+        r2 = await _run_cad(
+            Intent(action="generate", script="S2", reply="Taller box."), session, settings, "make it taller"
+        )
+        if session.project_id != pid or r2.model_id != f"{pid}-v2":
+            errors.append(f"follow-up did not append: {session.project_id} {r2.model_id}")
+        v2 = projects.get_version(settings, pid, 2) if pid else None
+        if not v2 or v2.parent != 1 or v2.script != "S2":
+            errors.append(f"v2 meta wrong: {v2}")
+
+        r3 = await _run_cad(
+            Intent(action="set_material", params={"color": "#FF0000"}, reply="Red."),
+            session, settings, "make it red",
+        )
+        v3 = projects.get_version(settings, pid, 3) if pid else None
+        if r3.model_id != f"{pid}-v3" or not v3 or v3.op != "set_material" or v3.color != "#FF0000":
+            errors.append(f"set_material not versioned: {r3.model_id} {v3}")
+
+        await _run_cad(
+            Intent(action="generate", script="R1", reply="A ring."), session, settings, "build me a ring"
+        )
+        if session.project_id == pid or session.version != 1:
+            errors.append("new object should start a new project")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("builds record project versions", errors)
+
+
+async def test_missing_glb_keeps_legacy_url():
+    """No GLB on disk (mocked build) → nothing recorded, legacy ids untouched."""
+    print("\n=== Test: missing GLB keeps legacy url ===")
+    import shutil
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_a")
+        with patch("app.pipeline._execute_with_retry", AsyncMock(return_value=(True, "ghost", None))), \
+             patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+             patch("app.pipeline.save_session"):
+            r = await apply_intent(Intent(action="generate", script="x"), session, settings, transcript="build me a box")
+        if r.model_id != "ghost" or session.project_id is not None:
+            errors.append(f"model_id={r.model_id} project_id={session.project_id}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("missing GLB keeps legacy url", errors)
+
+
+async def test_photo_build_records_project():
+    print("\n=== Test: photo build records a mesh project ===")
+    import shutil
+    from app import projects
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = SessionState(session_id="ws_a")
+
+        async def fake_image(image_url, output_dir, **kwargs):
+            (Path(output_dir) / "photo1.glb").write_bytes(b"glTF" + bytes(20))
+            return {"ok": True, "model_id": "photo1", "textured": True, "exec_ms": 1}
+
+        with patch("app.pipeline.generate_mesh_glb_from_image", side_effect=fake_image), \
+             patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0.0))), \
+             patch("app.pipeline.save_session"):
+            r = await build_from_image("http://x/ref.png", session, settings, prompt="a mug")
+        pid = session.project_id
+        cur = projects.current_version(settings, pid) if pid else None
+        if not cur or cur.kind != "mesh" or cur.op != "photo" or cur.mesh_prompt != "a mug":
+            errors.append(f"photo version wrong: {cur}")
+        if r.model_id != f"{pid}-v1" or r.glb_url != f"/media/projects/{pid}/v1.glb":
+            errors.append(f"response ids {r.model_id} {r.glb_url}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("photo build records a mesh project", errors)
+
+
 def run_all_tests():
     """Run all pipeline regression tests."""
     print("=" * 60)
@@ -1194,6 +1364,13 @@ def run_all_tests():
         p, f = loop.run_until_complete(test_cad_generate_still_uses_sandbox())
         total_pass += p
         total_fail += f
+
+        # === WS-A: project versions ===
+        print("\n--- Project Version Tests ---")
+        for test in WS_A_TESTS:
+            p, f = loop.run_until_complete(test())
+            total_pass += p
+            total_fail += f
         
     finally:
         loop.close()
@@ -1209,6 +1386,13 @@ def run_all_tests():
     else:
         print("\n✓ ALL TESTS PASSED")
         return 0
+
+
+WS_A_TESTS = [
+    test_builds_record_project_versions,
+    test_missing_glb_keeps_legacy_url,
+    test_photo_build_records_project,
+]
 
 
 if __name__ == "__main__":
