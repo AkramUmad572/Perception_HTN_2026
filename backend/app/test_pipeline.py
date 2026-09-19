@@ -1278,6 +1278,104 @@ async def test_photo_build_records_project():
     return _report("photo build records a mesh project", errors)
 
 
+# ============================================================================
+# Absolute size ("make it 8 cm tall") on sculpts
+# ============================================================================
+
+async def _apply_scale(intent, session, settings):
+    with patch("app.pipeline.synthesize_speech") as mock_tts:
+        mock_tts.return_value = (None, 0.0)
+        with patch("app.pipeline.save_session"):
+            return await apply_intent(intent, session, settings)
+
+
+def _mesh_session(**kw):
+    base = dict(
+        session_id="test", last_backend="mesh", model_id="m1",
+        glb_url="/media/glb/m1.glb", base_size_m=0.2, scale=1.0,
+    )
+    base.update(kw)
+    return SessionState(**base)
+
+
+async def test_absolute_size_sets_longest_edge():
+    print("\n=== Test: absolute size sets the longest edge ===")
+    session = _mesh_session()
+    intent = Intent(action="set_scale", params={"target_m": 0.08, "axis": None},
+                    reply="Made it 8 centimetres.", backend="mesh")
+    result = await _apply_scale(intent, session, _mock_settings())
+    errors = []
+    if result.action != "set_scale":
+        errors.append(f"action {result.action!r}")
+    if result.rebuilt:
+        errors.append("must not rebuild")
+    if abs(session.scale - 0.4) > 1e-6:
+        errors.append(f"scale {session.scale}")
+    if abs((result.display_size_m or 0) - 0.08) > 1e-6:
+        errors.append(f"display_size_m {result.display_size_m}")
+    if errors:
+        print("  ✗ FAILED: " + "; ".join(errors))
+        return 0, 1
+    print("  ✓ 8 cm target → scale 0.4, display 0.08 m")
+    return 1, 0
+
+
+async def test_absolute_size_uses_axis_from_glb():
+    print("\n=== Test: absolute height reads the GLB bounds ===")
+    import tempfile
+    import trimesh
+
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = _mock_settings()
+        settings.glb_dir = Path(tmp)
+        # Width 1, height 2, depth 4: height is half the longest edge.
+        trimesh.creation.box(extents=(1.0, 2.0, 4.0)).export(str(Path(tmp) / "m1.glb"))
+        session = _mesh_session()
+        intent = Intent(action="set_scale", params={"target_m": 0.08, "axis": "height"},
+                        reply="Made it 8 centimetres tall.", backend="mesh")
+        result = await _apply_scale(intent, session, settings)
+    errors = []
+    if abs(session.scale - 0.8) > 1e-6:
+        errors.append(f"scale {session.scale}")
+    if abs((result.display_size_m or 0) - 0.16) > 1e-6:
+        errors.append(f"display_size_m {result.display_size_m}")
+    if errors:
+        print("  ✗ FAILED: " + "; ".join(errors))
+        return 0, 1
+    print("  ✓ 8 cm tall on a 1×2×4 box → longest edge 16 cm")
+    return 1, 0
+
+
+async def test_absolute_size_never_scales_cad():
+    print("\n=== Test: absolute size never display-scales CAD ===")
+    session = _mesh_session(last_backend="cad", last_script="result = None")
+    intent = Intent(action="set_scale", params={"target_m": 0.08, "axis": "height"},
+                    reply="Made it 8 centimetres tall.")
+    result = await _apply_scale(intent, session, _mock_settings())
+    if result.action == "clarify" and session.scale == 1.0 and not result.rebuilt:
+        print("  ✓ CAD refused with a spoken reason:", result.reply)
+        return 1, 0
+    print(f"  ✗ FAILED: action={result.action} scale={session.scale}")
+    return 0, 1
+
+
+async def test_absolute_size_clamps_and_says_so():
+    print("\n=== Test: absolute size beyond the display range ===")
+    session = _mesh_session()
+    intent = Intent(action="set_scale", params={"target_m": 5.0, "axis": None},
+                    reply="Made it 5 metres.", backend="mesh")
+    result = await _apply_scale(intent, session, _mock_settings())
+    ok = (
+        abs((result.display_size_m or 0) - 2.0) < 1e-6
+        and "as far as I can" in (result.reply or "")
+    )
+    if ok:
+        print("  ✓ clamped to 2 m and said so")
+        return 1, 0
+    print(f"  ✗ FAILED: display={result.display_size_m} reply={result.reply!r}")
+    return 0, 1
+
+
 def run_all_tests():
     """Run all pipeline regression tests."""
     print("=" * 60)
@@ -1371,6 +1469,22 @@ def run_all_tests():
             p, f = loop.run_until_complete(test())
             total_pass += p
             total_fail += f
+
+        p, f = loop.run_until_complete(test_absolute_size_sets_longest_edge())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_absolute_size_uses_axis_from_glb())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_absolute_size_never_scales_cad())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_absolute_size_clamps_and_says_so())
+        total_pass += p
+        total_fail += f
         
     finally:
         loop.close()

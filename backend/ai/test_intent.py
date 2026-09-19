@@ -616,6 +616,94 @@ def test_scale_fast_path():
     return passed, failed
 
 
+def test_absolute_size():
+    """"Make it 8 cm tall" on a sculpt sets a real target size; CAD keeps codegen."""
+    print("\n=== Test: absolute size (mesh sessions) ===")
+    import asyncio
+    from types import SimpleNamespace
+
+    passed = failed = 0
+    settings = SimpleNamespace(
+        meshy_api_key="",
+        nvidia_api_key="",
+        three_ws_enabled=True,
+        gemini_api_key="",
+        openai_api_key="",
+    )
+
+    async def _run(text, backend="mesh"):
+        return (
+            await intent_mod.parse_intent(
+                text, settings, None, {},
+                last_backend=backend,
+                last_mesh_prompt="a pikachu" if backend == "mesh" else None,
+            )
+        )[0]
+
+    # (utterance, expected target_m, expected axis)
+    cases = [
+        ("make it 8 cm tall", 0.08, "height"),
+        ("make it 50 millimetres wide", 0.05, "width"),
+        ("make it 1.5 metres long", 1.5, None),
+        ("make it eight centimeters", 0.08, None),
+        ("make it 30 mm deep", 0.03, "depth"),
+        ("make it 4 inches tall", 0.1016, "height"),
+        ("resize it to 10 cm", 0.1, None),
+        ("12 cm wide", 0.12, "width"),
+    ]
+    for text, want_m, want_axis in cases:
+        got = asyncio.run(_run(text))
+        target = got.params.get("target_m")
+        ok = (
+            got.action == "set_scale"
+            and target is not None
+            and abs(target - want_m) < 1e-6
+            and got.params.get("axis") == want_axis
+            and got.backend == "mesh"
+        )
+        if ok:
+            print(f"  [ok] {text!r} → {target} m axis={want_axis} reply={got.reply!r}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} → {got.action} {got.params} (want {want_m} {want_axis})")
+            failed += 1
+
+    # Relative amounts and part edits are not absolute resizes.
+    for text in (
+        "make it 2 cm taller",
+        "make the ears 2 cm long",
+        "add a 5 mm hole",
+        "put a 3 cm loop on top",
+    ):
+        got = asyncio.run(_run(text))
+        if "target_m" not in got.params:
+            print(f"  [ok] {text!r} is not an absolute resize ({got.action})")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} became an absolute resize {got.params}")
+            failed += 1
+
+    # Spoken reply: no digits-with-units jargon, reads as a sentence.
+    got = asyncio.run(_run("make it 8 cm tall"))
+    if got.reply == "Made it 8 centimetres tall.":
+        print("  [ok] reply is speakable")
+        passed += 1
+    else:
+        print(f"  [FAIL] reply {got.reply!r}")
+        failed += 1
+
+    # CAD is shown life size: never display-scale it, codegen owns real mm.
+    cad = asyncio.run(_run("make it 8 cm tall", backend="cad"))
+    if cad.action != "set_scale":
+        print(f"  [ok] CAD absolute size stays in codegen (action={cad.action})")
+        passed += 1
+    else:
+        print("  [FAIL] CAD absolute size took the display-only path")
+        failed += 1
+
+    return passed, failed
+
+
 def test_photo_search_fast_path():
     """'From my photos' must skip CAD/mesh and not fire codegen."""
     print("\n=== Test: photo search fast path ===")
@@ -765,9 +853,10 @@ def run_all_tests():
     s_pass, s_fail = test_scale_fast_path()
     ph_pass, ph_fail = test_photo_search_fast_path()
     h_pass, h_fail = test_history_rung()
+    a_pass, a_fail = test_absolute_size()
 
-    total_pass = w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass + h_pass
-    total_fail = w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail + h_fail
+    total_pass = w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass + h_pass + a_pass
+    total_fail = w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail + h_fail + a_fail
     
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -781,6 +870,7 @@ def run_all_tests():
     print(f"Resize fast path:           {s_pass}/{s_pass + s_fail} passed")
     print(f"Photo search:               {ph_pass}/{ph_pass + ph_fail} passed")
     print(f"Undo/redo rung:             {h_pass}/{h_pass + h_fail} passed")
+    print(f"Absolute size:              {a_pass}/{a_pass + a_fail} passed")
     print(f"TOTAL:                      {total_pass}/{total_pass + total_fail} passed")
     
     if total_fail > 0:

@@ -525,6 +525,87 @@ def _check_history(text: str) -> Intent | None:
     )
 
 
+# Absolute size ("make it 8 cm tall"). Sculpts only: a sculpt has no real size,
+# so this sets one. CAD keeps going through codegen, where the millimetres live.
+_SIZE_UNITS: tuple[tuple[str, float, str], ...] = (
+    (r"mm|millimet(?:er|re)s?", 0.001, "millimetres"),
+    (r"cm|centimet(?:er|re)s?", 0.01, "centimetres"),
+    (r"inch(?:es)?", 0.0254, "inches"),
+    (r"m|met(?:er|re)s?", 1.0, "metres"),
+)
+_NUMBER_WORDS: dict[str, float] = {
+    w: float(i)
+    for i, w in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve "
+        "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split()
+    )
+}
+_NUMBER_WORDS.update(
+    {"thirty": 30.0, "forty": 40.0, "fifty": 50.0, "sixty": 60.0,
+     "seventy": 70.0, "eighty": 80.0, "ninety": 90.0, "hundred": 100.0}
+)
+_ABS_SIZE_RE = re.compile(
+    r"\b(?P<num>\d+(?:\.\d+)?|" + "|".join(_NUMBER_WORDS) + r")\s*"
+    r"(?P<unit>" + "|".join(p for p, _m, _w in _SIZE_UNITS) + r")\b"
+    r"(?:\s+(?P<adj>tall|high|wide|across|long|deep|thick))?",
+    re.I,
+)
+_RELATIVE_SIZE_RE = re.compile(
+    r"\b(?:bigger|smaller|larger|longer|shorter|taller|wider|deeper|thicker|"
+    r"thinner|more|less|by)\b",
+    re.I,
+)
+# The size must be about the whole model: "make it 8 cm", "resize it to 10 cm",
+# or the size phrase on its own ("12 cm wide"). "Add a 5 mm hole" is not a resize.
+_RESIZE_CUE_RE = re.compile(
+    r"\b(?:make|makes|resize|scale|size|set)\s+(?:it|this|that|the (?:model|sculpt|whole thing))\b"
+    r"|\bresize\b|\b(?:it|this|that)\s+(?:should|to)\s+be\b",
+    re.I,
+)
+_AXIS_WORDS = {
+    "tall": "height", "high": "height",
+    "wide": "width", "across": "width",
+    "deep": "depth", "thick": "depth",
+    "long": None,
+}
+
+
+def _check_absolute_size(text: str) -> Intent | None:
+    """"Make it 8 cm tall" on a sculpt → set_scale with a real target in metres."""
+    t = text.lower().strip()
+    m = _ABS_SIZE_RE.search(t)
+    if not m or _is_new_object_request(t):
+        return None
+    # "2 cm taller" is a relative amount; "make the ears 2 cm long" is a part edit.
+    if _RELATIVE_SIZE_RE.search(t) or _PART_RE.search(t):
+        return None
+    bare = t.rstrip(" .!?") == m.group(0)
+    if not bare and not _RESIZE_CUE_RE.search(t):
+        return None
+
+    raw = m.group("num")
+    value = _NUMBER_WORDS.get(raw, None)
+    if value is None:
+        value = float(raw)
+    unit = m.group("unit")
+    for pattern, to_m, word in _SIZE_UNITS:
+        if re.fullmatch(pattern, unit, re.I):
+            break
+    else:
+        return None
+    if value <= 0:
+        return None
+
+    adj = (m.group("adj") or "").lower()
+    axis = _AXIS_WORDS.get(adj) if adj else None
+    spoken = f"Made it {value:g} {word}" + (f" {adj}" if adj else "") + "."
+    return Intent(
+        action="set_scale",
+        params={"target_m": round(value * to_m, 6), "axis": axis},
+        reply=spoken,
+    )
+
+
 def _build_user_payload(
     text: str,
     current_script: str | None = None,
@@ -966,6 +1047,12 @@ async def parse_intent(
     logger.info("Router → %s (session=%s new=%s)", routed, session_backend, is_new)
 
     if session_backend == "mesh" and not is_new:
+        # Above clarify_mesh: "30 mm deep" contains a CAD cue but is only a resize.
+        size_intent = _check_absolute_size(cleaned)
+        if size_intent:
+            size_intent.backend = "mesh"
+            logger.info("Fast path: absolute size %.3f m", size_intent.params["target_m"])
+            return size_intent, (time.perf_counter() - t0) * 1000
         scale_intent = _check_scale_only(cleaned)
         if scale_intent:
             scale_intent.backend = "mesh"
