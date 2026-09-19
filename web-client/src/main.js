@@ -390,7 +390,7 @@ function applyDisplaySize(obj, displaySizeM) {
 }
 
 async function setModelFromResponse(data) {
-  if (data.action === "find_photos") {
+  if (data.action === "find_photos" || data.action === "browse_photos") {
     return;
   }
   const newColor = data.color || currentColor;
@@ -804,28 +804,55 @@ const pointer = new THREE.Vector2();
 const raycaster = new THREE.Raycaster();
 const lastPtr = new THREE.Vector2();
 
-renderer.domElement.addEventListener("pointerdown", (e) => {
-  if (renderer.xr.isPresenting) return;
+// Mouse drag-to-scroll for the photo picker (desktop preview only — VR uses
+// real hand/controller pinch positions via pollHand). We fake a "pinch"
+// world position by raycasting onto the plane the picker cards sit on, then
+// drive the same beginPinch/movePinch/endPinch the hand-tracking path uses.
+let pickerDragging = false;
+const _pickerPlane = new THREE.Plane();
+const _pickerPlaneNormal = new THREE.Vector3();
+const _pickerWorldPos = new THREE.Vector3();
+
+function pointerToPickerWorld(e) {
   pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
   pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
+  _pickerPlaneNormal.set(0, 0, 1).applyQuaternion(camera.quaternion);
+  _pickerPlane.setFromNormalAndCoplanarPoint(_pickerPlaneNormal, photoPicker.group.position);
+  raycaster.ray.intersectPlane(_pickerPlane, _pickerWorldPos);
+  return _pickerWorldPos;
+}
+
+renderer.domElement.addEventListener("pointerdown", (e) => {
+  if (renderer.xr.isPresenting) return;
   if (photoPicker.isOpen) {
-    const hits = raycaster.intersectObjects(photoPicker.cards, true);
-    const card = hits[0]?.object;
-    const fileId = card?.userData?.fileId || card?.parent?.userData?.fileId;
-    if (fileId) buildFromPickedPhoto(fileId);
+    photoPicker.beginPinch(pointerToPickerWorld(e));
+    pickerDragging = true;
     return;
   }
+  pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
+  pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
   const target = modelInteractTarget();
   if (target && raycaster.intersectObject(target, true).length) {
     desktopMode = e.shiftKey ? "spin" : "move";
     lastPtr.set(e.clientX, e.clientY);
   }
 });
-window.addEventListener("pointerup", () => {
+window.addEventListener("pointerup", (e) => {
+  if (pickerDragging) {
+    pickerDragging = false;
+    const picked = photoPicker.endPinch(pointerToPickerWorld(e));
+    if (picked) buildFromPickedPhoto(picked);
+    return;
+  }
   desktopMode = null;
 });
 window.addEventListener("pointermove", (e) => {
+  if (pickerDragging) {
+    photoPicker.movePinch(pointerToPickerWorld(e));
+    return;
+  }
   if (!desktopMode || renderer.xr.isPresenting) return;
   const dx = e.clientX - lastPtr.x;
   const dy = e.clientY - lastPtr.y;

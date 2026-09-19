@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ai.intent import extract_named_color
+from app import jobs
 from app.config import Settings
 from app.models import CommandResponse, Intent, SessionState
 from app.session import save_session
@@ -182,6 +183,119 @@ async def _execute_mesh(
     return True, result["model_id"], None, bool(result.get("textured", True))
 
 
+async def _finish_mesh_build(
+    prompt: str,
+    session: SessionState,
+    settings: Settings,
+    transcript: str | None,
+    completion_reply: str,
+    failure_prefix: str,
+    size_mm: float | None = None,
+    recolor: str | None = None,
+) -> CommandResponse:
+    """
+    Runs detached (see jobs.py): the actual sculpt, then the final response
+    the client picks up via /api/jobs/{id}. Mirrors apply_intent's own
+    mesh success/failure shaping, just off the request path.
+    """
+    latency: dict[str, float] = {}
+    success, model_id, error, _textured = await _execute_mesh(
+        prompt, session, settings, latency, size_mm=size_mm
+    )
+
+    if success:
+        reply = completion_reply
+        rebuilt = True
+        result_model_id = model_id
+        textured = True
+        error_msg = None
+        if recolor:
+            session.color = recolor
+            session.params["color"] = recolor
+        session.last_summary = reply
+        save_session(session)
+    else:
+        reply = f"{failure_prefix}{error}"
+        rebuilt = False
+        result_model_id = None
+        textured = False
+        error_msg = error
+
+    t0 = time.perf_counter()
+    audio_url, tts_ms = await synthesize_speech(reply, settings)
+    latency["tts_ms"] = tts_ms if tts_ms else (time.perf_counter() - t0) * 1000
+
+    return CommandResponse(
+        ok=error_msg is None,
+        transcript=transcript,
+        reply=reply,
+        action="generate" if success else "clarify",
+        rebuilt=rebuilt,
+        color=session.color,
+        glb_url=session.glb_url,
+        model_id=result_model_id if rebuilt else session.model_id,
+        reply_audio_url=audio_url,
+        session=session,
+        latency_ms=latency,
+        error=error_msg,
+        textured=textured,
+        backend="mesh",
+        display_size_m=_display_size_m(session),
+        candidates=[],
+    )
+
+
+async def _start_mesh_build(
+    prompt: str,
+    session: SessionState,
+    settings: Settings,
+    transcript: str | None,
+    ack_reply: str,
+    completion_reply: str,
+    failure_prefix: str,
+    latency: dict[str, float] | None = None,
+    size_mm: float | None = None,
+    recolor: str | None = None,
+) -> CommandResponse:
+    """
+    Speak an instant acknowledgment, then sculpt in the background.
+
+    Mesh generation runs 10-90s+; holding the request open that whole time
+    leaves Percy silent. Acknowledge immediately — same idea as the photo-pick
+    flow's confirm step — and let the client poll /api/jobs/{id} for the
+    finished model, exactly as it already does for photo builds.
+    """
+    t0 = time.perf_counter()
+    audio_url, tts_ms = await synthesize_speech(ack_reply, settings)
+    ack_latency = dict(latency or {})
+    ack_latency["tts_ms"] = tts_ms if tts_ms else (time.perf_counter() - t0) * 1000
+
+    async def work() -> CommandResponse:
+        return await _finish_mesh_build(
+            prompt,
+            session,
+            settings,
+            transcript,
+            completion_reply,
+            failure_prefix,
+            size_mm=size_mm,
+            recolor=recolor,
+        )
+
+    job_id = jobs.start(work)
+    return CommandResponse(
+        ok=True,
+        transcript=transcript,
+        reply=ack_reply,
+        action="building",
+        session=session,
+        backend="mesh",
+        reply_audio_url=audio_url,
+        latency_ms=ack_latency,
+        job_id=job_id,
+    )
+
+
 async def apply_intent(
     intent: Intent,
     session: SessionState,
@@ -263,6 +377,40 @@ async def apply_intent(
             else:
                 intent.reply = f"Found {n}. Pinch to pick one."
 
+    elif action == "browse_photos":
+        # Just a listing — no ranking, no per-photo download. Drive's own
+        # thumbnail serves the picker; the pick itself downloads full-res.
+        response_backend = "mesh"
+        try:
+            files = await list_images(settings)
+        except Exception as exc:
+            logger.warning("Drive list failed: %s", exc)
+            error_msg = str(exc)
+            intent.reply = "I couldn't reach your photos."
+            action = "clarify"
+            files = []
+        candidates = [
+            {
+                "id": f["id"],
+                "name": f.get("name") or "photo",
+                "preview_url": f.get("thumbnail_link") or "",
+                "image_url": f.get("thumbnail_link") or "",
+            }
+            for f in files
+            if f.get("thumbnail_link")
+        ]
+        session.last_photos = candidates
+        save_session(session)
+        n = len(candidates)
+        if n == 0:
+            if not error_msg:
+                intent.reply = "Your Drive folder looks empty."
+            action = "clarify"
+        elif n == 1:
+            intent.reply = "One photo in your Drive. Pinch to build it."
+        else:
+            intent.reply = f"Here's all {n} from your Drive. Pinch one to build."
+
     elif action == "generate" and (intent.backend or "cad") == "mesh":
         prompt = (intent.mesh_prompt or "").strip()
         if not prompt:
@@ -278,21 +426,17 @@ async def apply_intent(
             response_backend = "mesh"
         else:
             session.scale = 1.0
-            success, model_id, error, _mesh_textured = await _execute_mesh(
-                prompt, session, settings, latency, size_mm=intent.size_mm
+            return await _start_mesh_build(
+                prompt,
+                session,
+                settings,
+                transcript,
+                ack_reply="Sculpting that, one moment.",
+                completion_reply=intent.reply or "Here's that sculpt.",
+                failure_prefix="Sculpt failed: ",
+                latency=latency,
+                size_mm=intent.size_mm,
             )
-            if success:
-                rebuilt = True
-                result_model_id = model_id
-                textured = True
-                response_backend = "mesh"
-                session.last_summary = intent.reply
-                save_session(session)
-            else:
-                error_msg = error
-                intent.reply = f"Sculpt failed: {error}"
-                action = "clarify"
-                response_backend = "mesh"
 
     elif action == "set_scale":
         # Resizing a sculpt is a display change, not a reason to spend 90s
@@ -430,20 +574,17 @@ async def apply_intent(
                 response_backend = "mesh"
             else:
                 prompt = f"{session.last_mesh_prompt}, overall color {color}"
-                success, model_id, error, _tex = await _execute_mesh(
-                    prompt, session, settings, latency
+                return await _start_mesh_build(
+                    prompt,
+                    session,
+                    settings,
+                    transcript,
+                    ack_reply="Recoloring that, one moment.",
+                    completion_reply=intent.reply or "Changed the color.",
+                    failure_prefix="Couldn't apply color: ",
+                    latency=latency,
+                    recolor=color,
                 )
-                if success:
-                    rebuilt = True
-                    result_model_id = model_id
-                    textured = True
-                    response_backend = "mesh"
-                    session.color = color
-                    session.params["color"] = color
-                else:
-                    error_msg = f"Color change failed: {error}"
-                    intent.reply = f"Couldn't apply color: {error}"
-                    response_backend = "mesh"
         elif session.last_script:
             rebuild_attempted = True
             success, model_id, error = await _execute_with_retry(
@@ -508,7 +649,7 @@ async def apply_intent(
         textured=textured,
         backend=response_backend,
         display_size_m=_display_size_m(session),
-        candidates=candidates if action == "find_photos" else [],
+        candidates=candidates if action in ("find_photos", "browse_photos") else [],
     )
 
 
@@ -718,6 +859,35 @@ async def build_chosen_photo(
             reply_audio_url=audio_url,
             backend="mesh",
         )
+
+    if not chosen.get("build_url"):
+        # Browsed-not-searched: only a Drive thumbnail was fetched so far.
+        # Download and cut out the subject now, on the one photo picked.
+        try:
+            raw, mime = await download_file(file_id, settings)
+        except Exception as exc:
+            logger.warning("Drive download %s failed: %s", file_id, exc)
+            reply = "I couldn't download that photo. Try another."
+            audio_url, _ = await synthesize_speech(reply, settings)
+            return CommandResponse(
+                ok=False,
+                reply=reply,
+                action="clarify",
+                session=session,
+                reply_audio_url=audio_url,
+                backend="mesh",
+            )
+        info = stage_photo(raw, settings, mime=mime, name=chosen.get("name") or "", file_id=file_id)
+        chosen = {
+            **chosen,
+            "preview_url": info["preview_url"],
+            "image_url": info["preview_url"],
+            "build_url": info["build_url"],
+        }
+        session.last_photos = [
+            chosen if p.get("id") == file_id else p for p in session.last_photos
+        ]
+        save_session(session)
 
     prompt = chosen.get("name") or ""
     # The staged cut-out on disk, for the CAD fallback when sculpting is down.

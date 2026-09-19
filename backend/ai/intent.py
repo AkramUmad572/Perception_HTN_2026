@@ -9,8 +9,9 @@ import time
 from typing import Any
 
 from app.config import Settings
+from app.httpclient import get_http_client
 from app.models import Intent
-from photos.search import is_photo_search, photo_query
+from photos.search import is_browse_all_query, is_photo_search, photo_query
 
 logger = logging.getLogger(__name__)
 
@@ -576,7 +577,6 @@ async def _gemini_codegen(
     current_color: str | None = None,
 ) -> Intent:
     """Generate CadQuery code via Gemini API."""
-    import httpx
 
     model = settings.gemini_model
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -599,15 +599,16 @@ async def _gemini_codegen(
         },
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            url,
-            params={"key": settings.gemini_api_key},
-            headers={"Content-Type": "application/json"},
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    client = get_http_client()
+    resp = await client.post(
+        url,
+        params={"key": settings.gemini_api_key},
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
     raw = (
         data.get("candidates", [{}])[0]
@@ -686,8 +687,6 @@ async def codegen_from_photo(
     """
     import base64
 
-    import httpx
-
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is required to build from a photo.")
     if mime not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
@@ -720,15 +719,16 @@ async def codegen_from_photo(
         "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"},
     }
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            url,
-            params={"key": settings.gemini_api_key},
-            headers={"Content-Type": "application/json"},
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    client = get_http_client()
+    resp = await client.post(
+        url,
+        params={"key": settings.gemini_api_key},
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=120.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
     raw = (
         data.get("candidates", [{}])[0]
@@ -754,8 +754,6 @@ async def mesh_prompt_from_photo(
     (`/api/3d/generate`) stays up. Gemini just tells it what the photo shows.
     """
     import base64
-
-    import httpx
 
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is required to describe a photo.")
@@ -788,15 +786,16 @@ async def mesh_prompt_from_photo(
         "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            url,
-            params={"key": settings.gemini_api_key},
-            headers={"Content-Type": "application/json"},
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    client = get_http_client()
+    resp = await client.post(
+        url,
+        params={"key": settings.gemini_api_key},
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
     raw = (
         data.get("candidates", [{}])[0]
@@ -906,6 +905,12 @@ async def parse_intent(
 
     if is_photo_search(cleaned):
         query = photo_query(cleaned)
+        if is_browse_all_query(query):
+            logger.info("Photo browse-all requested")
+            return (
+                Intent(action="browse_photos", backend="mesh", reply="Here's your Drive."),
+                (time.perf_counter() - t0) * 1000,
+            )
         logger.info("Photo search → %r", query)
         return (
             Intent(

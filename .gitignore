@@ -1,0 +1,29 @@
+# Secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+.vite/
+.iwsdk/
+
+# Generated storage
+backend/storage/glb/*
+backend/storage/audio/*
+backend/storage/ref/*
+backend/storage/sessions.json
+!backend/storage/glb/.gitkeep
+!backend/storage/audio/.gitkeep
+!backend/storage/ref/.gitkeep
+
+# OS
+.DS_Store

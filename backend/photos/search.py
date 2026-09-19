@@ -7,9 +7,8 @@ import logging
 import re
 from typing import Any
 
-import httpx
-
 from app.config import Settings
+from app.httpclient import get_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +50,27 @@ def is_photo_search(text: str) -> bool:
     if not t:
         return False
     return bool(_PHOTO_SOURCE_RE.search(t) or _PHOTO_VERB_RE.search(t))
+
+
+# Words that survive photo_query()'s filler-stripping even when the user
+# named no actual subject ("open up my photos" -> "open up my"). If nothing
+# but these is left, they want everything shown, not one photo found.
+_BROWSE_STOPWORDS = frozenset({
+    "my", "all", "everything", "every", "open", "up", "show", "showing",
+    "me", "please", "can", "you", "could", "would", "lets", "let",
+    "drive", "photos", "photo", "pictures", "picture", "pics", "pic",
+    "google", "the", "a", "an", "of", "folder", "files", "file",
+    "whats", "what", "in", "is", "are", "there", "them", "out",
+    "bring", "browse", "pull", "see", "seeing", "look", "looking",
+    "hey", "percy", "gallery", "album", "stuff", "got", "have",
+})
+
+
+def is_browse_all_query(query: str) -> bool:
+    """True when photo_query() left nothing but filler — show everything."""
+    tokens = [w for w in re.split(r"[^a-z0-9]+", (query or "").lower()) if w]
+    meaningful = [t for t in tokens if t not in _BROWSE_STOPWORDS and len(t) > 2]
+    return not meaningful
 
 
 def photo_query(text: str) -> str:
@@ -133,15 +153,16 @@ async def rank_matches(
         },
     }
     try:
-        async with httpx.AsyncClient(timeout=40.0) as client:
-            resp = await client.post(
-                url,
-                params={"key": settings.gemini_api_key},
-                headers={"Content-Type": "application/json"},
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        client = get_http_client()
+        resp = await client.post(
+            url,
+            params={"key": settings.gemini_api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=40.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
         raw = (
             data.get("candidates", [{}])[0]
             .get("content", {})

@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from ai.intent import parse_intent
 from app import jobs
 from app.config import get_settings
+from app.httpclient import aclose_http_client
 from app.models import CommandRequest, CommandResponse, PhotoChooseRequest, ScriptRequest
 from app.pipeline import (
     apply_intent,
@@ -32,6 +33,11 @@ logger = logging.getLogger("perception_cad")
 
 settings = get_settings()
 app = FastAPI(title="Perception CAD", version="0.2.0")
+
+
+@app.on_event("shutdown")
+async def _close_http_client():
+    await aclose_http_client()
 
 app.add_middleware(
     CORSMiddleware,

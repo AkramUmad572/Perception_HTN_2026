@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app import jobs
 from app.models import Intent, SessionState, CommandResponse
 from app.pipeline import apply_intent, build_from_image
 
@@ -959,9 +960,16 @@ async def test_mesh_generate_skips_sandbox_and_sets_session():
             with patch("app.pipeline.synthesize_speech") as mock_tts:
                 mock_tts.return_value = (None, 0.0)
                 with patch("app.pipeline.save_session"):
-                    result = await apply_intent(intent, session, settings)
+                    # Mesh builds run detached now (see _start_mesh_build): the
+                    # request gets an instant ack, the sculpt itself is a job.
+                    ack = await apply_intent(intent, session, settings)
+                    job = jobs.get(ack.job_id)
+                    await job.task
+                    result = job.result
 
     errors = []
+    if ack.action != "building" or not ack.job_id:
+        errors.append("apply_intent should ack immediately with a job_id")
     if mock_cad.called:
         errors.append("CadQuery sandbox must not run for mesh generate")
     if not mock_mesh.called:
@@ -1011,7 +1019,10 @@ async def test_mesh_without_meshy_still_runs_factory():
             with patch("app.pipeline.synthesize_speech") as mock_tts:
                 mock_tts.return_value = (None, 0.0)
                 with patch("app.pipeline.save_session"):
-                    result = await apply_intent(intent, session, settings)
+                    ack = await apply_intent(intent, session, settings)
+                    job = jobs.get(ack.job_id)
+                    await job.task
+                    result = job.result
     errors = []
     if mock_cad.called:
         errors.append("must not call CadQuery")
