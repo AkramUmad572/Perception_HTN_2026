@@ -14,5 +14,12 @@
  * left to actual controllers.
  */
 export function selectEventDrivesPtt(hand) {
-  return !hand?.joints?.["index-finger-tip"];
+  // hand.joints["index-finger-tip"] is the wrong signal: three.js creates
+  // that entry the first time a joint pose ever arrives and never removes
+  // it, so once hand tracking has been seen even once in a session the key
+  // stays forever — permanently reading as "tracked" and blocking the
+  // controller's own select events for the rest of the session. hand.visible
+  // is reset every frame (true only while the input source currently reports
+  // .hand), so it actually reflects whether a hand is tracked right now.
+  return !hand?.visible;
 }

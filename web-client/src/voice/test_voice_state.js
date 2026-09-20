@@ -337,7 +337,7 @@ await test("a held pinch stays held while it jitters inside the dead band", () =
 console.log("\n=== Left-hand PTT must have exactly one driver ===");
 
 await test("a tracked hand leaves the select events alone", () => {
-  const trackedHand = { joints: { "index-finger-tip": {}, "thumb-tip": {}, wrist: {} } };
+  const trackedHand = { visible: true, joints: { "index-finger-tip": {}, "thumb-tip": {}, wrist: {} } };
   assert(
     !selectEventDrivesPtt(trackedHand),
     "pollHand already latches a tracked hand's pinch — taking the select event too " +
@@ -346,8 +346,19 @@ await test("a tracked hand leaves the select events alone", () => {
 });
 
 await test("a controller still drives PTT through the select events", () => {
-  assert(selectEventDrivesPtt({ joints: {} }), "a controller has no hand joints to sample");
+  assert(selectEventDrivesPtt({ visible: false, joints: {} }), "a controller has no hand joints to sample");
   assert(selectEventDrivesPtt(undefined), "no hand object at all is still a controller");
+});
+
+await test("a hand once tracked but now stowed for controllers doesn't stick", () => {
+  // three.js never deletes a joint entry once seen, so the OLD signal
+  // (joints["index-finger-tip"] presence) stayed true forever after any
+  // hand-tracking blip. `visible` is reset every frame and must not.
+  const stowedHand = { visible: false, joints: { "index-finger-tip": {} } };
+  assert(
+    selectEventDrivesPtt(stowedHand),
+    "a hand with a stale joint entry but visible:false must not block the controller's trigger"
+  );
 });
 
 /**
@@ -365,7 +376,7 @@ function leftHandDriver(percy) {
 
   return function feed(...frames) {
     for (const { gap, select } of frames) {
-      const hand = gap === null ? { joints: {} } : { joints: { "index-finger-tip": {} } };
+      const hand = gap === null ? { visible: false, joints: {} } : { visible: true, joints: { "index-finger-tip": {} } };
 
       // left.controller select listeners (main.js)
       if (select === "start" && selectEventDrivesPtt(hand)) percy.beginTalk();
