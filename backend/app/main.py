@@ -32,6 +32,7 @@ from app.pipeline import (
     apply_intent,
     apply_param_update,
     apply_resize,
+    apply_semantic_edit,
     build_chosen_photo,
     build_from_image,
     confirm_chosen_photo,
@@ -311,6 +312,41 @@ async def project_resize(project_id: str, body: ResizeRequest):
             session=session,
             error=str(exc),
         )
+
+
+@app.post("/api/projects/{project_id}/semantic_edit", response_model=CommandResponse)
+async def project_semantic_edit(
+    project_id: str,
+    image: UploadFile = File(...),
+    text: str = Form(...),
+    session_id: str = Form("default"),
+):
+    """
+    Semantic sculpt edit. The headset sends a PNG of what it is looking at with
+    a circle drawn where the user pinched; this edits that picture with Gemini
+    and rebuilds a mesh from it.
+
+    Runs as a job because the whole chain is ~40-70 s: the answer here is just
+    the job_id, and the client polls /api/jobs/{job_id} for the result.
+    """
+    session = get_session(session_id)
+    try:
+        png = await image.read()
+    except Exception as exc:
+        logger.exception("Could not read the uploaded render: %s", exc)
+        return CommandResponse(
+            ok=False, reply="That didn't upload. Try again.",
+            action="clarify", session=session, error=str(exc),
+        )
+
+    async def work() -> CommandResponse:
+        return await apply_semantic_edit(session, settings, project_id, png, text)
+
+    job_id = jobs.start(work, progress={"stage": "editing"})
+    return CommandResponse(
+        ok=True, reply="That'll take a minute.", action="semantic_edit",
+        session=session, job_id=job_id,
+    )
 
 
 @app.post("/api/command", response_model=CommandResponse)

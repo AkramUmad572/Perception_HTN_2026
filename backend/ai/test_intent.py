@@ -783,14 +783,26 @@ def test_mesh_boolean_rung():
         print(f"  [FAIL] flat base → {got.action} {got.params}")
         failed += 1
 
-    # Everything else on a mesh session still gets the generic clarify (not
-    # a new-object request, so it doesn't fall through to codegen instead).
+    # clarify_mesh narrows again in Phase 4 (WS-H). "Add a keychain lug" on a
+    # sculpt used to be refused; with a selection it is now a semantic edit,
+    # because an image edit genuinely can add one. That is the point of the
+    # phase, so this asserts the new behaviour rather than the old refusal.
     got = asyncio.run(_run("add a keychain lug", selection=sel))
-    if got.action == "clarify" and got.backend == "mesh" and "Point at" not in got.reply:
-        print("  [ok] non-boolean CAD vocabulary still clarify_mesh")
+    if got.action == "semantic_edit" and got.backend == "mesh":
+        print("  [ok] an addition on a sculpt is now a semantic edit")
         passed += 1
     else:
         print(f"  [FAIL] keychain lug on mesh session → {got.action} {got.reply!r}")
+        failed += 1
+
+    # ...but clarify_mesh still holds for genuine CAD-only vocabulary, so the
+    # narrowing is not total.
+    got = asyncio.run(_run("chamfer the edges", selection=sel))
+    if got.action == "clarify" and got.backend == "mesh" and "Point at" not in got.reply:
+        print("  [ok] CAD-only vocabulary still clarify_mesh")
+        passed += 1
+    else:
+        print(f"  [FAIL] chamfer on mesh session → {got.action} {got.reply!r}")
         failed += 1
 
     return passed, failed
@@ -1145,6 +1157,46 @@ def test_ui_mode_rung():
 # Run All Tests
 # ============================================================================
 
+def test_semantic_edit_rung():
+    """"Give it wings" on a sculpt with a selection -> an image edit."""
+    print("\n=== Test: semantic edit rung ===")
+    from ai.intent import _check_semantic_edit
+    from app.models import Selection
+
+    sel = Selection(center=[0.0, 0.0, 0.0], normal=[0.0, 1.0, 0.0])
+    passed = failed = 0
+
+    claims = ["give it wings", "add a hat", "make it look angrier",
+              "put horns on it", "give it red wings", "stick a handle on it"]
+    for text in claims:
+        got = _check_semantic_edit(text, sel)
+        if got is not None and got.action == "semantic_edit":
+            print(f"  [ok] claims {text!r}"); passed += 1
+        else:
+            print(f"  [FAIL] should claim {text!r}, got {got}"); failed += 1
+
+    if _check_semantic_edit("give it wings", None) is None:
+        print("  [ok] no selection -> no semantic edit"); passed += 1
+    else:
+        print("  [FAIL] claimed without a selection"); failed += 1
+
+    # Everything with its own deterministic path must keep it. A recolour is
+    # the dangerous one: "make" is a semantic verb, so without the recolour
+    # guard "make it red" would cost a 40-70s regeneration.
+    for text in ["drill a hole", "add a loop", "flatten the base",
+                 "make it bigger", "make it smaller", "make it 8 cm tall",
+                 "paint it red", "make it red", "make it blue",
+                 "turn it green", "colour it black", "make the ears red",
+                 "build me a car", "undo"]:
+        got = _check_semantic_edit(text, sel)
+        if got is None:
+            print(f"  [ok] leaves {text!r} alone"); passed += 1
+        else:
+            print(f"  [FAIL] hijacked {text!r} -> {got.action}"); failed += 1
+
+    return passed, failed
+
+
 def run_all_tests():
     """Run all intent parsing regression tests."""
     print("=" * 60)
@@ -1166,14 +1218,15 @@ def run_all_tests():
     mb_pass, mb_fail = test_mesh_boolean_rung()
     sel_pass, sel_fail = test_selection_in_codegen_payload()
     ui_pass, ui_fail = test_ui_mode_rung()
+    se_pass, se_fail = test_semantic_edit_rung()
 
     total_pass = (
         w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass
-        + ch_pass + co_pass + h_pass + a_pass + mb_pass + sel_pass + ui_pass
+        + ch_pass + co_pass + h_pass + a_pass + mb_pass + sel_pass + ui_pass + se_pass
     )
     total_fail = (
         w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail
-        + ch_fail + co_fail + h_fail + a_fail + mb_fail + sel_fail + ui_fail
+        + ch_fail + co_fail + h_fail + a_fail + mb_fail + sel_fail + ui_fail + se_fail
     )
 
     print("\n" + "=" * 60)
@@ -1194,6 +1247,7 @@ def run_all_tests():
     print(f"Mesh boolean rung:          {mb_pass}/{mb_pass + mb_fail} passed")
     print(f"Selection in payload:       {sel_pass}/{sel_pass + sel_fail} passed")
     print(f"ui_mode rung:               {ui_pass}/{ui_pass + ui_fail} passed")
+    print(f"Semantic edit rung:         {se_pass}/{se_pass + se_fail} passed")
     print(f"TOTAL:                      {total_pass}/{total_pass + total_fail} passed")
     
     if total_fail > 0:

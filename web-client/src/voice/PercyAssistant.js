@@ -61,6 +61,11 @@ export class PercyAssistant {
     // falls through to /api/command exactly as before. ~67 ms vs ~15 s for
     // the same edit through codegen.
     this.onPartEdit = options.onPartEdit || null;
+    // Captures the current view with the selection circled and uploads it for
+    // a semantic sculpt edit (WS-H). The router answers action="semantic_edit"
+    // with rebuilt=false because the server has no picture yet; the headset is
+    // what takes it.
+    this.onSemanticEdit = options.onSemanticEdit || null;
     this.onJobProgress = options.onJobProgress || (() => {});
     this.onItems = options.onItems || (() => {});
 
@@ -329,6 +334,18 @@ export class PercyAssistant {
         body.lon = _cachedLocation.lon;
       }
       const result = await this._postJson(`${API_BASE}/api/command`, body);
+
+      // The router says this is a semantic edit but has no picture yet: the
+      // headset renders the current view with the selection circled and posts
+      // it to /semantic_edit, which answers with a job to poll.
+      if (result?.action === "semantic_edit" && !result?.rebuilt
+          && selection && this.onSemanticEdit) {
+        await this._handleResponse(result);
+        const started = await this.onSemanticEdit(text, selection);
+        if (started) return this._deliverResponse(started);
+        return result;
+      }
+
       await this._deliverResponse(result);
       return result;
     } catch (e) {
@@ -401,6 +418,23 @@ export class PercyAssistant {
   }
 
   /**
+   * Upload a render of the current view, with the selection circled, for a
+   * semantic sculpt edit. Answers with a job_id; the whole chain is ~40-70 s.
+   */
+  async postSemanticEdit(projectId, blob, text) {
+    const form = new FormData();
+    form.append("image", blob, "view.png");
+    form.append("text", text);
+    form.append("session_id", SESSION_ID);
+    const res = await fetch(`${API_BASE}/api/projects/${projectId}/semantic_edit`, {
+      method: "POST",
+      body: form,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  /**
    * Two-hand-stretch release: resize the project's real dimensions by
    * `factor`. Silent on purpose, like postParamUpdate — this fires once per
    * gesture, not on every frame of the stretch.
@@ -456,7 +490,9 @@ export class PercyAssistant {
   // full 10-90s+. Speak the ack, then poll the same way choosePhoto() does,
   // and hand the finished build to _handleResponse once it lands.
   async _deliverResponse(result) {
-    if ((result?.action !== "building" && result?.action !== "searching" && result?.action !== "publishing") || !result?.job_id) {
+    if ((result?.action !== "building" && result?.action !== "searching"
+         && result?.action !== "publishing" && result?.action !== "semantic_edit")
+        || !result?.job_id) {
       await this._handleResponse(result);
       return result;
     }

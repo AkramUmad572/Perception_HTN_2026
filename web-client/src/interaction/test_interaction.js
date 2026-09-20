@@ -66,6 +66,7 @@ import {
   needsSelection,
   PART_SCALE_STEP,
 } from "./partEdit.js";
+import { ndcToPixels, circleRadiusPx, clampCircle } from "./viewCapture.js";
 
 const assert = (condition, message) => {
   if (!condition) throw new Error(`ASSERTION FAILED: ${message}`);
@@ -640,6 +641,52 @@ test("needsSelection leaves whole-model and structural speech alone", () => {
                       "undo", "make it red", "what is this"]) {
     assert(!needsSelection(text), `should NOT need a selection: ${text}`);
   }
+});
+
+console.log("\n=== viewCapture.js ===");
+
+test("ndcToPixels maps the centre to the middle of the canvas", () => {
+  const p = ndcToPixels({ x: 0, y: 0 }, 1024, 512);
+  eq(p.x, 512);
+  eq(p.y, 256);
+});
+
+test("ndcToPixels flips Y (NDC is up-positive, pixels are down-positive)", () => {
+  eq(ndcToPixels({ x: 0, y: 1 }, 100, 100).y, 0);
+  eq(ndcToPixels({ x: 0, y: -1 }, 100, 100).y, 100);
+});
+
+test("ndcToPixels maps the right edge", () => {
+  eq(ndcToPixels({ x: 1, y: 0 }, 800, 600).x, 800);
+});
+
+test("circleRadiusPx scales with the smaller dimension", () => {
+  eq(circleRadiusPx(1000, 500, 0.2), 100);
+});
+
+test("clampCircle keeps a circle near the edge fully on canvas", () => {
+  const c = clampCircle(5, 5, 40, 400, 400);
+  assert(c.cx >= c.r && c.cy >= c.r, `clamped to ${c.cx},${c.cy} r=${c.r}`);
+});
+
+test("clampCircle leaves a centred circle alone", () => {
+  const c = clampCircle(200, 200, 40, 400, 400);
+  eq(c.cx, 200);
+  eq(c.cy, 200);
+  eq(c.r, 40);
+});
+
+test("clampCircle shrinks a radius bigger than the canvas", () => {
+  assert(clampCircle(200, 200, 500, 400, 400).r <= 200, "radius not clamped");
+});
+
+test("clampCircle handles a point projected off-screen behind the camera", () => {
+  // .project(camera) can return NDC outside -1..1; the circle must still land
+  // on the canvas rather than producing NaN or a negative radius.
+  const c = clampCircle(-9999, 99999, 100, 512, 512);
+  assert(Number.isFinite(c.cx) && Number.isFinite(c.cy), "non-finite centre");
+  assert(c.cx >= c.r && c.cx <= 512 - c.r, `cx off canvas: ${c.cx}`);
+  assert(c.cy >= c.r && c.cy <= 512 - c.r, `cy off canvas: ${c.cy}`);
 });
 
 console.log("\n" + "=".repeat(60));

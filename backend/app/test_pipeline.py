@@ -1570,6 +1570,13 @@ def run_all_tests():
             total_pass += p
             total_fail += f
 
+        # === Semantic sculpt edits (WS-H) ===
+        print("\n--- Semantic Edit Tests ---")
+        for test in SEMANTIC_TESTS:
+            p, f = loop.run_until_complete(test())
+            total_pass += p
+            total_fail += f
+
     finally:
         loop.close()
     
@@ -2223,6 +2230,156 @@ async def test_resize_undo_restores_previous_size_both_lanes():
     finally:
         shutil.rmtree(root, ignore_errors=True)
     return _report("undo after a resize restores the previous size (both lanes)", errors)
+
+
+# ============================================================================
+# WS-H: semantic sculpt edits (Gemini image edit -> image-to-3D)
+# ============================================================================
+
+async def test_semantic_edit_appends_one_version():
+    print("\n=== Test: semantic edit appends a version with a parent ===")
+    import shutil
+    from app import pipeline, projects
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session, pid = _resize_mesh_project(settings, base_size_m=0.2)
+        before = projects.current_version(settings, pid)
+
+        async def fake_edit(png, instruction, s, timeout_s=90.0):
+            return b"EDITED-PNG"
+
+        async def fake_mesh(image_url, output_dir, **kw):
+            dest = Path(output_dir) / "newmesh.glb"
+            dest.write_bytes(b"glTF" + bytes(20))
+            return {"ok": True, "model_id": "newmesh", "glb_path": str(dest),
+                    "textured": True, "provider": "fake"}
+
+        with patch.object(pipeline, "edit_image", fake_edit), \
+             patch.object(pipeline, "generate_mesh_glb_from_image", fake_mesh), \
+             patch("app.pipeline.save_session"), \
+             patch("app.pipeline.synthesize_speech", AsyncMock(return_value=(None, 0))):
+            r = await pipeline.apply_semantic_edit(
+                session, settings, pid, b"SRC", "give it wings")
+
+        after = projects.current_version(settings, pid)
+        if not r.ok or not r.rebuilt:
+            errors.append(f"ok={r.ok} rebuilt={r.rebuilt} err={r.error}")
+        if after.version != before.version + 1:
+            errors.append(f"version {before.version} -> {after.version}")
+        if after.op != "semantic_edit":
+            errors.append(f"op={after.op}")
+        if after.parent != before.version:
+            errors.append(f"parent={after.parent} want {before.version}")
+        if after.mesh_prompt != "give it wings":
+            errors.append(f"mesh_prompt={after.mesh_prompt!r}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("semantic edit appends one version with a parent", errors)
+
+
+async def test_semantic_edit_failure_appends_nothing():
+    print("\n=== Test: a failed semantic edit leaves the model untouched ===")
+    import shutil
+    from app import pipeline, projects
+    from mesh.edit import EditError
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session, pid = _resize_mesh_project(settings, base_size_m=0.2)
+        before = projects.current_version(settings, pid)
+
+        async def boom(png, instruction, s, timeout_s=90.0):
+            raise EditError("I couldn't picture that change")
+
+        with patch.object(pipeline, "edit_image", boom), \
+             patch("app.pipeline.save_session"):
+            r = await pipeline.apply_semantic_edit(
+                session, settings, pid, b"SRC", "give it wings")
+
+        after = projects.current_version(settings, pid)
+        if r.ok or r.action != "clarify":
+            errors.append(f"ok={r.ok} action={r.action}")
+        if after.version != before.version:
+            errors.append(f"version changed to {after.version}")
+        # The reply is spoken: no paths, no exception names, no markdown.
+        if "/" in r.reply or "Error" in r.reply or "`" in r.reply:
+            errors.append(f"unspeakable reply {r.reply!r}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("a failed semantic edit leaves the model untouched", errors)
+
+
+async def test_semantic_edit_mesh_build_failure_appends_nothing():
+    print("\n=== Test: a failed 3D rebuild leaves the model untouched ===")
+    import shutil
+    from app import pipeline, projects
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session, pid = _resize_mesh_project(settings, base_size_m=0.2)
+        before = projects.current_version(settings, pid)
+
+        async def fake_edit(png, instruction, s, timeout_s=90.0):
+            return b"EDITED-PNG"
+
+        async def bad_mesh(image_url, output_dir, **kw):
+            return {"ok": False, "error": "provider down"}
+
+        with patch.object(pipeline, "edit_image", fake_edit), \
+             patch.object(pipeline, "generate_mesh_glb_from_image", bad_mesh), \
+             patch("app.pipeline.save_session"):
+            r = await pipeline.apply_semantic_edit(
+                session, settings, pid, b"SRC", "give it wings")
+
+        after = projects.current_version(settings, pid)
+        if r.ok or r.action != "clarify":
+            errors.append(f"ok={r.ok} action={r.action}")
+        if after.version != before.version:
+            errors.append(f"version changed to {after.version}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("a failed 3D rebuild leaves the model untouched", errors)
+
+
+async def test_semantic_edit_refuses_a_cad_project():
+    print("\n=== Test: semantic edit refuses CAD ===")
+    import shutil
+    from app import pipeline
+
+    settings, root = _version_settings()
+    errors = []
+    try:
+        session = await _resize_cad_project(settings)
+        called = {"n": 0}
+
+        async def should_not_run(*a, **k):
+            called["n"] += 1
+            return b""
+
+        with patch.object(pipeline, "edit_image", should_not_run), \
+             patch("app.pipeline.save_session"):
+            r = await pipeline.apply_semantic_edit(
+                session, settings, session.project_id, b"SRC", "give it wings")
+
+        if r.ok or r.action != "clarify":
+            errors.append(f"ok={r.ok} action={r.action}")
+        if called["n"]:
+            errors.append("called Gemini for a CAD project")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return _report("semantic edit refuses CAD", errors)
+
+
+SEMANTIC_TESTS = [
+    test_semantic_edit_appends_one_version,
+    test_semantic_edit_failure_appends_nothing,
+    test_semantic_edit_mesh_build_failure_appends_nothing,
+    test_semantic_edit_refuses_a_cad_project,
+]
 
 
 RESIZE_TESTS = [

@@ -41,6 +41,7 @@ import {
 } from "./interaction/paramPanel.js";
 import { selectionFromStroke, isTapRelease } from "./interaction/selection.js";
 import { planPartEdit } from "./interaction/partEdit.js";
+import { ndcToPixels, circleRadiusPx, clampCircle } from "./interaction/viewCapture.js";
 import {
   scaleRegion,
   pullRegion,
@@ -1363,6 +1364,79 @@ async function applyRegionCommand(cmd, selection, text) {
 }
 
 /**
+ * A PNG of what the user is looking at, with a red circle drawn where they
+ * pinched. The circle is what tells the image model where to make the change;
+ * it was verified not to appear in the edited output.
+ *
+ * Rendering here rather than server-side keeps it WYSIWYG and makes the 3D to
+ * 2D conversion free: the camera is right here.
+ */
+async function captureViewWithCircle(selection) {
+  if (!currentModel || !selection) return null;
+  const W = 1024;
+  const H = 1024;
+
+  const rt = new THREE.WebGLRenderTarget(W, H);
+  const prevTarget = renderer.getRenderTarget();
+  let buf;
+  try {
+    renderer.setRenderTarget(rt);
+    renderer.render(scene, camera);
+    buf = new Uint8Array(W * H * 4);
+    renderer.readRenderTargetPixels(rt, 0, 0, W, H, buf);
+  } finally {
+    renderer.setRenderTarget(prevTarget);
+    rt.dispose();
+  }
+
+  // readRenderTargetPixels is bottom-up; a canvas is top-down.
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(W, H);
+  for (let y = 0; y < H; y++) {
+    const src = (H - 1 - y) * W * 4;
+    img.data.set(buf.subarray(src, src + W * 4), y * W * 4);
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const world = currentModel.localToWorld(
+    new THREE.Vector3(selection.center[0], selection.center[1], selection.center[2])
+  );
+  const ndc = world.project(camera);
+  const px = ndcToPixels(ndc, W, H);
+  const c = clampCircle(px.x, px.y, circleRadiusPx(W, H), W, H);
+
+  ctx.strokeStyle = "#ff0000";
+  ctx.lineWidth = Math.max(4, c.r * 0.06);
+  ctx.beginPath();
+  ctx.arc(c.cx, c.cy, c.r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+}
+
+/**
+ * Capture the view and hand it to the semantic-edit route. Returns null when
+ * it cannot (no sculpt, no project, capture failed), in which case Percy keeps
+ * the router's original answer instead.
+ */
+async function applySemanticEdit(text, selection) {
+  if (lastBackend !== "mesh" || !currentProjectId) return null;
+  try {
+    const blob = await captureViewWithCircle(selection);
+    if (!blob) return null;
+    setStatus("Working on that…", true);
+    return await percy.postSemanticEdit(currentProjectId, blob, text);
+  } catch (e) {
+    console.error("[Percy] Semantic edit failed:", e);
+    setStatus("That change didn't work.", false);
+    return null;
+  }
+}
+
+/**
  * Re-establish a selection on a named part of the freshly-loaded model.
  *
  * Returns a Selection shaped exactly like selectionFromStroke's, centred on
@@ -1411,6 +1485,7 @@ const percy = new PercyAssistant({
   onStatusMessage: (msg, ok) => setStatus(msg, ok),
   onRegionCommand: (cmd, selection, text) => applyRegionCommand(cmd, selection, text),
   onPartEdit: (text, selection) => applyPartEdit(text, selection),
+  onSemanticEdit: (text, selection) => applySemanticEdit(text, selection),
   onSelectionCleared: () => clearSelectionHighlight(),
   onPhotoCandidates: (cands) => {
     if (!cands || !cands.length) {

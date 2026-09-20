@@ -152,6 +152,7 @@ NEW_ROUTES = {
     ("POST", "/api/projects/{project_id}/versions"),
     ("POST", "/api/projects/{project_id}/params"),
     ("POST", "/api/projects/{project_id}/resize"),
+    ("POST", "/api/projects/{project_id}/semantic_edit"),
 }
 
 
@@ -432,6 +433,43 @@ def test_history_step_count_is_bounded():
     return t
 
 
+def test_semantic_edit_route():
+    print("\n=== Test: semantic_edit route ===")
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+
+    t = (0, 0)
+    with TestClient(main.app) as client:
+        r = client.post(
+            "/api/projects/does-not-exist/semantic_edit",
+            files={"image": ("v.png", b"notreallyapng", "image/png")},
+            data={"text": "give it wings", "session_id": "test_api"},
+        )
+        # It starts a job, so the immediate answer is ok with a job_id; the
+        # unknown project surfaces in the job result, not here.
+        body = r.json() if r.status_code == 200 else {}
+        t = _add(t, _check("accepted and started a job",
+                           r.status_code == 200 and bool(body.get("job_id")),
+                           f"{r.status_code} {str(body)[:120]}"))
+        t = _add(t, _check("action is semantic_edit",
+                           body.get("action") == "semantic_edit", body.get("action")))
+
+        r = client.post(
+            "/api/projects/p/semantic_edit",
+            data={"text": "give it wings", "session_id": "test_api"},
+        )
+        t = _add(t, _check("a missing image is 422", r.status_code == 422, r.status_code))
+
+        r = client.post(
+            "/api/projects/p/semantic_edit",
+            files={"image": ("v.png", b"x", "image/png")},
+            data={"session_id": "test_api"},
+        )
+        t = _add(t, _check("missing text is 422", r.status_code == 422, r.status_code))
+    return t
+
+
 def run_all_tests():
     print("=" * 60)
     print("HTTP API REGRESSION TESTS")
@@ -469,6 +507,7 @@ TESTS = [
     test_command_response_stays_backward_compatible,
     test_new_fast_paths_do_not_hijack_build_requests,
     test_history_step_count_is_bounded,
+    test_semantic_edit_route,
 ]
 
 

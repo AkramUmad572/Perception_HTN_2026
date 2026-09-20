@@ -832,6 +832,50 @@ def _check_mesh_boolean(text: str, selection: Selection | None) -> Intent | None
     return Intent(action="mesh_boolean", backend="mesh", params=params, reply=reply)
 
 
+# Anything a sculpt cannot do deterministically but an image edit can:
+# "give it wings", "add a hat". Needs a selection, because the circle drawn on
+# the render is what tells the image model where to make the change.
+_SEMANTIC_VERBS = re.compile(r"\b(?:give|add|put|make|turn|stick)\b", re.I)
+
+# Handled elsewhere, deterministically — never claim these.
+_NOT_SEMANTIC = re.compile(
+    r"\bholes?\b|\bloops?\b|\bhanger\b|\bflat(?:ten)?\s+(?:it\s+|the\s+)?(?:base|bottom)\b"
+    r"|\b(?:bigger|smaller|larger|taller|wider|thicker|thinner)\b"
+    r"|\bpaint\b|\bsmooth\b|\bpull\b|\bpush\b"
+    r"|\b\d+(?:\.\d+)?\s*(?:mm|cm|m|inch(?:es)?|millimet|centimet|met)",
+    re.I,
+)
+
+# A pure recolour is NOT a semantic edit. "make" is in _SEMANTIC_VERBS, so
+# without this "make it red" would cost a 40-70s regeneration instead of the
+# instant recolour. "give it red wings" is still semantic: there the colour is
+# not the whole request.
+_RECOLOR_ONLY_RE = re.compile(
+    r"^(?:make|turn|paint|colou?r)\s+(?:it|this|that|the\s+\w+)\s+"
+    r"(?:" + "|".join(re.escape(c) for c in COLOR_MAP) + r")\b\s*[.!?]*$",
+    re.I,
+)
+
+
+def _check_semantic_edit(text: str, selection: Selection | None) -> Intent | None:
+    '''"Give it wings" on a sculpt, with a spot pointed at → an image edit.'''
+    t = text.lower().strip()
+    if selection is None or not getattr(selection, "center", None):
+        return None
+    if _is_new_object_request(t) or _NOT_SEMANTIC.search(t):
+        return None
+    if _RECOLOR_ONLY_RE.match(t):
+        return None
+    if not _SEMANTIC_VERBS.search(t):
+        return None
+    return Intent(
+        action="semantic_edit",
+        backend="mesh",
+        params={"instruction": text.strip()},
+        reply="That'll take a minute.",
+    )
+
+
 def _describe_selection(selection: Selection | None) -> str | None:
     """Spoken-free text for the codegen payload: "user pointed at X near (x,y,z) mm"."""
     if selection is None:
@@ -1471,6 +1515,12 @@ async def parse_intent(
             scale_intent.backend = "mesh"
             logger.info("Fast path: resize x%.2f", scale_intent.params["factor"])
             return scale_intent, (time.perf_counter() - t0) * 1000
+        # Last rung before clarify_mesh: everything deterministic has had its
+        # turn, so what is left is a semantic change an image edit can make.
+        semantic_intent = _check_semantic_edit(cleaned, selection)
+        if semantic_intent:
+            logger.info("Fast path: semantic edit")
+            return semantic_intent, (time.perf_counter() - t0) * 1000
 
     if routed == "clarify_mesh":
         return (
