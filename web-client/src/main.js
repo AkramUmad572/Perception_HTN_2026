@@ -1272,17 +1272,20 @@ left.controller.addEventListener("selectend", () => {
 
 right.controller.addEventListener("selectstart", () => {
   right.controller.getWorldPosition(_pinch);
+  // A tracked hand pinch also fires this same select event; pollHand already
+  // drives the picker/tape/select-stroke off the hand, so a controller-select
+  // handler that doesn't check selectEventDrivesPtt double-drives whichever
+  // one is open from a single physical gesture.
   if (photoPicker.isOpen) {
-    photoPicker.beginPinch(_pinch);
+    if (selectEventDrivesPtt(right.hand)) photoPicker.beginPinch(_pinch);
     return;
   }
-  // Hand input also fires select events; hands place tape points in pollHand.
   if (tapeMode) {
-    if (!right.hand.joints?.["index-finger-tip"]) placeTapePointFromHand(right);
+    if (selectEventDrivesPtt(right.hand)) placeTapePointFromHand(right);
     return;
   }
   if (selectMode) {
-    if (!right.hand.joints?.["index-finger-tip"]) {
+    if (selectEventDrivesPtt(right.hand)) {
       strokeHits = [];
       const hit = raycastFromHand(right);
       if (hit) strokeHits.push(hit);
@@ -1293,9 +1296,11 @@ right.controller.addEventListener("selectstart", () => {
 });
 right.controller.addEventListener("selectend", () => {
   if (photoPicker.isOpen) {
-    right.controller.getWorldPosition(_pinch);
-    const picked = photoPicker.endPinch(_pinch);
-    if (picked) buildFromPickedPhoto(picked);
+    if (selectEventDrivesPtt(right.hand)) {
+      right.controller.getWorldPosition(_pinch);
+      const picked = photoPicker.endPinch(_pinch);
+      if (picked) buildFromPickedPhoto(picked);
+    }
     return;
   }
   if (selectMode) {
