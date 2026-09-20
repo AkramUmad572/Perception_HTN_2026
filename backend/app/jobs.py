@@ -13,22 +13,23 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from app.models import CommandResponse
 
 logger = logging.getLogger(__name__)
 
-# How long a finished job sticks around for a client that went away mid-build.
 RETENTION_S = 900.0
 
 
 class Job:
-    def __init__(self, job_id: str) -> None:
+    def __init__(self, job_id: str, progress: dict[str, Any] | None = None) -> None:
         self.job_id = job_id
         self.started_at = time.monotonic()
         self.finished_at: float | None = None
         self.result: CommandResponse | None = None
         self.error: str | None = None
+        self.progress: dict[str, Any] = progress or {}
 
     @property
     def done(self) -> bool:
@@ -49,10 +50,12 @@ def _sweep() -> None:
             _jobs.pop(job_id, None)
 
 
-def start(work: Callable[[], Awaitable[CommandResponse]]) -> str:
-    """Run `work` detached and hand back the id to poll it with."""
+def start(
+    work: Callable[[], Awaitable[CommandResponse]],
+    progress: dict[str, Any] | None = None,
+) -> str:
     _sweep()
-    job = Job(uuid.uuid4().hex[:12])
+    job = Job(uuid.uuid4().hex[:12], progress=progress)
     _jobs[job.job_id] = job
 
     async def run() -> None:
@@ -65,7 +68,6 @@ def start(work: Callable[[], Awaitable[CommandResponse]]) -> str:
             job.finished_at = time.monotonic()
             logger.info("Job %s finished in %.1fs", job.job_id, job.elapsed_s)
 
-    # Held so the loop cannot garbage-collect a build mid-flight.
     task = asyncio.create_task(run())
     task.add_done_callback(lambda _: None)
     job.task = task  # type: ignore[attr-defined]
@@ -74,3 +76,14 @@ def start(work: Callable[[], Awaitable[CommandResponse]]) -> str:
 
 def get(job_id: str) -> Job | None:
     return _jobs.get(job_id)
+
+
+def set_app_status(job_id: str, slug: str, status: str) -> None:
+    job = _jobs.get(job_id)
+    if not job:
+        return
+    apps = job.progress.setdefault("apps", [])
+    for app in apps:
+        if app.get("slug") == slug:
+            app["status"] = status
+            return

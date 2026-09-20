@@ -16,7 +16,7 @@ const READY_HINT =
 // Kept under the proxy's own limit so a stall surfaces here, with a message,
 // rather than as a severed connection.
 const REQUEST_TIMEOUT_MS = 180000;
-const JOB_POLL_MS = 3000;
+const JOB_POLL_MS = 800;
 const JOB_MAX_MS = 600000;
 // Polls are cheap, so ride out a few dropped ones before giving up on a build.
 const JOB_MAX_MISSES = 5;
@@ -32,6 +32,8 @@ export class PercyAssistant {
     // matches the local table runs here instead of /api/command — no LLM
     // round trip for "bigger" / "pull it out" / etc. on a selection.
     this.onRegionCommand = options.onRegionCommand || null;
+    this.onJobProgress = options.onJobProgress || (() => {});
+    this.onItems = options.onItems || (() => {});
 
     this.recorder = new PTTRecorder();
     this.recorder.onMaxHold = () => this.endTalk();
@@ -343,7 +345,14 @@ export class PercyAssistant {
         continue;
       }
       misses = 0;
-      if (data.action !== "building") return data;
+      if (data.action !== "building" && data.action !== "searching" && data.action !== "publishing") {
+        return data;
+      }
+      if (data.action === "searching" || data.action === "publishing") {
+        this.onJobProgress(data);
+        this.onStatusMessage(data.reply || "Working…", true);
+        continue;
+      }
       const secs = Math.round((data.latency_ms?.elapsed_ms || 0) / 1000);
       this.onStatusMessage(`Still sculpting… ${secs}s`, true);
     }
@@ -356,7 +365,7 @@ export class PercyAssistant {
   // full 10-90s+. Speak the ack, then poll the same way choosePhoto() does,
   // and hand the finished build to _handleResponse once it lands.
   async _deliverResponse(result) {
-    if (result?.action !== "building" || !result?.job_id) {
+    if ((result?.action !== "building" && result?.action !== "searching" && result?.action !== "publishing") || !result?.job_id) {
       await this._handleResponse(result);
       return result;
     }
@@ -377,11 +386,23 @@ export class PercyAssistant {
     const heard = data.transcript ? `"${data.transcript}" → ` : "";
     const ms = data.latency_ms?.total_ms ? ` (${Math.round(data.latency_ms.total_ms)}ms)` : "";
 
+    if (data.action === "searching" || data.action === "publishing") {
+      this.onJobProgress(data);
+    }
+
     const isPhotoListing = data.action === "find_photos" || data.action === "browse_photos";
     if (isPhotoListing && (data.candidates || []).length) {
+      this.onJobProgress(null);
+      this.onItems(null);
       this.onPhotoCandidates(data.candidates);
-    } else if (data.rebuilt && data.glb_url) {
+    } else if (data.action === "show_items" && (data.items || []).length) {
+      this.onJobProgress(null);
       this.onPhotoCandidates(null);
+      this.onItems(data.items);
+    } else if (data.action !== "searching" && data.action !== "publishing") {
+      this.onJobProgress(null);
+      this.onPhotoCandidates(null);
+      this.onItems(null);
     }
 
     this.onModelUpdate(data);

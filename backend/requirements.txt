@@ -13,3 +13,4 @@ networkx>=3.2
 numpy>=1.26.0
 aiofiles>=24.1.0
 python-dotenv>=1.0.0
+composio>=0.8.0

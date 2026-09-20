@@ -11,6 +11,7 @@ from typing import Any
 from app.config import Settings
 from app.httpclient import get_http_client
 from app.models import Intent, Selection
+from composio_app.router import route_composio
 from photos.search import is_browse_all_query, is_photo_search, photo_query
 
 logger = logging.getLogger(__name__)
@@ -1179,6 +1180,7 @@ async def parse_intent(
     last_backend: str | None = None,
     last_mesh_prompt: str | None = None,
     selection: Selection | None = None,
+    last_brief: str | None = None,
 ) -> tuple[Intent, float]:
     """
     Parse user utterance into Intent (CadQuery script or mesh prompt).
@@ -1210,6 +1212,12 @@ async def parse_intent(
     if ui_mode_intent:
         logger.info("Fast path: ui_mode %s", ui_mode_intent.params["mode"])
         return ui_mode_intent, (time.perf_counter() - t0) * 1000
+
+    object_hint = " ".join(x for x in (last_mesh_prompt, last_summary, current_template) if x)
+    routed = route_composio(cleaned, has_brief=bool(last_brief), object_hint=object_hint or None)
+    if routed:
+        logger.info("Composio router → %s apps=%s kind=%s", routed.action, routed.apps, routed.pull_kind)
+        return routed, (time.perf_counter() - t0) * 1000
 
     if is_photo_search(cleaned):
         query = photo_query(cleaned)

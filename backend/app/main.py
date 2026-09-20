@@ -151,6 +151,7 @@ async def health():
             else None
         ),
         "drive": bool(settings.google_drive_api_key and settings.google_drive_folder_id),
+        "composio": bool(settings.composio_api_key),
     }
 
 
@@ -291,6 +292,7 @@ async def command(body: CommandRequest):
         last_backend=session.last_backend,
         last_mesh_prompt=session.last_mesh_prompt,
         selection=body.selection,
+        last_brief=session.last_brief,
     )
     result = await apply_intent(
         intent,
@@ -409,7 +411,12 @@ async def photo_preview(file_id: str):
     if not valid_file_id(file_id):
         raise HTTPException(status_code=400, detail="Invalid file id")
     try:
-        path, mime = await ensure_local_file(file_id, settings)
+        if ":" in file_id:
+            from composio_app.adapters import cache_prefixed
+
+            path, mime = await cache_prefixed(file_id, settings)
+        else:
+            path, mime = await ensure_local_file(file_id, settings)
     except Exception as exc:
         logger.warning("Drive preview %s failed: %s", file_id, exc)
         raise HTTPException(status_code=404, detail="Photo unavailable") from exc
@@ -485,6 +492,19 @@ async def job_status(job_id: str, session_id: str = "default"):
         )
 
     # No reply_audio_url: a poll every few seconds must not talk over itself.
+    apps = (job.progress or {}).get("apps") or []
+    if apps:
+        return CommandResponse(
+            ok=True,
+            reply=(job.progress or {}).get("caption") or "Still looking…",
+            action="searching",
+            session=session,
+            backend="mesh",
+            job_id=job_id,
+            apps=apps,
+            progress=job.progress,
+            latency_ms={"elapsed_ms": job.elapsed_s * 1000},
+        )
     return CommandResponse(
         ok=True,
         reply="Still sculpting…",
@@ -540,6 +560,7 @@ async def voice(
             last_backend=session.last_backend,
             last_mesh_prompt=session.last_mesh_prompt,
             selection=_parse_selection(selection),
+            last_brief=session.last_brief,
         )
         result = await apply_intent(
             intent,

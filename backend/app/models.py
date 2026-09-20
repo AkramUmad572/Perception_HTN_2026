@@ -30,6 +30,8 @@ class Intent(BaseModel):
     size_mm: float | None = None
     # What's in the photo the user wants pulled from Drive.
     photo_query: str | None = None
+    apps: list[str] = Field(default_factory=list)
+    pull_kind: str | None = None
 
 
 class Selection(BaseModel):
@@ -111,6 +113,8 @@ class SessionState(BaseModel):
     scale: float = 1.0
     # Last Drive photo search; each item has id, name, preview_url, build_url.
     last_photos: list[dict[str, Any]] = Field(default_factory=list)
+    last_items: list[dict[str, Any]] = Field(default_factory=list)
+    last_brief: str | None = None
     # Project history the model on screen belongs to (app/projects.py).
     project_id: str | None = None
     version: int | None = None
@@ -143,3 +147,6 @@ class CommandResponse(BaseModel):
     # Set when action == "ui_mode": "lasso" | "tape" | "none". The client
     # calls setSelectMode/setTapeMode accordingly.
     ui_mode: str | None = None
+    apps: list[dict[str, Any]] = Field(default_factory=list)
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    progress: dict[str, Any] = Field(default_factory=dict)

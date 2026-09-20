@@ -484,6 +484,39 @@ async def apply_intent(
     response_backend = intent.backend or session.last_backend or "cad"
     candidates: list[dict] = []
 
+    if action in ("pull_app", "image_find", "pickup_work", "publish_work"):
+        from composio_app.runner import start_pull_job
+
+        if action == "publish_work":
+            intent.reply = "Sending this out…"
+        return start_pull_job(intent, session, settings, transcript)
+
+    if action == "build_from_brief":
+        brief = (session.last_brief or "").strip()
+        if not brief:
+            intent.reply = "I don't have a brief yet. Ask me to check Gmail or Notion first."
+            action = "clarify"
+        else:
+            intent.action = "generate"
+            intent.backend = "cad"
+            intent.script = None
+            # Fall through after rewriting the transcript-driven generate via parse? 
+            # Use the brief as a generate request by calling parse_intent.
+            from ai.intent import parse_intent as _parse
+
+            gen, gen_ms = await _parse(
+                f"build {brief[:240]}",
+                settings,
+                session.template,
+                session.params,
+                session.last_script,
+                last_summary=session.last_summary,
+                current_color=session.color,
+                last_backend="cad",
+            )
+            latency["brief_intent_ms"] = gen_ms
+            return await apply_intent(gen, session, settings, transcript=transcript, extra_latency=latency)
+
     if action == "find_photos":
         response_backend = "mesh"
         try:
@@ -1452,7 +1485,12 @@ async def build_chosen_photo(
         # Browsed-not-searched: only a Drive thumbnail was fetched so far.
         # Download and cut out the subject now, on the one photo picked.
         try:
-            raw, mime = await download_file(file_id, settings)
+            if ":" in file_id:
+                from composio_app.adapters import download_prefixed
+
+                raw, mime = await download_prefixed(file_id, settings)
+            else:
+                raw, mime = await download_file(file_id, settings)
         except Exception as exc:
             logger.warning("Drive download %s failed: %s", file_id, exc)
             reply = "I couldn't download that photo. Try another."

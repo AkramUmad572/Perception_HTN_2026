@@ -3,7 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
     <title>Perception CAD</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet" />
     <style>
       :root {
         color-scheme: dark;
@@ -131,6 +136,193 @@
       }
       #minimalStatus.debug-visible { display: block; }
       #minimalStatus.ok { color: var(--ok); }
+
+      #searchHud {
+        position: fixed;
+        top: 18%;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 14;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+        pointer-events: none;
+      }
+      #searchHud[hidden] { display: none !important; }
+      #searchCaption {
+        margin: 0;
+        font-size: 15px;
+        letter-spacing: 0.02em;
+        color: #f2f5ff;
+        text-shadow: 0 2px 16px rgba(0,0,0,0.45);
+      }
+      #searchChips { display: flex; gap: 14px; }
+      .search-chip {
+        width: 64px; height: 64px;
+        border-radius: 50%;
+        background: rgba(20,24,32,0.72);
+        border: 1px solid rgba(255,255,255,0.12);
+        display: flex; align-items: center; justify-content: center;
+        overflow: hidden;
+        opacity: 0.35;
+        transition: opacity 0.25s ease, transform 0.25s ease, box-shadow 0.25s ease;
+      }
+      .search-chip img { width: 34px; height: 34px; }
+      .search-chip span { display: none; }
+      .search-chip.live {
+        opacity: 1;
+        transform: scale(1.08);
+        box-shadow: 0 0 0 6px rgba(79,140,255,0.28);
+        animation: chipPulse 1.1s ease-in-out infinite;
+      }
+      .search-chip.done { opacity: 1; }
+      .search-chip.empty { opacity: 0.32; }
+      .search-chip.error { opacity: 0.4; filter: grayscale(0.6); }
+      @keyframes chipPulse {
+        0%, 100% { box-shadow: 0 0 0 4px rgba(79,140,255,0.18); }
+        50% { box-shadow: 0 0 0 10px rgba(79,140,255,0.32); }
+      }
+      #itemCards {
+        position: fixed;
+        top: 10%;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 13;
+        display: flex;
+        gap: 12px;
+        pointer-events: none;
+        max-width: min(920px, 94vw);
+      }
+      #itemCards[hidden] { display: none !important; }
+      .item-card {
+        background: rgba(16,20,28,0.86);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 16px;
+        padding: 16px 18px;
+        width: min(360px, 80vw);
+        backdrop-filter: blur(12px);
+      }
+      .item-kicker { margin: 0 0 6px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+      .item-card h2 { margin: 0 0 8px; font-size: 17px; }
+      .item-body { margin: 0; font-size: 13px; color: #c5cde0; line-height: 1.4; max-height: 7.2em; overflow: hidden; }
+      .item-meta { margin: 10px 0 0; font-size: 11px; color: var(--muted); }
+
+      #itemCards.gmail-window {
+        color-scheme: light;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0;
+        width: min(760px, 94vw);
+        max-height: 68vh;
+        overflow: auto;
+        background: #fff;
+        color: #202124;
+        border-radius: 8px;
+        box-shadow: 0 1px 2px rgba(60,64,67,.3), 0 2px 6px 2px rgba(60,64,67,.15);
+        font-family: Roboto, Arial, sans-serif;
+      }
+      .gmail-chrome {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 16px 6px;
+        color: #5f6368;
+        font-size: 13px;
+      }
+      .gmail-logo { width: 22px; height: 22px; }
+      .gmail-chrome-title { font-weight: 500; color: #5f6368; }
+      .gmail-count { margin-left: auto; font-size: 12px; }
+      .gmail-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        padding: 4px 10px 8px;
+        color: #5f6368;
+        border-bottom: 1px solid #e8eaed;
+      }
+      .gmail-toolbar span {
+        width: 32px; height: 32px;
+        display: grid; place-items: center;
+        border-radius: 50%;
+      }
+      .gmail-toolbar svg { width: 18px; height: 18px; fill: #5f6368; }
+      .gmail-subject {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 18px 24px 10px;
+        font-size: 22px;
+        font-weight: 400;
+        color: #1f1f1f;
+        line-height: 1.25;
+      }
+      .gmail-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        background: #e8f0fe;
+        color: #1967d2;
+        border-radius: 4px;
+        font-size: 12px;
+        font-weight: 500;
+        padding: 2px 8px;
+        white-space: nowrap;
+      }
+      .gmail-msg { padding: 4px 24px 8px; }
+      .gmail-who { display: flex; align-items: flex-start; gap: 12px; }
+      .gmail-avatar {
+        width: 40px; height: 40px; border-radius: 50%;
+        display: grid; place-items: center;
+        color: #fff; font-weight: 500; font-size: 16px; flex: 0 0 auto;
+      }
+      .gmail-from { font-size: 14px; font-weight: 700; color: #202124; }
+      .gmail-tome { font-size: 12px; color: #5f6368; margin-top: 2px; }
+      .gmail-time { margin-left: auto; font-size: 12px; color: #5f6368; white-space: nowrap; padding-top: 2px; }
+      .gmail-body {
+        margin: 14px 0 0 52px;
+        font-size: 14px;
+        line-height: 1.55;
+        color: #222;
+        white-space: pre-wrap;
+        max-height: 12em;
+        overflow: hidden;
+      }
+      .gmail-suggest { margin: 22px 0 0 52px; }
+      .gmail-suggest-label { font-size: 12px; color: #5f6368; margin-bottom: 8px; }
+      .gmail-suggest-chip {
+        display: inline-block;
+        border: 1px solid #dadce0;
+        border-radius: 16px;
+        padding: 8px 16px;
+        font-size: 14px;
+        color: #3c4043;
+        background: #fff;
+      }
+      .gmail-actions { display: flex; gap: 8px; margin: 16px 0 18px 52px; }
+      .gmail-btn {
+        border: 1px solid #dadce0;
+        border-radius: 18px;
+        padding: 7px 16px;
+        background: #fff;
+        color: #3c4043;
+        font-size: 14px;
+      }
+      .gmail-more { border-top: 1px solid #e8eaed; padding: 4px 0 8px; }
+      .gmail-row {
+        display: grid;
+        grid-template-columns: 40px minmax(110px, 160px) 1fr auto;
+        gap: 10px;
+        align-items: center;
+        padding: 10px 20px;
+        font-size: 14px;
+        color: #202124;
+      }
+      .gmail-row .gmail-avatar { width: 32px; height: 32px; font-size: 13px; }
+      .gmail-row-from { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .gmail-row-snip { color: #5f6368; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .gmail-row-snip b { color: #202124; font-weight: 700; }
+      .gmail-row-time { font-size: 12px; color: #5f6368; }
     </style>
   </head>
   <body>
@@ -157,8 +349,13 @@
 
       <!-- Minimal debug status (small text, only shown with ?debug) -->
       <div id="minimalStatus"></div>
+      <div id="searchHud" hidden>
+        <p id="searchCaption">Looking…</p>
+        <div id="searchChips"></div>
+      </div>
+      <div id="itemCards" hidden></div>
     </div>
 
-    <script type="module" src="/src/main.js"></script>
+    <script type="module" src="/src/main.js?v=gmail-inbox-2"></script>
   </body>
 </html>

@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     # Per-object version history: projects/<project_id>/v<N>.glb + info.json.
     projects_dir: Path = STORAGE / "projects"
     prefer_cadquery: bool = True
+    composio_api_key: str = ""
+    composio_user_id: str = ""
 
 
 @lru_cache

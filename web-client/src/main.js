@@ -18,6 +18,8 @@ import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { PercyAssistant } from "./voice/PercyAssistant.js";
 import { voiceState, VoiceStates } from "./voice/VoiceState.js";
 import { PhotoPicker } from "./PhotoPicker.js";
+import { SearchHUD } from "./SearchHUD.js";
+import { ItemPicker } from "./ItemPicker.js";
 import { realSize, realScaleFor } from "./interaction/measure.js";
 import {
   twoHandTransform,
@@ -218,6 +220,8 @@ const _forward = new THREE.Vector3();
 let grabbing = false;
 
 const photoPicker = new PhotoPicker(scene, () => camera);
+const searchHud = new SearchHUD(scene, () => camera);
+const itemPicker = new ItemPicker(scene, () => camera);
 
 function buildFromPickedPhoto(fileId) {
   photoPicker.keepOnly(fileId);
@@ -624,7 +628,7 @@ async function setModelFromResponse(data) {
   cadParams = data.cad_params || {};
   if (data.session?.project_id) currentProjectId = data.session.project_id;
   if (data.session?.project_id) lastProjectId = data.session.project_id;
-  if (data.action === "find_photos" || data.action === "browse_photos") {
+  if (data.action === "find_photos" || data.action === "browse_photos" || data.action === "searching" || data.action === "show_items" || data.action === "publishing") {
     return;
   }
   if (data.action === "ui_mode") {
@@ -1352,12 +1356,38 @@ const percy = new PercyAssistant({
       photoPicker.hide();
       return;
     }
+    searchHud.hide();
+    itemPicker.hide();
     photoPicker.show(cands, renderer).then(() => {
       setStatus("Pinch to pick a photo. Drag sideways to swipe.", true);
     }).catch((err) => {
       console.error("[Percy] Photo picker failed:", err);
       setStatus("Found the photo but couldn't show it.", false);
     });
+  },
+  onItems: (items) => {
+    if (!items || !items.length) {
+      itemPicker.hide();
+      return;
+    }
+    searchHud.hide();
+    photoPicker.hide();
+    itemPicker.show(items, renderer);
+    setStatus("Here it is.", true);
+  },
+  onJobProgress: (data) => {
+    if (!data) {
+      searchHud.hide();
+      return;
+    }
+    photoPicker.hide();
+    itemPicker.hide();
+    const apps = data.apps || data.progress?.apps || [];
+    if (!searchHud.isOpen) {
+      searchHud.show(apps, data.reply, renderer);
+    } else {
+      searchHud.update(apps, data.reply);
+    }
   },
   onTalkingChange: (talking) => {
     const mic = document.getElementById("micButton");
@@ -1419,7 +1449,9 @@ renderer.setAnimationLoop(() => {
   dimsLabel.follow(currentModel, camera);
   tape.update();
   const nowTick = performance.now();
-  photoPicker.tick((nowTick - lastTick) / 1000);
+  const dt = (nowTick - lastTick) / 1000;
+  photoPicker.tick(dt);
+  searchHud.tick(dt);
   lastTick = nowTick;
 
   if (!grabbing && !twoHandOn) {
@@ -1601,6 +1633,8 @@ fetch(`${API_BASE}/api/health`)
   });
 
 window.percyAssistant = percy;
+window.searchHud = searchHud;
+window.itemPicker = itemPicker;
 window.voiceState = voiceState;
 window.VoiceStates = VoiceStates;
 

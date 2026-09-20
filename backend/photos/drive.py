@@ -17,7 +17,7 @@ DRIVE_FILES = "https://www.googleapis.com/drive/v3/files"
 DRIVE_UC = "https://drive.google.com/uc"
 IMAGE_MIMES = ("image/jpeg", "image/png", "image/webp", "image/gif", "image/heic")
 _TIMEOUT = 45.0
-_FILE_ID_RE = re.compile(r"^[\w-]{8,128}$")
+_FILE_ID_RE = re.compile(r"^(?:[a-z]+:)?[\w.=-]{4,400}$")
 _CONFIRM_RE = re.compile(r"confirm=([0-9A-Za-z_-]+)")
 
 
