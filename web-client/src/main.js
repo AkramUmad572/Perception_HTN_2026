@@ -1575,18 +1575,20 @@ let lastTick = performance.now();
 const frameGuard = createFrameGuard();
 
 renderer.setAnimationLoop(() => {
-  if (needsUserPlacement && renderer.xr.isPresenting) {
-    placeFrameCount += 1;
-    if (placeFrameCount >= 3) {
-      placeModelInFrontOfUser(0.7);
-      needsUserPlacement = false;
-      setStatus("Hold left trigger to talk. Right pinch the model to move it.", true);
+  frameGuard("placeModel", () => {
+    if (needsUserPlacement && renderer.xr.isPresenting) {
+      placeFrameCount += 1;
+      if (placeFrameCount >= 3) {
+        placeModelInFrontOfUser(0.7);
+        needsUserPlacement = false;
+        setStatus("Hold left trigger to talk. Right pinch the model to move it.", true);
+      }
     }
-  }
+  });
 
-  layoutVoiceIndicator();
-
-  if (voiceIndicatorGroup.visible) {
+  frameGuard("voiceIndicator", () => {
+    layoutVoiceIndicator();
+    if (!voiceIndicatorGroup.visible) return;
     pulsePhase += 0.08;
     const state = voiceState.state;
     if (state === "listening") {
@@ -1603,7 +1605,7 @@ renderer.setAnimationLoop(() => {
       voiceRing.material.opacity = 0.85;
       voiceDot.material.opacity = 0.9;
     }
-  }
+  });
 
   // Each step is guarded: three.js re-queues the next frame only after this
   // callback returns, so one uncaught throw here would stop rendering for good
