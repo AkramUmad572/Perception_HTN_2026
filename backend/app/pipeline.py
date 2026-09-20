@@ -924,6 +924,12 @@ async def apply_intent(
 
         save_session(session)
 
+    elif action == "chat":
+        # Conversational reply — never touches model/session build state.
+        # rebuilt stays False; the shared tail below handles TTS + response
+        # construction exactly like it does for action="clarify" today.
+        pass
+
     if rebuilt and result_model_id and action in _VERSION_OPS:
         new_object = action == "create" or (
             action == "generate" and _is_new_object_request(transcript or "")

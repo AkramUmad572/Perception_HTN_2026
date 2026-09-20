@@ -21,6 +21,28 @@ const JOB_MAX_MS = 600000;
 // Polls are cheap, so ride out a few dropped ones before giving up on a build.
 const JOB_MAX_MISSES = 5;
 
+// Cached once granted so grounded chat answers ("how's the weather") can be
+// accurate for the user's real location. Requested lazily on first talk —
+// never blocks startup, and a denial just leaves this null (backend
+// degrades gracefully with no location).
+let _cachedLocation = null;
+let _locationRequested = false;
+
+function _requestLocationOnce() {
+  if (_locationRequested || _cachedLocation) return;
+  _locationRequested = true;
+  if (!("geolocation" in navigator)) return;
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      _cachedLocation = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+    },
+    (err) => {
+      console.info("[Percy] Geolocation unavailable/denied:", err.message);
+    },
+    { timeout: 8000, maximumAge: 600000 }
+  );
+}
+
 export class PercyAssistant {
   constructor(options = {}) {
     this.onModelUpdate = options.onModelUpdate || (() => {});
@@ -101,9 +123,40 @@ export class PercyAssistant {
     return muted;
   }
 
+  async greet() {
+    if (voiceState.isMuted) return;
+    try {
+      const localHour = new Date().getHours();
+      const data = await this._fetchJson(
+        `${API_BASE}/api/greet?session_id=${SESSION_ID}&local_hour=${localHour}`,
+        {},
+        15000
+      );
+      if (data.reply_audio_url) {
+        voiceState.toSpeaking();
+        this.onStatusMessage(data.reply, true);
+        try {
+          this.replyAudio = new Audio(data.reply_audio_url);
+          await new Promise((resolve) => {
+            this.replyAudio.onended = resolve;
+            this.replyAudio.onerror = resolve;
+            this.replyAudio.play().catch(resolve);
+          });
+        } catch (_) {}
+        voiceState.toIdle();
+      } else {
+        this.onStatusMessage(data.reply, true);
+      }
+    } catch (e) {
+      console.warn("[Percy] Greeting failed:", e);
+      // Non-fatal — silently skip the greeting rather than blocking AR entry.
+    }
+  }
+
   async beginTalk() {
     if (!this.started || voiceState.isMuted) return;
     if (voiceState.isListening || voiceState.isThinking) return;
+    _requestLocationOnce();
     this._cancelPending = false;
 
     if (this.replyAudio) {
@@ -204,12 +257,17 @@ export class PercyAssistant {
     form.append("session_id", SESSION_ID);
     const selection = this._takeSelection();
     if (selection) form.append("selection", JSON.stringify(selection));
+    if (_cachedLocation) {
+      form.append("lat", String(_cachedLocation.lat));
+      form.append("lon", String(_cachedLocation.lon));
+    }
 
     return this._fetchJson(`${API_BASE}/api/voice`, { method: "POST", body: form });
   }
 
   async sendTextCommand(text) {
     if (voiceState.isMuted) return null;
+    _requestLocationOnce();
 
     // A region edit on an active selection runs client-side (regionOps.js),
     // with no LLM round trip: parse the small local table first.
@@ -237,6 +295,10 @@ export class PercyAssistant {
       const body = { text, session_id: SESSION_ID };
       const selection = this._takeSelection();
       if (selection) body.selection = selection;
+      if (_cachedLocation) {
+        body.lat = _cachedLocation.lat;
+        body.lon = _cachedLocation.lon;
+      }
       const result = await this._postJson(`${API_BASE}/api/command`, body);
       await this._deliverResponse(result);
       return result;

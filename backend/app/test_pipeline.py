@@ -1119,6 +1119,54 @@ async def test_cad_generate_still_uses_sandbox():
     print("  [ok] CAD generate uses sandbox only")
     return 1, 0
 
+
+async def test_chat_action_never_touches_build_state():
+    """A conversational reply must not rebuild or mutate session model state."""
+    print("\n=== Test: chat action leaves build state untouched ===")
+    session = SessionState(
+        session_id="test",
+        model_id="old_model_123",
+        glb_url="/media/glb/old_model_123.glb",
+        last_script='import cadquery as cq\nresult = cq.Workplane("XY").box(10, 10, 5)',
+        last_backend="cad",
+        color="#C0C0C0",
+    )
+    intent = Intent(
+        action="chat",
+        reply="It's sunny and 22 degrees, sir.",
+    )
+    settings = _mock_settings()
+
+    with patch("app.pipeline._execute_with_retry") as mock_cad:
+        with patch("app.pipeline.generate_mesh_glb") as mock_mesh:
+            with patch("app.pipeline.synthesize_speech") as mock_tts:
+                mock_tts.return_value = (None, 0.0)
+                with patch("app.pipeline.save_session"):
+                    result = await apply_intent(intent, session, settings)
+
+    errors = []
+    if mock_cad.called:
+        errors.append("chat must not touch the CAD sandbox")
+    if mock_mesh.called:
+        errors.append("chat must not touch the mesh factory")
+    if result.rebuilt:
+        errors.append("rebuilt should be False for a chat reply")
+    if session.model_id != "old_model_123" or session.glb_url != "/media/glb/old_model_123.glb":
+        errors.append("chat must not mutate session.model_id/glb_url")
+    if result.reply != intent.reply:
+        errors.append(f"reply should pass through unchanged, got {result.reply!r}")
+    if result.action != "chat":
+        errors.append(f"action should stay 'chat', got {result.action!r}")
+
+    if errors:
+        print("  [FAIL]")
+        for e in errors:
+            print(f"    - {e}")
+        return 0, 1
+    print("  [ok] chat reply leaves model/session build state untouched")
+    return 1, 0
+
+
 # ============================================================================
 # WS-A: project versions
 # ============================================================================
@@ -1471,6 +1519,10 @@ def run_all_tests():
         total_fail += f
 
         p, f = loop.run_until_complete(test_cad_generate_still_uses_sandbox())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_chat_action_never_touches_build_state())
         total_pass += p
         total_fail += f
 

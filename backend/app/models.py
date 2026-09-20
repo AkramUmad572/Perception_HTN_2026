@@ -46,6 +46,10 @@ class CommandRequest(BaseModel):
     text: str
     session_id: str = "default"
     selection: Selection | None = None
+    # Browser geolocation, when granted — lets grounded chat answers (e.g.
+    # "how's the weather") be accurate for the user's actual location.
+    lat: float | None = None
+    lon: float | None = None
 
 
 class PhotoChooseRequest(BaseModel):

@@ -42,7 +42,7 @@ from app.pipeline import (
 from app.session import clear_session, get_session
 from mesh.refimage import isolate_subject
 from photos.drive import ensure_local_file, valid_file_id
-from voice.speech import transcribe_audio
+from voice.speech import synthesize_speech, transcribe_audio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("perception_cad")
@@ -167,6 +167,42 @@ async def reset_session(session_id: str = "default"):
     return get_session(session_id)
 
 
+def _time_of_day_greeting(hour: int) -> str:
+    if 5 <= hour < 12:
+        period = "Good morning"
+    elif 12 <= hour < 17:
+        period = "Good afternoon"
+    else:
+        period = "Good evening"
+    return f"{period}, sir. What would you like to work on today?"
+
+
+@app.get("/api/greet", response_model=CommandResponse)
+async def greet(session_id: str = "default", local_hour: int | None = None):
+    """
+    Deterministic, no-LLM greeting for the moment the user enters AR.
+
+    `local_hour` (0-23), from the client's `new Date().getHours()`, is used
+    instead of server time — the server's timezone won't generally match the
+    user's. Falls back to server local time if omitted.
+    """
+    import datetime
+
+    session = get_session(session_id)
+    hour = local_hour if local_hour is not None else datetime.datetime.now().hour
+    hour = max(0, min(23, hour))
+    reply = _time_of_day_greeting(hour)
+    audio_url, tts_ms = await synthesize_speech(reply, settings)
+    return CommandResponse(
+        ok=True,
+        reply=reply,
+        action="greet",
+        session=session,
+        reply_audio_url=audio_url,
+        latency_ms={"tts_ms": tts_ms},
+    )
+
+
 @app.get("/api/projects/{project_id}")
 async def project_info(project_id: str):
     """Version history of one project. Read-only."""
@@ -281,6 +317,9 @@ async def project_resize(project_id: str, body: ResizeRequest):
 async def command(body: CommandRequest):
     t_all = time.perf_counter()
     session = get_session(body.session_id)
+    location = (
+        f"{body.lat},{body.lon}" if body.lat is not None and body.lon is not None else None
+    )
     intent, intent_ms = await parse_intent(
         body.text,
         settings,
@@ -293,6 +332,7 @@ async def command(body: CommandRequest):
         last_mesh_prompt=session.last_mesh_prompt,
         selection=body.selection,
         last_brief=session.last_brief,
+        location=location,
     )
     result = await apply_intent(
         intent,
@@ -521,9 +561,12 @@ async def voice(
     audio: UploadFile = File(...),
     session_id: str = Form("default"),
     selection: str | None = Form(None),
+    lat: float | None = Form(None),
+    lon: float | None = Form(None),
 ):
     t_all = time.perf_counter()
     session = get_session(session_id)
+    location = f"{lat},{lon}" if lat is not None and lon is not None else None
     try:
         raw = await audio.read()
         if not raw or len(raw) < 200:
@@ -561,6 +604,7 @@ async def voice(
             last_mesh_prompt=session.last_mesh_prompt,
             selection=_parse_selection(selection),
             last_brief=session.last_brief,
+            location=location,
         )
         result = await apply_intent(
             intent,

@@ -20,12 +20,15 @@ from ai.intent import (
     _build_user_payload,
     _check_color_only,
     _compose_mesh_prompt,
+    _has_cad_force,
+    _has_mesh_cue,
     _is_new_object_request,
     _normalize_transcript,
     _normalize_wake_word,
     _parse_json_response,
     choose_backend,
     extract_named_color,
+    is_chat_like,
 )
 import ai.intent as intent_mod
 
@@ -894,6 +897,116 @@ def test_photo_search_fast_path():
     return passed, failed
 
 
+def test_chat_overrides_active_session():
+    """
+    Chat must win even when a mesh/CAD session is already in progress — and
+    must NOT steal a genuine new-object build request that happens to share
+    a keyword with a chat cue (e.g. "weather").
+
+    This regression exists because choose_backend()'s sticky-session rule
+    (`if session == "mesh" and not is_new: return "mesh"`) returns early from
+    parse_intent BEFORE the general chat gate is ever reached — caught via a
+    live browser test, not the regex-only checks above.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    print("\n=== Test: chat overrides active session / new-object veto ===")
+    passed = failed = 0
+    settings = SimpleNamespace(gemini_api_key="", openai_api_key="")  # keyless → canned chat reply
+
+    async def _run(text, last_backend, current_script=None):
+        return (
+            await intent_mod.parse_intent(
+                text,
+                settings,
+                None,
+                {},
+                current_script=current_script,
+                last_backend=last_backend,
+            )
+        )[0]
+
+    # Mid mesh-session, a live-data question must route to chat, not a
+    # "sculpt this new prompt" mesh follow-up.
+    intent = asyncio.run(_run("how's the weather today", "mesh"))
+    if intent.action == "chat":
+        print("  [ok] weather question during active mesh session → chat")
+        passed += 1
+    else:
+        print(f"  [FAIL] mesh session weather question got action={intent.action!r}")
+        failed += 1
+
+    # Mid CAD-session, a capability question must route to chat too.
+    intent = asyncio.run(
+        _run("what can you do", "cad", current_script="import cadquery as cq\nresult = cq.Workplane('XY').box(1,1,1)")
+    )
+    if intent.action == "chat":
+        print("  [ok] capability question during active CAD session → chat")
+        passed += 1
+    else:
+        print(f"  [FAIL] CAD session capability question got action={intent.action!r}")
+        failed += 1
+
+    # A genuine new-object build request that happens to contain a live-data
+    # keyword must stay on the build path, not get swallowed by chat.
+    intent = asyncio.run(_run("build me a weather vane", None))
+    if intent.action != "chat":
+        print(f"  [ok] 'build me a weather vane' stays off chat (action={intent.action!r})")
+        passed += 1
+    else:
+        print("  [FAIL] 'build me a weather vane' incorrectly routed to chat")
+        failed += 1
+
+    return passed, failed
+
+
+def test_chat_fast_path():
+    """Conversational Q&A must be caught by is_chat_like, but never steal a build/edit command."""
+    print("\n=== Test: chat fast path ===")
+    passed = failed = 0
+
+    # These should look conversational, with no CAD/mesh cue to veto them.
+    chat_cases = [
+        "how's the weather today",
+        "what can you do",
+        "hey percy how are you",
+        "what's the weather like right now",
+        "who are you",
+    ]
+    for text in chat_cases:
+        chat_like = is_chat_like(text)
+        vetoed = _has_cad_force(text) or _has_mesh_cue(text)
+        ok = chat_like and not vetoed
+        if ok:
+            print(f"  [ok] chat: {text!r}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} chat_like={chat_like} vetoed={vetoed}")
+            failed += 1
+
+    # These must NOT be routed to chat — build/edit commands, even when
+    # phrased as a question, must stay on the CAD/mesh path.
+    build_cases = [
+        "build me a box",
+        "make it bigger",
+        "can you build me a mug",
+        "make the ears black",
+    ]
+    for text in build_cases:
+        chat_like = is_chat_like(text)
+        vetoed = _has_cad_force(text) or _has_mesh_cue(text)
+        would_route_to_chat = chat_like and not vetoed
+        if not would_route_to_chat:
+            print(f"  [ok] stays on build path: {text!r}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} incorrectly routed to chat")
+            failed += 1
+
+    return passed, failed
+
+
 def test_history_rung():
     """'undo' / 'go back two' / 'redo' finish in the router with no network call."""
     print("\n=== Test: undo/redo rung ===")
@@ -1024,6 +1137,8 @@ def run_all_tests():
     m_pass, m_fail = test_parse_intent_mesh_routes_without_llm()
     s_pass, s_fail = test_scale_fast_path()
     ph_pass, ph_fail = test_photo_search_fast_path()
+    ch_pass, ch_fail = test_chat_fast_path()
+    co_pass, co_fail = test_chat_overrides_active_session()
     h_pass, h_fail = test_history_rung()
     a_pass, a_fail = test_absolute_size()
     mb_pass, mb_fail = test_mesh_boolean_rung()
@@ -1032,11 +1147,11 @@ def run_all_tests():
 
     total_pass = (
         w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass
-        + h_pass + a_pass + mb_pass + sel_pass + ui_pass
+        + ch_pass + co_pass + h_pass + a_pass + mb_pass + sel_pass + ui_pass
     )
     total_fail = (
         w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail
-        + h_fail + a_fail + mb_fail + sel_fail + ui_fail
+        + ch_fail + co_fail + h_fail + a_fail + mb_fail + sel_fail + ui_fail
     )
 
     print("\n" + "=" * 60)
@@ -1050,6 +1165,8 @@ def run_all_tests():
     print(f"Mesh parse_intent:          {m_pass}/{m_pass + m_fail} passed")
     print(f"Resize fast path:           {s_pass}/{s_pass + s_fail} passed")
     print(f"Photo search:               {ph_pass}/{ph_pass + ph_fail} passed")
+    print(f"Chat fast path:             {ch_pass}/{ch_pass + ch_fail} passed")
+    print(f"Chat overrides session:     {co_pass}/{co_pass + co_fail} passed")
     print(f"Undo/redo rung:             {h_pass}/{h_pass + h_fail} passed")
     print(f"Absolute size:              {a_pass}/{a_pass + a_fail} passed")
     print(f"Mesh boolean rung:          {mb_pass}/{mb_pass + mb_fail} passed")

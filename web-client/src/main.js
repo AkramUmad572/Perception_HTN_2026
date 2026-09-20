@@ -212,6 +212,7 @@ let currentModel = null;
 let currentColor = "#C0C0C0";
 let needsUserPlacement = false;
 let placeFrameCount = 0;
+let hasGreeted = false;
 const loader = new GLTFLoader();
 
 const _camPos = new THREE.Vector3();
@@ -750,6 +751,14 @@ renderer.xr.addEventListener("sessionstart", () => {
   placeFrameCount = 0;
   if (!currentModel) placeholder.visible = true;
   setStatus("Entering passthrough AR…", true);
+
+  // AR entry is the only point guaranteed to follow a real user gesture
+  // (the "Enter AR" tap), which is what lets the greeting's audio actually
+  // play — browsers block autoplay without one.
+  if (!hasGreeted && !voiceState.isMuted) {
+    hasGreeted = true;
+    percy.greet();
+  }
 });
 
 renderer.xr.addEventListener("sessionend", () => {

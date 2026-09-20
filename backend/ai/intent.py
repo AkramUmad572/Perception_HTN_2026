@@ -411,6 +411,75 @@ _CAD_OBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Conversational Q&A cues — greetings, capability questions, live-data asks.
+# This is a heuristic gate, not a classifier: it only needs to catch the
+# common phrasings ("how's the weather", "what can you do", "hey percy how
+# are you") without firing on build/edit commands. False negatives (a chat-ish
+# utterance that falls through to codegen and gets a clarify/junk CAD reply)
+# are an acceptable, non-blocking tradeoff.
+_CHAT_GREETING_RE = re.compile(
+    r"^\s*(?:hey\s+percy[,.\s]*)?(?:hi|hello|hey|good\s*(?:morning|afternoon|evening))\b",
+    re.IGNORECASE,
+)
+_CHAT_CAPABILITY_RE = re.compile(
+    r"\bwhat\s+can\s+you\s+do\b|\bwho\s+are\s+you\b|\bwhat\s+are\s+you\b|"
+    r"\bhow\s+(?:are|do)\s+you\b|\bwhat's\s+up\b",
+    re.IGNORECASE,
+)
+_CHAT_LIVE_DATA_RE = re.compile(
+    r"\bweather\b|\bforecast\b|\btemperature\s+(?:outside|today|now)\b|"
+    r"\bnews\b|\bwhat\s+time\s+is\s+it\b|\bwhat's\s+the\s+date\b|"
+    r"\bscore\b|\bstock\b|\bnearby\b|\brestaurants?\s+near\b",
+    re.IGNORECASE,
+)
+# Bare question words, only when the sentence has no build/CAD cues at all —
+# this is the riskiest signal (highest false-positive rate), so it is gated
+# by "no CAD force, no mesh cue" at the call site too.
+_CHAT_QUESTION_RE = re.compile(
+    r"^\s*(?:hey\s+percy[,.\s]*)?(?:what|who|when|where|why|how|is|are|can|do|does|did)\b.*\?\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_strong_chat_signal(text: str) -> bool:
+    """
+    Unambiguous conversation cues only (greeting / capability / live-data) —
+    no bare-question fallback. Safe to check even during an active mesh/CAD
+    session, where a question-shaped utterance ("can you make it bigger?")
+    is far more likely to be a build follow-up than genuine chat. Callers
+    must also check `_has_cad_force`/`_has_mesh_cue`.
+    """
+    t = text.strip()
+    if not t:
+        return False
+    return bool(
+        _CHAT_GREETING_RE.search(t)
+        or _CHAT_CAPABILITY_RE.search(t)
+        or _CHAT_LIVE_DATA_RE.search(t)
+    )
+
+
+def is_chat_like(text: str) -> bool:
+    """
+    Heuristic: does this utterance look like conversation, not a build/edit
+    command? Includes the bare-question fallback on top of
+    `is_strong_chat_signal` — only safe to use once session-continuation
+    paths (mesh follow-up, CAD color/scale) have already had first claim.
+    Callers must also check `_has_cad_force`/`_has_mesh_cue` so a
+    question-shaped build request ("can you build me a mug?") never gets
+    routed to chat.
+    """
+    t = text.strip()
+    if not t:
+        return False
+    if _CHAT_GREETING_RE.search(t) or _CHAT_CAPABILITY_RE.search(t):
+        return True
+    if _CHAT_LIVE_DATA_RE.search(t):
+        return True
+    if _CHAT_QUESTION_RE.search(t):
+        return True
+    return False
+
 
 def _has_cad_force(text: str) -> bool:
     return bool(_CAD_FORCE_RE.search(text))
@@ -1153,6 +1222,113 @@ async def generate_code(
     )
 
 
+CHAT_SYSTEM_PROMPT = """You are Percy, a voice-controlled CAD/AR assistant with a
+JARVIS-like personality. You address the user as "sir." You are speaking OUT LOUD
+through text-to-speech, so:
+- No markdown, no bullet points, no headings, no asterisks.
+- 1-3 short sentences. Say the number, not a citation footnote.
+- Warm, capable, concise — never a wall of text.
+
+You can also build and edit 3D objects (CAD parts and organic sculpted meshes) by
+voice, and find/pull photos from the user's Google Drive. If asked what you can do,
+mention that briefly in plain spoken language.
+
+If the user's question needs current information (weather, news, time, scores,
+prices), use the search tool and answer with the real, current answer — do not say
+you don't have access to the internet. If you need a location and none was given,
+ask which city, in one short sentence.
+"""
+
+
+async def generate_chat_reply(
+    text: str,
+    settings: Settings,
+    location: str | None = None,
+) -> Intent:
+    """
+    Grounded conversational reply via Gemini + google_search.
+
+    Deliberately does NOT force responseMimeType=application/json — grounded
+    responses are prose with citations, not clean JSON. Reply text is used
+    as-is; no schema is expected from the model.
+    """
+    if not settings.gemini_api_key:
+        return Intent(
+            action="chat",
+            reply="I can't reach live information right now, sir — no API key configured.",
+        )
+
+    model = settings.gemini_model
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    client = get_http_client()
+
+    user_text = text
+    if location:
+        user_text = f"{text}\n\n(User's approximate location: {location})"
+
+    payload = {
+        "system_instruction": {"parts": [{"text": CHAT_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.4},
+    }
+
+    try:
+        resp = await client.post(
+            url,
+            params={"key": settings.gemini_api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        reply = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        ).strip()
+        if not reply:
+            raise RuntimeError("Empty grounded response")
+        return Intent(action="chat", reply=reply)
+    except Exception as exc:
+        logger.warning("Grounded chat call failed (%s); falling back to ungrounded", exc)
+
+    # Fallback: same model, no tools, no location dependency — still tries to
+    # be useful (personality-only) rather than a hard failure mid-demo.
+    try:
+        payload_fallback = {
+            "system_instruction": {"parts": [{"text": CHAT_SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": text}]}],
+            "generationConfig": {"temperature": 0.4},
+        }
+        resp = await client.post(
+            url,
+            params={"key": settings.gemini_api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload_fallback,
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        reply = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        ).strip()
+        if reply:
+            return Intent(action="chat", reply=reply)
+    except Exception as exc2:
+        logger.warning("Ungrounded chat fallback also failed: %s", exc2)
+
+    return Intent(
+        action="chat",
+        reply="I can't reach live data right now, sir. Try again in a moment.",
+    )
+
+
 def _unavailable_or_mesh_intent(
     text: str,
     settings: Settings,
@@ -1181,6 +1357,7 @@ async def parse_intent(
     last_mesh_prompt: str | None = None,
     selection: Selection | None = None,
     last_brief: str | None = None,
+    location: str | None = None,
 ) -> tuple[Intent, float]:
     """
     Parse user utterance into Intent (CadQuery script or mesh prompt).
@@ -1189,7 +1366,9 @@ async def parse_intent(
     1. Normalize STT errors
     2. Route cad vs mesh (CAD cues, organic cues, session)
     3. Fast path: named color only on CAD sessions
-    4. Mesh: skip sandbox codegen. CAD: LLM script, new object drops current_script.
+    4. Conversational Q&A (greetings, capability/live-data questions) —
+       only when nothing above claimed the utterance as a build/edit command.
+    5. Mesh: skip sandbox codegen. CAD: LLM script, new object drops current_script.
 
     `selection` is what the client last pointed at (interaction/selection.js).
     On a mesh session it can turn "drill a hole" into a mesh_boolean edit
@@ -1213,12 +1392,15 @@ async def parse_intent(
         logger.info("Fast path: ui_mode %s", ui_mode_intent.params["mode"])
         return ui_mode_intent, (time.perf_counter() - t0) * 1000
 
-    object_hint = " ".join(x for x in (last_mesh_prompt, last_summary, current_template) if x)
-    routed = route_composio(cleaned, has_brief=bool(last_brief), object_hint=object_hint or None)
-    if routed:
-        logger.info("Composio router → %s apps=%s kind=%s", routed.action, routed.apps, routed.pull_kind)
-        return routed, (time.perf_counter() - t0) * 1000
-
+    # The local demo-folder photo search/browse takes priority over the
+    # Composio app router. Both trigger on "photos"/"drive" phrasing with no
+    # clean disambiguating signal between them ("open up my google drive
+    # photos" vs. "find pikachu in my google drive" look the same to a
+    # regex) — this ordering was chosen so the photo picker stays reachable
+    # by voice, at the cost of some Composio Drive/Photos search phrasing
+    # (composio_app/test_router.py's own fixtures) now landing here instead
+    # of at Composio. Revisit if Composio's Drive/Photos search needs to win
+    # more often than the demo-folder picker does.
     if is_photo_search(cleaned):
         query = photo_query(cleaned)
         if is_browse_all_query(query):
@@ -1238,6 +1420,12 @@ async def parse_intent(
             (time.perf_counter() - t0) * 1000,
         )
 
+    object_hint = " ".join(x for x in (last_mesh_prompt, last_summary, current_template) if x)
+    routed = route_composio(cleaned, has_brief=bool(last_brief), object_hint=object_hint or None)
+    if routed:
+        logger.info("Composio router → %s apps=%s kind=%s", routed.action, routed.apps, routed.pull_kind)
+        return routed, (time.perf_counter() - t0) * 1000
+
     is_new = _is_new_object_request(cleaned)
     session_backend = last_backend or ("cad" if current_script or current_template else None)
     routed = choose_backend(
@@ -1246,6 +1434,22 @@ async def parse_intent(
         is_new_object=is_new,
     )
     logger.info("Router → %s (session=%s new=%s)", routed, session_backend, is_new)
+
+    # Unambiguous conversation cues (greeting/capability/live-data) win even
+    # over an active mesh/CAD session — otherwise "how's the weather" right
+    # after building a sculpt gets treated as a follow-up sculpt tweak
+    # instead of a chat question. `not is_new` keeps genuine build requests
+    # that happen to contain a live-data word ("build me a weather vane")
+    # on the build path.
+    if (
+        is_strong_chat_signal(cleaned)
+        and not is_new
+        and not _has_cad_force(cleaned)
+        and not _has_mesh_cue(cleaned)
+    ):
+        chat_intent = await generate_chat_reply(cleaned, settings, location=location)
+        logger.info("Chat path (session override) → action=%s", chat_intent.action)
+        return chat_intent, (time.perf_counter() - t0) * 1000
 
     if session_backend == "mesh" and not is_new:
         # Above clarify_mesh: hole / loop / flat base are deterministic booleans,
@@ -1289,6 +1493,20 @@ async def parse_intent(
         else:
             logger.info("Fast path: color clarify")
         return color_intent, (time.perf_counter() - t0) * 1000
+
+    # Conversational Q&A — only when nothing above claimed this utterance as
+    # a build/edit/resize/color command, and it doesn't carry a hard CAD/mesh
+    # cue or new-object phrasing (so "can you build me a mug?" / "build me a
+    # weather vane" stay on the CAD path despite matching a chat cue).
+    if (
+        is_chat_like(cleaned)
+        and not is_new
+        and not _has_cad_force(cleaned)
+        and not _has_mesh_cue(cleaned)
+    ):
+        chat_intent = await generate_chat_reply(cleaned, settings, location=location)
+        logger.info("Chat path → action=%s", chat_intent.action)
+        return chat_intent, (time.perf_counter() - t0) * 1000
 
     script_for_llm = current_script
     if current_script and is_new:
