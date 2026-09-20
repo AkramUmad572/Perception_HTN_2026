@@ -21,6 +21,7 @@ from cad.params import extract_params as extract_cad_params
 from cad.params import set_params as set_cad_params
 from cad.sandbox import execute_cadquery_script
 from cad.builder import merge_params, build_model
+from mesh.edit import EditError, edit_image
 from mesh.factory import (
     generate_mesh_glb,
     generate_mesh_glb_from_image,
@@ -1308,6 +1309,112 @@ async def _cad_from_photo(
         session.last_summary = intent.reply
         save_session(session)
     return success, model_id, error
+
+
+_EDIT_NO_PROJECT = "I can't find that model's history."
+_EDIT_NOT_MESH = "I can only do that to a sculpted model."
+_EDIT_FAILED = "That change didn't work. The model is unchanged."
+
+
+async def apply_semantic_edit(
+    session: SessionState,
+    settings: Settings,
+    project_id: str,
+    png: bytes,
+    instruction: str,
+) -> CommandResponse:
+    """
+    Edit a render of the current sculpt with Gemini, then rebuild a mesh from
+    the edited picture.
+
+    The headset supplies the PNG with the circle already drawn on it, so
+    nothing here needs the camera, the selection, or the model's transform —
+    every coordinate-space question stays on the side that has the answers.
+
+    Appends exactly one version on success and nothing at all on failure: a
+    semantic edit never destroys what is on screen. `parent` is set by
+    append_version, so undo returns to the pre-edit sculpt, which is the only
+    real mitigation for the identity drift this approach carries.
+    """
+    current = projects.current_version(settings, project_id)
+    if current is None:
+        return CommandResponse(
+            ok=False, reply=_EDIT_NO_PROJECT, action="clarify", session=session,
+            error=f"Unknown project {project_id}",
+        )
+    if current.kind != "mesh":
+        return CommandResponse(
+            ok=False, reply=_EDIT_NOT_MESH, action="clarify", session=session,
+            error="Not a mesh project",
+        )
+
+    latency: dict[str, float] = {}
+    try:
+        t0 = time.perf_counter()
+        edited = await edit_image(png, instruction, settings)
+        latency["image_edit_ms"] = (time.perf_counter() - t0) * 1000
+    except EditError as err:
+        return CommandResponse(
+            ok=False, reply=f"{err}.", action="clarify", session=session, error=str(err),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Semantic edit failed: %s", type(exc).__name__)
+        return CommandResponse(
+            ok=False, reply=_EDIT_FAILED, action="clarify", session=session, error=str(exc),
+        )
+
+    # Staged in ref_dir because the three.ws fallback fetches by public URL;
+    # the HF Space path (tried first) reads the local file directly.
+    ref_name = f"edit_{uuid.uuid4().hex[:12]}.png"
+    ref_path = Path(settings.ref_dir) / ref_name
+    try:
+        ref_path.write_bytes(edited)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Could not stage the edited image: %s", type(exc).__name__)
+        return CommandResponse(
+            ok=False, reply=_EDIT_FAILED, action="clarify", session=session, error=str(exc),
+        )
+
+    public_url = f"{settings.public_base_url.rstrip('/')}/media/ref/{ref_name}"
+    try:
+        t0 = time.perf_counter()
+        result = await generate_mesh_glb_from_image(
+            public_url,
+            settings.glb_dir,
+            prompt=instruction,
+            image_path=ref_path,
+            hf_token=getattr(settings, "hf_token", "") or "",
+            hf_space=bool(getattr(settings, "hf_space_enabled", True)),
+            three_ws=bool(getattr(settings, "three_ws_enabled", True)),
+        )
+        latency["mesh_ms"] = result.get("exec_ms", (time.perf_counter() - t0) * 1000)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Semantic edit mesh build failed: %s", type(exc).__name__)
+        return CommandResponse(
+            ok=False, reply=_EDIT_FAILED, action="clarify", session=session, error=str(exc),
+        )
+
+    if not result.get("ok") or not result.get("glb_path"):
+        return CommandResponse(
+            ok=False, reply=_EDIT_FAILED, action="clarify", session=session,
+            error=str(result.get("error") or "Mesh build returned no model"),
+        )
+
+    info = projects.append_version(
+        settings, project_id, Path(result["glb_path"]),
+        op="semantic_edit", summary=instruction, mesh_prompt=instruction,
+    )
+    restore_version(session, info)
+
+    reply = "Done."
+    audio_url, tts_ms = await synthesize_speech(reply, settings)
+    latency["tts_ms"] = tts_ms or 0.0
+    return CommandResponse(
+        ok=True, reply=reply, action="semantic_edit", rebuilt=True,
+        glb_url=info.glb_url, model_id=session.model_id,
+        reply_audio_url=audio_url, session=session, latency_ms=latency,
+        textured=True, backend="mesh", display_size_m=_display_size_m(session),
+    )
 
 
 async def build_from_image(

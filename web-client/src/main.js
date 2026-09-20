@@ -40,6 +40,9 @@ import {
   paramPanelLines,
 } from "./interaction/paramPanel.js";
 import { selectionFromStroke, isTapRelease } from "./interaction/selection.js";
+import { planPartEdit } from "./interaction/partEdit.js";
+import { ndcToPixels, circleRadiusPx, clampCircle } from "./interaction/viewCapture.js";
+import { createFrameGuard } from "./interaction/frameGuard.js";
 import {
   scaleRegion,
   pullRegion,
@@ -705,8 +708,14 @@ async function setModelFromResponse(data) {
       lastBackend = data.backend || (textured ? "mesh" : "cad");
       refreshDimensions();
       tape.clear();
+      // Re-point at the same part after a rebuild the user just caused, so a
+      // run of edits ("longer"... "longer") keeps working. Without this the
+      // selection died on every swap and the next command fell through.
+      const keepPart = percy.selection?.parts?.[0] || null;
       clearSelectionHighlight();
       percy.clearSelection();
+      const again = keepPart ? reselectPartByName(keepPart) : null;
+      if (again) percy.setSelection(again);
       photoPicker.hide();
 
       if (wasGrabbing && savedOffset && savedSource) {
@@ -1355,10 +1364,156 @@ async function applyRegionCommand(cmd, selection, text) {
   return res.json();
 }
 
+/**
+ * A PNG of what the user is looking at, with a red circle drawn where they
+ * pinched. The circle is what tells the image model where to make the change;
+ * it was verified not to appear in the edited output.
+ *
+ * Rendering here rather than server-side keeps it WYSIWYG and makes the 3D to
+ * 2D conversion free: the camera is right here.
+ */
+async function captureViewWithCircle(selection) {
+  if (!currentModel || !selection) return null;
+  const W = 1024;
+  const H = 1024;
+
+  // Render the MODEL only. renderer.render(scene, ...) would also draw the
+  // voice indicator, the dimensions label, the param panel and the tracked
+  // hand meshes, and Gemini would faithfully edit a picture of the model with
+  // floating hands and text labels in it. Hide every top-level child that is
+  // not the model or a light, then put it all back.
+  const hidden = [];
+  for (const child of scene.children) {
+    if (child === modelRoot || child.isLight) continue;
+    if (child.visible) {
+      hidden.push(child);
+      child.visible = false;
+    }
+  }
+  // These two are parented to currentModel, so the loop above misses them.
+  // Hide them explicitly rather than relying on the clear-order of whoever
+  // consumed the selection.
+  for (const marker of [selectionMarker, hoverMarker]) {
+    if (marker.visible) {
+      hidden.push(marker);
+      marker.visible = false;
+    }
+  }
+  const prevBg = scene.background;
+  scene.background = new THREE.Color(0xffffff);
+
+  const rt = new THREE.WebGLRenderTarget(W, H);
+  const prevTarget = renderer.getRenderTarget();
+  let buf;
+  try {
+    renderer.setRenderTarget(rt);
+    renderer.render(scene, camera);
+    buf = new Uint8Array(W * H * 4);
+    renderer.readRenderTargetPixels(rt, 0, 0, W, H, buf);
+  } finally {
+    renderer.setRenderTarget(prevTarget);
+    rt.dispose();
+    scene.background = prevBg;
+    for (const child of hidden) child.visible = true;
+  }
+
+  // readRenderTargetPixels is bottom-up; a canvas is top-down.
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(W, H);
+  for (let y = 0; y < H; y++) {
+    const src = (H - 1 - y) * W * 4;
+    img.data.set(buf.subarray(src, src + W * 4), y * W * 4);
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const world = currentModel.localToWorld(
+    new THREE.Vector3(selection.center[0], selection.center[1], selection.center[2])
+  );
+  const ndc = world.project(camera);
+  const px = ndcToPixels(ndc, W, H);
+  const c = clampCircle(px.x, px.y, circleRadiusPx(W, H), W, H);
+
+  ctx.strokeStyle = "#ff0000";
+  ctx.lineWidth = Math.max(4, c.r * 0.06);
+  ctx.beginPath();
+  ctx.arc(c.cx, c.cy, c.r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+}
+
+/**
+ * Capture the view and hand it to the semantic-edit route. Returns null when
+ * it cannot (no sculpt, no project, capture failed), in which case Percy keeps
+ * the router's original answer instead.
+ */
+async function applySemanticEdit(text, selection) {
+  if (lastBackend !== "mesh" || !currentProjectId) return null;
+  try {
+    const blob = await captureViewWithCircle(selection);
+    if (!blob) return null;
+    setStatus("Working on that…", true);
+    return await percy.postSemanticEdit(currentProjectId, blob, text);
+  } catch (e) {
+    console.error("[Percy] Semantic edit failed:", e);
+    setStatus("That change didn't work.", false);
+    return null;
+  }
+}
+
+/**
+ * Re-establish a selection on a named part of the freshly-loaded model.
+ *
+ * Returns a Selection shaped exactly like selectionFromStroke's, centred on
+ * the part's bounding box, or null when that part no longer exists (a codegen
+ * rebuild may have renamed or removed it).
+ */
+function reselectPartByName(part) {
+  if (!currentModel || !part) return null;
+  const node = currentModel.getObjectByName(part);
+  if (!node) return null;
+  const box = new THREE.Box3().setFromObject(node);
+  if (box.isEmpty()) return null;
+  const mid = box.getCenter(new THREE.Vector3());
+  const local = currentModel.worldToLocal(mid.clone());
+  return {
+    parts: [part],
+    center: [local.x, local.y, local.z],
+    normal: [0, 1, 0],
+    radius: 0,
+  };
+}
+
+/**
+ * A dimensional edit on the selected CAD part, applied by rewriting its PARAMS
+ * value rather than asking the LLM to rewrite the script.
+ *
+ * Returns null whenever this should not be handled locally — a sculpt, no
+ * project, no part in the selection, or an utterance that does not resolve to
+ * a real parameter. PercyAssistant falls through to /api/command on null, so a
+ * miss costs nothing and behaves exactly as it did before.
+ */
+async function applyPartEdit(text, selection) {
+  if (lastBackend !== "cad" || !currentProjectId) return null;
+  const part = selection?.parts?.[0];
+  if (!part) return null;
+
+  const plan = planPartEdit(cadParams, part, text);
+  if (!plan) return null;
+
+  setStatus(`${plan.key.replace(/_mm$/, "")} → ${plan.to} mm`, true);
+  return percy.postParamUpdate(currentProjectId, { [plan.key]: plan.to });
+}
+
 const percy = new PercyAssistant({
   onModelUpdate: (data) => setModelFromResponse(data),
   onStatusMessage: (msg, ok) => setStatus(msg, ok),
   onRegionCommand: (cmd, selection, text) => applyRegionCommand(cmd, selection, text),
+  onPartEdit: (text, selection) => applyPartEdit(text, selection),
+  onSemanticEdit: (text, selection) => applySemanticEdit(text, selection),
   onSelectionCleared: () => clearSelectionHighlight(),
   onPhotoCandidates: (cands) => {
     if (!cands || !cands.length) {
@@ -1417,19 +1572,23 @@ window.addEventListener("resize", () => {
 let pulsePhase = 0;
 let lastTick = performance.now();
 
+const frameGuard = createFrameGuard();
+
 renderer.setAnimationLoop(() => {
-  if (needsUserPlacement && renderer.xr.isPresenting) {
-    placeFrameCount += 1;
-    if (placeFrameCount >= 3) {
-      placeModelInFrontOfUser(0.7);
-      needsUserPlacement = false;
-      setStatus("Hold left trigger to talk. Right pinch the model to move it.", true);
+  frameGuard("placeModel", () => {
+    if (needsUserPlacement && renderer.xr.isPresenting) {
+      placeFrameCount += 1;
+      if (placeFrameCount >= 3) {
+        placeModelInFrontOfUser(0.7);
+        needsUserPlacement = false;
+        setStatus("Hold left trigger to talk. Right pinch the model to move it.", true);
+      }
     }
-  }
+  });
 
-  layoutVoiceIndicator();
-
-  if (voiceIndicatorGroup.visible) {
+  frameGuard("voiceIndicator", () => {
+    layoutVoiceIndicator();
+    if (!voiceIndicatorGroup.visible) return;
     pulsePhase += 0.08;
     const state = voiceState.state;
     if (state === "listening") {
@@ -1446,30 +1605,40 @@ renderer.setAnimationLoop(() => {
       voiceRing.material.opacity = 0.85;
       voiceDot.material.opacity = 0.9;
     }
-  }
+  });
 
-  pollHand(left, 0);
-  pollHand(right, 1);
-  updateTwoHand();
-  if (!twoHandOn) updateGrab();
-  updateParamPanel();
-  updateParamDrag();
-  updateSelectionHover();
-  dimsLabel.follow(currentModel, camera);
-  tape.update();
-  const nowTick = performance.now();
-  const dt = (nowTick - lastTick) / 1000;
-  photoPicker.tick(dt);
-  searchHud.tick(dt);
-  lastTick = nowTick;
+  // Each step is guarded: three.js re-queues the next frame only after this
+  // callback returns, so one uncaught throw here would stop rendering for good
+  // and freeze the headset. See interaction/frameGuard.js.
+  frameGuard("pollHand", () => {
+    pollHand(left, 0);
+    pollHand(right, 1);
+  });
+  frameGuard("updateTwoHand", updateTwoHand);
+  frameGuard("updateGrab", () => {
+    if (!twoHandOn) updateGrab();
+  });
+  frameGuard("updateParamPanel", updateParamPanel);
+  frameGuard("updateParamDrag", updateParamDrag);
+  frameGuard("updateSelectionHover", updateSelectionHover);
+  frameGuard("dimsLabel", () => dimsLabel.follow(currentModel, camera));
+  frameGuard("tape", () => tape.update());
+  frameGuard("tick", () => {
+    const nowTick = performance.now();
+    const dt = (nowTick - lastTick) / 1000;
+    photoPicker.tick(dt);
+    searchHud.tick(dt);
+    lastTick = nowTick;
+  });
+  frameGuard("halo", () => {
+    if (!grabbing && !twoHandOn) {
+      const decay = 0.92;
+      halo.material.opacity *= decay;
+      if (halo.material.opacity < 0.01) halo.material.opacity = 0;
+    }
+  });
 
-  if (!grabbing && !twoHandOn) {
-    const decay = 0.92;
-    halo.material.opacity *= decay;
-    if (halo.material.opacity < 0.01) halo.material.opacity = 0;
-  }
-
-  renderer.render(scene, camera);
+  frameGuard("render", () => renderer.render(scene, camera));
 });
 
 let desktopMode = null;

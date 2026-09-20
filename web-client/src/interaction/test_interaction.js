@@ -59,6 +59,15 @@ import {
   parseRegionCommand,
   REGION_COLOR_MAP,
 } from "./regionOps.js";
+import {
+  parseDimensionCommand,
+  resolveParamKey,
+  planPartEdit,
+  needsSelection,
+  PART_SCALE_STEP,
+} from "./partEdit.js";
+import { ndcToPixels, circleRadiusPx, clampCircle } from "./viewCapture.js";
+import { createFrameGuard } from "./frameGuard.js";
 
 const assert = (condition, message) => {
   if (!condition) throw new Error(`ASSERTION FAILED: ${message}`);
@@ -452,6 +461,384 @@ test("parseRegionCommand returns null for anything else", () => {
   eq(parseRegionCommand("paint it a color that doesn't exist"), null);
   eq(parseRegionCommand(""), null);
   eq(parseRegionCommand(undefined), null);
+});
+
+console.log("\n=== partEdit.js ===");
+
+// A realistic PARAMS dict, in the shape cad/params.py produces.
+const EAR_PARAMS = {
+  ear_length_mm: 16,
+  ear_base_r_mm: 5.5,
+  ear_top_r_mm: 1.6,
+  ear_spacing_mm: 20,
+  head_radius_mm: 16,
+  plate_thickness_mm: 6,
+  plate_width_mm: 26,
+};
+
+test("parseDimensionCommand reads relative length words", () => {
+  eq(parseDimensionCommand("make it longer").axis, "length");
+  eq(parseDimensionCommand("make it longer").dir, 1);
+  eq(parseDimensionCommand("make it shorter").dir, -1);
+  eq(parseDimensionCommand("taller").axis, "length");
+});
+
+test("parseDimensionCommand reads width and thickness", () => {
+  eq(parseDimensionCommand("make it wider").axis, "width");
+  eq(parseDimensionCommand("make it thicker").axis, "thickness");
+  eq(parseDimensionCommand("make it thinner").dir, -1);
+});
+
+test("parseDimensionCommand reads an explicit millimetre delta", () => {
+  const c = parseDimensionCommand("make it 5 mm longer");
+  eq(c.axis, "length");
+  eq(c.deltaMm, 5);
+  eq(c.dir, 1);
+});
+
+test("parseDimensionCommand reads centimetres as millimetres", () => {
+  eq(parseDimensionCommand("make it 2 cm longer").deltaMm, 20);
+});
+
+test("parseDimensionCommand handles an absolute target", () => {
+  const c = parseDimensionCommand("make it 20 mm long");
+  eq(c.absoluteMm, 20);
+  eq(c.axis, "length");
+});
+
+test("parseDimensionCommand ignores non-dimensional speech", () => {
+  eq(parseDimensionCommand("add wings"), null);
+  eq(parseDimensionCommand("give it a hat"), null);
+  eq(parseDimensionCommand("make it red"), null);
+  eq(parseDimensionCommand("paint it blue"), null);
+  eq(parseDimensionCommand("drill a hole"), null);
+  eq(parseDimensionCommand(""), null);
+  eq(parseDimensionCommand(undefined), null);
+});
+
+test("resolveParamKey finds the part's own dimension first", () => {
+  eq(resolveParamKey(EAR_PARAMS, "ear_l", "length"), "ear_length_mm");
+  eq(resolveParamKey(EAR_PARAMS, "plate", "thickness"), "plate_thickness_mm");
+  eq(resolveParamKey(EAR_PARAMS, "plate", "width"), "plate_width_mm");
+});
+
+test("resolveParamKey falls back to a radius for size words", () => {
+  eq(resolveParamKey(EAR_PARAMS, "head", "size"), "head_radius_mm");
+});
+
+test("resolveParamKey returns null when the part has no such dimension", () => {
+  eq(resolveParamKey(EAR_PARAMS, "head", "thickness"), null);
+  eq(resolveParamKey(EAR_PARAMS, "nonexistent", "length"), null);
+  eq(resolveParamKey({}, "ear_l", "length"), null);
+});
+
+test("planPartEdit scales by the step and snaps to 1 mm", () => {
+  const plan = planPartEdit(EAR_PARAMS, "ear_l", "make it longer");
+  eq(plan.key, "ear_length_mm");
+  eq(plan.from, 16);
+  eq(plan.to, Math.round(16 * PART_SCALE_STEP));
+});
+
+test("planPartEdit shrinks for a negative direction", () => {
+  const plan = planPartEdit(EAR_PARAMS, "ear_l", "make it shorter");
+  assert(plan.to < plan.from, `expected shrink, got ${plan.to}`);
+});
+
+test("planPartEdit applies an explicit delta exactly", () => {
+  const plan = planPartEdit(EAR_PARAMS, "ear_l", "make it 5 mm longer");
+  eq(plan.to, 21);
+});
+
+test("planPartEdit applies an absolute target exactly", () => {
+  eq(planPartEdit(EAR_PARAMS, "ear_l", "make it 20 mm long").to, 20);
+});
+
+test("planPartEdit never returns a non-positive value", () => {
+  const tiny = { ear_length_mm: 2 };
+  const plan = planPartEdit(tiny, "ear_l", "make it 50 mm shorter");
+  assert(plan === null || plan.to > 0, `got ${JSON.stringify(plan)}`);
+});
+
+test("planPartEdit returns null with no part, no match, or no params", () => {
+  eq(planPartEdit(EAR_PARAMS, "", "make it longer"), null);
+  eq(planPartEdit(EAR_PARAMS, null, "make it longer"), null);
+  eq(planPartEdit(EAR_PARAMS, "ear_l", "add wings"), null);
+  eq(planPartEdit({}, "ear_l", "make it longer"), null);
+  eq(planPartEdit(EAR_PARAMS, "head", "make it thicker"), null);
+});
+
+// ---------------------------------------------------------------------------
+// Dispatch guard: every utterance that is fast today must STAY on its own path.
+// This is the test that would have caught "make it red" being swallowed by the
+// semantic-edit rung. A new rung that steals traffic fails here.
+// ---------------------------------------------------------------------------
+console.log("\n=== dispatch guard ===");
+
+test("sculpt-only region ops are never claimed as a dimension edit", () => {
+  // These have no CAD meaning: they mutate vertices. partEdit must leave them
+  // to regionOps regardless of lane.
+  for (const text of ["smooth", "pull it out", "push it in", "flatten", "paint it red"]) {
+    assert(parseRegionCommand(text) !== null, `regionOps should claim ${text}`);
+    eq(planPartEdit(EAR_PARAMS, "ear_l", text), null);
+  }
+});
+
+test("size words are claimed by both, and the LANE decides which wins", () => {
+  // "bigger" means vertex-scale a sculpt and PARAMS-scale a CAD part. Both
+  // claiming is correct; the caller must pick by session backend, which is
+  // why the wiring only consults partEdit on a CAD session.
+  for (const text of ["bigger", "smaller"]) {
+    assert(parseRegionCommand(text) !== null, `regionOps should claim ${text} for mesh`);
+    assert(planPartEdit(EAR_PARAMS, "ear_l", text) !== null,
+           `partEdit should claim ${text} for CAD`);
+  }
+});
+
+test("recolours are never claimed as a dimension edit", () => {
+  for (const text of ["make it red", "make it blue", "turn it green",
+                      "colour it black", "paint the ears red"]) {
+    eq(planPartEdit(EAR_PARAMS, "ear_l", text), null);
+  }
+});
+
+test("structural additions are never claimed as a dimension edit", () => {
+  for (const text of ["add wings", "give it a hat", "put horns on it",
+                      "stick a handle on it", "drill a hole", "add a loop"]) {
+    eq(planPartEdit(EAR_PARAMS, "ear_l", text), null);
+  }
+});
+
+test("MIXED utterances containing a size word still defer to the right path", () => {
+  // These are the cases the exclusion list actually earns its keep on: each
+  // contains a real axis word ("longer"/"bigger"/"taller"), so without the
+  // colour/structural exclusions they WOULD be claimed as a plain resize and
+  // the addition or recolour would silently never happen.
+  for (const text of ["add a longer handle", "give it a taller hat",
+                      "put a bigger lug on it", "paint it red and make it bigger",
+                      "make it red and longer", "drill a bigger hole",
+                      "add a loop and make it thicker"]) {
+    eq(planPartEdit(EAR_PARAMS, "ear_l", text), null);
+  }
+});
+
+test("partEdit claims only what it can actually resolve", () => {
+  // resolvable -> claimed
+  assert(planPartEdit(EAR_PARAMS, "ear_l", "make it longer") !== null, "should claim");
+  // same words, no selected part -> not claimed, falls through to the server
+  eq(planPartEdit(EAR_PARAMS, null, "make it longer"), null);
+});
+
+test("needsSelection spots a part-scoped edit with no selection", () => {
+  // These only mean something against a selected part, so with no selection
+  // the user must be told -- not silently handed to the LLM.
+  for (const text of ["make it longer", "make it thinner", "bigger", "smaller",
+                      "smooth", "pull it out", "paint it red", "flatten"]) {
+    assert(needsSelection(text), `should need a selection: ${text}`);
+  }
+});
+
+test("needsSelection leaves whole-model and structural speech alone", () => {
+  for (const text of ["build me a gear", "add wings", "give it a hat",
+                      "undo", "make it red", "what is this"]) {
+    assert(!needsSelection(text), `should NOT need a selection: ${text}`);
+  }
+});
+
+console.log("\n=== viewCapture.js ===");
+
+test("ndcToPixels maps the centre to the middle of the canvas", () => {
+  const p = ndcToPixels({ x: 0, y: 0 }, 1024, 512);
+  eq(p.x, 512);
+  eq(p.y, 256);
+});
+
+test("ndcToPixels flips Y (NDC is up-positive, pixels are down-positive)", () => {
+  eq(ndcToPixels({ x: 0, y: 1 }, 100, 100).y, 0);
+  eq(ndcToPixels({ x: 0, y: -1 }, 100, 100).y, 100);
+});
+
+test("ndcToPixels maps the right edge", () => {
+  eq(ndcToPixels({ x: 1, y: 0 }, 800, 600).x, 800);
+});
+
+test("circleRadiusPx scales with the smaller dimension", () => {
+  eq(circleRadiusPx(1000, 500, 0.2), 100);
+});
+
+test("clampCircle keeps a circle near the edge fully on canvas", () => {
+  const c = clampCircle(5, 5, 40, 400, 400);
+  assert(c.cx >= c.r && c.cy >= c.r, `clamped to ${c.cx},${c.cy} r=${c.r}`);
+});
+
+test("clampCircle leaves a centred circle alone", () => {
+  const c = clampCircle(200, 200, 40, 400, 400);
+  eq(c.cx, 200);
+  eq(c.cy, 200);
+  eq(c.r, 40);
+});
+
+test("clampCircle shrinks a radius bigger than the canvas", () => {
+  assert(clampCircle(200, 200, 500, 400, 400).r <= 200, "radius not clamped");
+});
+
+test("clampCircle handles a point projected off-screen behind the camera", () => {
+  // .project(camera) can return NDC outside -1..1; the circle must still land
+  // on the canvas rather than producing NaN or a negative radius.
+  const c = clampCircle(-9999, 99999, 100, 512, 512);
+  assert(Number.isFinite(c.cx) && Number.isFinite(c.cy), "non-finite centre");
+  assert(c.cx >= c.r && c.cx <= 512 - c.r, `cx off canvas: ${c.cx}`);
+  assert(c.cy >= c.r && c.cy <= 512 - c.r, `cy off canvas: ${c.cy}`);
+});
+
+console.log("\n=== frameGuard.js ===");
+
+test("a throwing step does not stop the steps after it", () => {
+  const guard = createFrameGuard({ log: () => {} });
+  const ran = [];
+  guard("a", () => ran.push("a"));
+  guard("b", () => {
+    throw new Error("boom");
+  });
+  guard("c", () => ran.push("c"));
+  eq(ran.join(","), "a,c");
+});
+
+test("guard never rethrows, so the caller can re-queue the next frame", () => {
+  const guard = createFrameGuard({ log: () => {} });
+  let reached = false;
+  // If guard rethrew, `reached` would stay false -- this is the whole point:
+  // three.js re-queues rAF AFTER the callback returns, so a throw that escapes
+  // stops rendering permanently.
+  guard("x", () => {
+    throw new Error("boom");
+  });
+  reached = true;
+  assert(reached, "guard rethrew");
+});
+
+test("guard reports success and failure", () => {
+  const guard = createFrameGuard({ log: () => {} });
+  eq(guard("ok", () => {}), true);
+  eq(
+    guard("bad", () => {
+      throw new Error("boom");
+    }),
+    false
+  );
+});
+
+test("repeated failures are logged once per throttle window, not every frame", () => {
+  // At 90fps an unthrottled log would emit 90 lines a second and bury the
+  // console, which is where the actual error would be.
+  let clock = 0;
+  const lines = [];
+  const guard = createFrameGuard({ log: (m) => lines.push(m), now: () => clock, throttleMs: 5000 });
+  for (let i = 0; i < 200; i++) {
+    clock += 11; // ~90fps
+    guard("spin", () => {
+      throw new Error("boom");
+    });
+  }
+  eq(lines.length, 1);
+});
+
+test("logging resumes after the throttle window", () => {
+  let clock = 0;
+  const lines = [];
+  const guard = createFrameGuard({ log: (m) => lines.push(m), now: () => clock, throttleMs: 1000 });
+  const boom = () => {
+    throw new Error("boom");
+  };
+  guard("s", boom);
+  clock += 1500;
+  guard("s", boom);
+  eq(lines.length, 2);
+});
+
+test("different steps are throttled independently", () => {
+  let clock = 0;
+  const lines = [];
+  const guard = createFrameGuard({ log: (m) => lines.push(m), now: () => clock, throttleMs: 5000 });
+  const boom = () => {
+    throw new Error("boom");
+  };
+  guard("one", boom);
+  guard("two", boom);
+  eq(lines.length, 2);
+});
+
+test("the log names the step and counts repeats", () => {
+  let clock = 0;
+  const lines = [];
+  const guard = createFrameGuard({ log: (m) => lines.push(m), now: () => clock, throttleMs: 0 });
+  const boom = () => {
+    throw new Error("kaboom");
+  };
+  guard("updateTwoHand", boom);
+  guard("updateTwoHand", boom);
+  assert(lines[0].includes("updateTwoHand"), `no step name: ${lines[0]}`);
+  assert(lines[1].includes("2"), `no repeat count: ${lines[1]}`);
+  assert(lines[0].includes("kaboom"), `no message: ${lines[0]}`);
+});
+
+test("failures() counts throws per step", () => {
+  const guard = createFrameGuard({ log: () => {} });
+  const boom = () => {
+    throw new Error("boom");
+  };
+  guard("z", boom);
+  guard("z", boom);
+  guard("ok", () => {});
+  eq(guard.failures("z"), 2);
+  eq(guard.failures("ok"), 0);
+  eq(guard.failures("never"), 0);
+});
+
+test("the render loop survives a throwing step (three.js loop semantics)", () => {
+  // Reproduces WebGLAnimation.onAnimationFrame: it runs the callback and only
+  // THEN re-queues, so a throw that escapes never reaches the re-queue and
+  // rendering stops for good. Unguarded this survives 0 frames.
+  function runLoop(callback, maxFrames) {
+    let frames = 0;
+    function onAnimationFrame() {
+      callback();
+      if (++frames < maxFrames) onAnimationFrame();
+    }
+    try {
+      onAnimationFrame();
+    } catch (e) {
+      /* loop is dead, exactly as in the browser */
+    }
+    return frames;
+  }
+  const boom = () => {
+    throw new Error("null model");
+  };
+
+  const unguarded = runLoop(() => boom(), 50);
+  eq(unguarded, 0);
+
+  let rendered = 0;
+  const guard = createFrameGuard({ log: () => {} });
+  const guarded = runLoop(() => {
+    guard("bad", boom);
+    guard("render", () => rendered++);
+  }, 50);
+  eq(guarded, 50);
+  eq(rendered, 50);
+  eq(guard.failures("bad"), 50);
+});
+
+test("a non-Error throw is handled", () => {
+  const lines = [];
+  const guard = createFrameGuard({ log: (m) => lines.push(m), throttleMs: 0 });
+  eq(
+    guard("odd", () => {
+      throw "a string";
+    }),
+    false
+  );
+  assert(lines[0].includes("a string"), `lost the value: ${lines[0]}`);
 });
 
 console.log("\n" + "=".repeat(60));

@@ -7,6 +7,7 @@
 import { voiceState } from "./VoiceState.js";
 import { PTTRecorder } from "./PTTRecorder.js";
 import { parseRegionCommand } from "../interaction/regionOps.js";
+import { needsSelection } from "../interaction/partEdit.js";
 
 const API_BASE = "";
 const SESSION_ID = "default";
@@ -54,6 +55,17 @@ export class PercyAssistant {
     // matches the local table runs here instead of /api/command — no LLM
     // round trip for "bigger" / "pull it out" / etc. on a selection.
     this.onRegionCommand = options.onRegionCommand || null;
+    // Applies a dimensional edit to the selected CAD part by rewriting its
+    // PARAMS value (interaction/partEdit.js). Returns null when it cannot
+    // resolve the utterance to a real parameter, in which case the command
+    // falls through to /api/command exactly as before. ~67 ms vs ~15 s for
+    // the same edit through codegen.
+    this.onPartEdit = options.onPartEdit || null;
+    // Captures the current view with the selection circled and uploads it for
+    // a semantic sculpt edit (WS-H). The router answers action="semantic_edit"
+    // with rebuilt=false because the server has no picture yet; the headset is
+    // what takes it.
+    this.onSemanticEdit = options.onSemanticEdit || null;
     this.onJobProgress = options.onJobProgress || (() => {});
     this.onItems = options.onItems || (() => {});
 
@@ -132,18 +144,31 @@ export class PercyAssistant {
         {},
         15000
       );
+      // The greeting is fire-and-forget, so by the time it lands the user may
+      // already have grabbed the mic. Speaking over them — and then dropping
+      // the state machine back to idle underneath a live recording — is worse
+      // than skipping the greeting, so the mic always wins.
+      if (voiceState.isListening || voiceState.isThinking) return;
       if (data.reply_audio_url) {
         voiceState.toSpeaking();
         this.onStatusMessage(data.reply, true);
+        const audio = new Audio(data.reply_audio_url);
+        this.replyAudio = audio;
         try {
-          this.replyAudio = new Audio(data.reply_audio_url);
           await new Promise((resolve) => {
-            this.replyAudio.onended = resolve;
-            this.replyAudio.onerror = resolve;
-            this.replyAudio.play().catch(resolve);
+            audio.onended = resolve;
+            audio.onerror = resolve;
+            // beginTalk() pauses the reply audio to make room for the user;
+            // pause fires neither onended nor onerror, so watch for it here
+            // or this promise never settles.
+            audio.onpause = resolve;
+            audio.play().catch(resolve);
           });
         } catch (_) {}
-        voiceState.toIdle();
+        if (this.replyAudio === audio) this.replyAudio = null;
+        // Only hand back a state we still own: the user may have started
+        // talking while the greeting was playing.
+        if (voiceState.isSpeaking) voiceState.toIdle();
       } else {
         this.onStatusMessage(data.reply, true);
       }
@@ -288,6 +313,28 @@ export class PercyAssistant {
       }
     }
 
+    // A dimensional edit on a selected CAD part is a PARAMS rewrite, not a
+    // codegen round trip. onPartEdit returns null when it cannot resolve the
+    // utterance to a real parameter, and we fall through to the server.
+    if (this.selection && this.onPartEdit) {
+      const selection = this.selection;
+      const pending = await this.onPartEdit(text, selection);
+      if (pending) {
+        this._takeSelection();
+        await this._handleResponse(pending);
+        return pending;
+      }
+    }
+
+    // "bigger" / "make it longer" only mean something against a part. With no
+    // selection these used to fall through to the LLM and quietly do something
+    // else, which is the failure mode this guard exists to stop.
+    if (!this.selection && needsSelection(text)) {
+      this.onStatusMessage("Point at a part first, then say that again.", false);
+      voiceState.toIdle();
+      return null;
+    }
+
     voiceState.toThinking();
     this.onStatusMessage(`Looking that up… ("${text}")`, true);
 
@@ -300,6 +347,18 @@ export class PercyAssistant {
         body.lon = _cachedLocation.lon;
       }
       const result = await this._postJson(`${API_BASE}/api/command`, body);
+
+      // The router says this is a semantic edit but has no picture yet: the
+      // headset renders the current view with the selection circled and posts
+      // it to /semantic_edit, which answers with a job to poll.
+      if (result?.action === "semantic_edit" && !result?.rebuilt
+          && selection && this.onSemanticEdit) {
+        await this._handleResponse(result);
+        const started = await this.onSemanticEdit(text, selection);
+        if (started) return this._deliverResponse(started);
+        return result;
+      }
+
       await this._deliverResponse(result);
       return result;
     } catch (e) {
@@ -372,6 +431,23 @@ export class PercyAssistant {
   }
 
   /**
+   * Upload a render of the current view, with the selection circled, for a
+   * semantic sculpt edit. Answers with a job_id; the whole chain is ~40-70 s.
+   */
+  async postSemanticEdit(projectId, blob, text) {
+    const form = new FormData();
+    form.append("image", blob, "view.png");
+    form.append("text", text);
+    form.append("session_id", SESSION_ID);
+    const res = await fetch(`${API_BASE}/api/projects/${projectId}/semantic_edit`, {
+      method: "POST",
+      body: form,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  /**
    * Two-hand-stretch release: resize the project's real dimensions by
    * `factor`. Silent on purpose, like postParamUpdate — this fires once per
    * gesture, not on every frame of the stretch.
@@ -427,7 +503,9 @@ export class PercyAssistant {
   // full 10-90s+. Speak the ack, then poll the same way choosePhoto() does,
   // and hand the finished build to _handleResponse once it lands.
   async _deliverResponse(result) {
-    if ((result?.action !== "building" && result?.action !== "searching" && result?.action !== "publishing") || !result?.job_id) {
+    if ((result?.action !== "building" && result?.action !== "searching"
+         && result?.action !== "publishing" && result?.action !== "semantic_edit")
+        || !result?.job_id) {
       await this._handleResponse(result);
       return result;
     }

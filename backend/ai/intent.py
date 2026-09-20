@@ -417,13 +417,29 @@ _CAD_OBJECT_RE = re.compile(
 # are you") without firing on build/edit commands. False negatives (a chat-ish
 # utterance that falls through to codegen and gets a clarify/junk CAD reply)
 # are an acceptable, non-blocking tradeoff.
+#
+# _normalize_transcript canonicalizes the wake phrase to a "hey percy," prefix
+# rather than stripping it, so every chat cue below has to be tested against the
+# command BODY. Tested against the whole utterance, the bare "hey" alternative
+# in _CHAT_GREETING_RE backtracks past the optional wake prefix and matches the
+# "hey" of "hey percy" itself — which made every wake-worded command ("hey
+# percy, add wings to my cube") a greeting, and sent it to the grounded chat
+# LLM instead of the builder.
+_WAKE_PREFIX_RE = re.compile(r"^\s*hey\s+percy\b[,.\s]*", re.IGNORECASE)
+
+
+def _strip_wake_word(text: str) -> str:
+    """The command without its "hey percy," prefix. Empty if that was all of it."""
+    return _WAKE_PREFIX_RE.sub("", text, count=1).strip()
+
+
 _CHAT_GREETING_RE = re.compile(
-    r"^\s*(?:hey\s+percy[,.\s]*)?(?:hi|hello|hey|good\s*(?:morning|afternoon|evening))\b",
+    r"^\s*(?:hi|hello|hey|good\s*(?:morning|afternoon|evening))\b",
     re.IGNORECASE,
 )
 _CHAT_CAPABILITY_RE = re.compile(
-    r"\bwhat\s+can\s+you\s+do\b|\bwho\s+are\s+you\b|\bwhat\s+are\s+you\b|"
-    r"\bhow\s+(?:are|do)\s+you\b|\bwhat's\s+up\b",
+    r"\bwhat\s+can\s+you\s+(?:do|build|make|help)\b|\bwho\s+are\s+you\b|"
+    r"\bwhat\s+are\s+you\b|\bhow\s+(?:are|do)\s+you\b|\bwhat's\s+up\b",
     re.IGNORECASE,
 )
 _CHAT_LIVE_DATA_RE = re.compile(
@@ -436,7 +452,18 @@ _CHAT_LIVE_DATA_RE = re.compile(
 # this is the riskiest signal (highest false-positive rate), so it is gated
 # by "no CAD force, no mesh cue" at the call site too.
 _CHAT_QUESTION_RE = re.compile(
-    r"^\s*(?:hey\s+percy[,.\s]*)?(?:what|who|when|where|why|how|is|are|can|do|does|did)\b.*\?\s*$",
+    r"^\s*(?:what|who|when|where|why|how|is|are|can|could|do|does|did|would|will)\b.*\?\s*$",
+    re.IGNORECASE,
+)
+# Deepgram punctuates, so "can you add wings to my cube?" is question-shaped —
+# but a question carrying a build/edit verb is a politely phrased command, and
+# the bare-question signal must not claim it. The strong cues (greeting /
+# capability / live-data) are deliberately NOT subject to this veto: "what can
+# you build?" is a capability question, not a build request.
+_COMMAND_VERB_RE = re.compile(
+    r"\b(?:add|give|put|stick|attach|remove|delete|cut|drill|build|create|design|"
+    r"generate|make|turn|paint|colou?r|resize|scale|rotate|move|shrink|grow|"
+    r"stretch|flatten|smooth|sculpt|change|edit|undo|redo)\b",
     re.IGNORECASE,
 )
 
@@ -449,14 +476,27 @@ def is_strong_chat_signal(text: str) -> bool:
     is far more likely to be a build follow-up than genuine chat. Callers
     must also check `_has_cad_force`/`_has_mesh_cue`.
     """
-    t = text.strip()
-    if not t:
-        return False
+    body = _strip_wake_word(text)
+    if not body:
+        # The wake word on its own is a greeting; anything after it is not.
+        return bool(_WAKE_PREFIX_RE.match(text.strip()))
     return bool(
-        _CHAT_GREETING_RE.search(t)
-        or _CHAT_CAPABILITY_RE.search(t)
-        or _CHAT_LIVE_DATA_RE.search(t)
+        _CHAT_GREETING_RE.search(body)
+        or _CHAT_CAPABILITY_RE.search(body)
+        or _CHAT_LIVE_DATA_RE.search(body)
     )
+
+
+def is_capability_question(text: str) -> bool:
+    """
+    "What can you build?" — a question ABOUT building, not a build request.
+
+    Needed because _is_new_object_request fires on the bare verb, and the chat
+    gates veto on it to keep "build me a weather vane" on the build path. This
+    is the one shape where that veto is wrong, and it is narrow enough to be
+    safe: no build command matches _CHAT_CAPABILITY_RE.
+    """
+    return bool(_CHAT_CAPABILITY_RE.search(_strip_wake_word(text)))
 
 
 def is_chat_like(text: str) -> bool:
@@ -469,16 +509,12 @@ def is_chat_like(text: str) -> bool:
     question-shaped build request ("can you build me a mug?") never gets
     routed to chat.
     """
-    t = text.strip()
-    if not t:
+    if is_strong_chat_signal(text):
+        return True
+    body = _strip_wake_word(text)
+    if not body:
         return False
-    if _CHAT_GREETING_RE.search(t) or _CHAT_CAPABILITY_RE.search(t):
-        return True
-    if _CHAT_LIVE_DATA_RE.search(t):
-        return True
-    if _CHAT_QUESTION_RE.search(t):
-        return True
-    return False
+    return bool(_CHAT_QUESTION_RE.search(body) and not _COMMAND_VERB_RE.search(body))
 
 
 def _has_cad_force(text: str) -> bool:
@@ -830,6 +866,55 @@ def _check_mesh_boolean(text: str, selection: Selection | None) -> Intent | None
         params["diameter_mm"] = diameter_mm
     reply = "Drilling that hole." if op == "hole" else "Adding a loop."
     return Intent(action="mesh_boolean", backend="mesh", params=params, reply=reply)
+
+
+# Anything a sculpt cannot do deterministically but an image edit can:
+# "give it wings", "add a hat". Needs a selection, because the circle drawn on
+# the render is what tells the image model where to make the change.
+_SEMANTIC_VERBS = re.compile(r"\b(?:give|add|put|make|turn|stick)\b", re.I)
+
+# Handled elsewhere, deterministically — never claim these.
+_NOT_SEMANTIC = re.compile(
+    r"\bholes?\b|\bloops?\b|\bhanger\b|\bflat(?:ten)?\s+(?:it\s+|the\s+)?(?:base|bottom)\b"
+    r"|\bpaint\b|\bsmooth\b|\bpull\b|\bpush\b",
+    re.I,
+)
+
+# A pure recolour is NOT a semantic edit. "make" is in _SEMANTIC_VERBS, so
+# without this "make it red" would cost a 40-70s regeneration instead of the
+# instant recolour. "give it red wings" is still semantic: there the colour is
+# not the whole request.
+_RECOLOR_ONLY_RE = re.compile(
+    r"^(?:make|turn|paint|colou?r)\s+(?:it|this|that|the\s+\w+)\s+"
+    r"(?:" + "|".join(re.escape(c) for c in COLOR_MAP) + r")\b\s*[.!?]*$",
+    re.I,
+)
+
+
+def _check_semantic_edit(text: str, selection: Selection | None) -> Intent | None:
+    '''"Give it wings" on a sculpt, with a spot pointed at → an image edit.'''
+    t = text.lower().strip()
+    if selection is None or not getattr(selection, "center", None):
+        return None
+    if _is_new_object_request(t) or _NOT_SEMANTIC.search(t):
+        return None
+    if _RECOLOR_ONLY_RE.match(t):
+        return None
+    # Ask the resize rungs rather than pattern-matching for a measurement: a
+    # size only rules this out when it IS the request ("make it 8 cm tall"),
+    # not when it qualifies one ("add two wings, 30 mm long"). Refusing the
+    # latter is why answering the model's own request for dimensions used to
+    # make things worse instead of better.
+    if _check_absolute_size(t) or _check_scale_only(t):
+        return None
+    if not _SEMANTIC_VERBS.search(t):
+        return None
+    return Intent(
+        action="semantic_edit",
+        backend="mesh",
+        params={"instruction": text.strip()},
+        reply="That'll take a minute.",
+    )
 
 
 def _describe_selection(selection: Selection | None) -> str | None:
@@ -1279,7 +1364,7 @@ async def generate_chat_reply(
             params={"key": settings.gemini_api_key},
             headers={"Content-Type": "application/json"},
             json=payload,
-            timeout=30.0,
+            timeout=12.0,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -1308,7 +1393,7 @@ async def generate_chat_reply(
             params={"key": settings.gemini_api_key},
             headers={"Content-Type": "application/json"},
             json=payload_fallback,
-            timeout=20.0,
+            timeout=8.0,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -1435,22 +1520,6 @@ async def parse_intent(
     )
     logger.info("Router → %s (session=%s new=%s)", routed, session_backend, is_new)
 
-    # Unambiguous conversation cues (greeting/capability/live-data) win even
-    # over an active mesh/CAD session — otherwise "how's the weather" right
-    # after building a sculpt gets treated as a follow-up sculpt tweak
-    # instead of a chat question. `not is_new` keeps genuine build requests
-    # that happen to contain a live-data word ("build me a weather vane")
-    # on the build path.
-    if (
-        is_strong_chat_signal(cleaned)
-        and not is_new
-        and not _has_cad_force(cleaned)
-        and not _has_mesh_cue(cleaned)
-    ):
-        chat_intent = await generate_chat_reply(cleaned, settings, location=location)
-        logger.info("Chat path (session override) → action=%s", chat_intent.action)
-        return chat_intent, (time.perf_counter() - t0) * 1000
-
     if session_backend == "mesh" and not is_new:
         # Above clarify_mesh: hole / loop / flat base are deterministic booleans,
         # not a mismatch with CAD-only vocabulary.
@@ -1471,6 +1540,29 @@ async def parse_intent(
             scale_intent.backend = "mesh"
             logger.info("Fast path: resize x%.2f", scale_intent.params["factor"])
             return scale_intent, (time.perf_counter() - t0) * 1000
+        # Last rung before clarify_mesh: everything deterministic has had its
+        # turn, so what is left is a semantic change an image edit can make.
+        semantic_intent = _check_semantic_edit(cleaned, selection)
+        if semantic_intent:
+            logger.info("Fast path: semantic edit")
+            return semantic_intent, (time.perf_counter() - t0) * 1000
+
+    # Unambiguous conversation cues (greeting/capability/live-data) win over an
+    # active session — otherwise "how's the weather" right after building a
+    # sculpt gets treated as a follow-up tweak. It sits BELOW the deterministic
+    # mesh rungs on purpose: those are exact matches, this is a heuristic, and
+    # a heuristic must never outrank a certainty. `not is_new` keeps genuine
+    # build requests carrying a live-data word ("build me a weather vane") on
+    # the build path.
+    if (
+        is_strong_chat_signal(cleaned)
+        and (not is_new or is_capability_question(cleaned))
+        and not _has_cad_force(cleaned)
+        and not _has_mesh_cue(cleaned)
+    ):
+        chat_intent = await generate_chat_reply(cleaned, settings, location=location)
+        logger.info("Chat path (session override) → action=%s", chat_intent.action)
+        return chat_intent, (time.perf_counter() - t0) * 1000
 
     if routed == "clarify_mesh":
         return (
@@ -1500,7 +1592,7 @@ async def parse_intent(
     # weather vane" stay on the CAD path despite matching a chat cue).
     if (
         is_chat_like(cleaned)
-        and not is_new
+        and (not is_new or is_capability_question(cleaned))
         and not _has_cad_force(cleaned)
         and not _has_mesh_cue(cleaned)
     ):

@@ -783,14 +783,26 @@ def test_mesh_boolean_rung():
         print(f"  [FAIL] flat base → {got.action} {got.params}")
         failed += 1
 
-    # Everything else on a mesh session still gets the generic clarify (not
-    # a new-object request, so it doesn't fall through to codegen instead).
+    # clarify_mesh narrows again in Phase 4 (WS-H). "Add a keychain lug" on a
+    # sculpt used to be refused; with a selection it is now a semantic edit,
+    # because an image edit genuinely can add one. That is the point of the
+    # phase, so this asserts the new behaviour rather than the old refusal.
     got = asyncio.run(_run("add a keychain lug", selection=sel))
-    if got.action == "clarify" and got.backend == "mesh" and "Point at" not in got.reply:
-        print("  [ok] non-boolean CAD vocabulary still clarify_mesh")
+    if got.action == "semantic_edit" and got.backend == "mesh":
+        print("  [ok] an addition on a sculpt is now a semantic edit")
         passed += 1
     else:
         print(f"  [FAIL] keychain lug on mesh session → {got.action} {got.reply!r}")
+        failed += 1
+
+    # ...but clarify_mesh still holds for genuine CAD-only vocabulary, so the
+    # narrowing is not total.
+    got = asyncio.run(_run("chamfer the edges", selection=sel))
+    if got.action == "clarify" and got.backend == "mesh" and "Point at" not in got.reply:
+        print("  [ok] CAD-only vocabulary still clarify_mesh")
+        passed += 1
+    else:
+        print(f"  [FAIL] chamfer on mesh session → {got.action} {got.reply!r}")
         failed += 1
 
     return passed, failed
@@ -887,11 +899,33 @@ def test_photo_search_fast_path():
         )[0]
 
     intent = asyncio.run(_run())
+    # The Composio work (3bfa524) put route_composio above this rung, which
+    # swallowed "from my photos" phrasing before the picker ever saw it. That
+    # was found twice independently and fixed two ways; d3b3d11's fix won and
+    # is the one kept: is_photo_search runs FIRST, so the local demo-folder
+    # picker stays reachable. The tradeoff against Composio's overlapping
+    # trigger phrases is documented in ai/intent.py at the reorder.
     if intent.action == "find_photos" and "pikachu" in (intent.photo_query or "").lower():
         print(f"  [ok] parse_intent → find_photos {intent.photo_query!r}")
         passed += 1
     else:
         print(f"  [FAIL] parse_intent {intent.action} {intent.photo_query}")
+        failed += 1
+
+    # Independent of which rung wins: when a Composio pull DOES run and finds
+    # photos, it must still answer in the shape PhotoPicker consumes, or the
+    # app-search path silently stops producing a pinchable card. Verified
+    # red-green by flipping that action in the runner.
+    import inspect
+
+    from composio_app import runner
+
+    src = inspect.getsource(runner.run_pull) if hasattr(runner, "run_pull") else inspect.getsource(runner)
+    if 'action = "find_photos"' in src and "candidates=photos" in src:
+        print("  [ok] a photos pull still answers find_photos + candidates")
+        passed += 1
+    else:
+        print("  [FAIL] the photos pull no longer answers find_photos + candidates")
         failed += 1
 
     return passed, failed
@@ -1123,6 +1157,126 @@ def test_ui_mode_rung():
 # Run All Tests
 # ============================================================================
 
+def test_semantic_edit_rung():
+    """"Give it wings" on a sculpt with a selection -> an image edit."""
+    print("\n=== Test: semantic edit rung ===")
+    from ai.intent import _check_semantic_edit
+    from app.models import Selection
+
+    sel = Selection(center=[0.0, 0.0, 0.0], normal=[0.0, 1.0, 0.0])
+    passed = failed = 0
+
+    claims = ["give it wings", "add a hat", "make it look angrier",
+              "put horns on it", "give it red wings", "stick a handle on it"]
+    for text in claims:
+        got = _check_semantic_edit(text, sel)
+        if got is not None and got.action == "semantic_edit":
+            print(f"  [ok] claims {text!r}"); passed += 1
+        else:
+            print(f"  [FAIL] should claim {text!r}, got {got}"); failed += 1
+
+    if _check_semantic_edit("give it wings", None) is None:
+        print("  [ok] no selection -> no semantic edit"); passed += 1
+    else:
+        print("  [FAIL] claimed without a selection"); failed += 1
+
+    # Everything with its own deterministic path must keep it. A recolour is
+    # the dangerous one: "make" is a semantic verb, so without the recolour
+    # guard "make it red" would cost a 40-70s regeneration.
+    for text in ["drill a hole", "add a loop", "flatten the base",
+                 "make it bigger", "make it smaller", "make it 8 cm tall",
+                 "paint it red", "make it red", "make it blue",
+                 "turn it green", "colour it black", "make the ears red",
+                 "build me a car", "undo"]:
+        got = _check_semantic_edit(text, sel)
+        if got is None:
+            print(f"  [ok] leaves {text!r} alone"); passed += 1
+        else:
+            print(f"  [FAIL] hijacked {text!r} -> {got.action}"); failed += 1
+
+    return passed, failed
+
+
+def test_chat_never_hijacks_real_commands():
+    """
+    Real transcripts, not hand-trimmed ones: the wake word survives
+    normalization ("hey percy, ...") and Deepgram punctuates questions.
+    Both used to hand ordinary build/edit commands to the grounded chat LLM,
+    which answered with questions instead of building and cost a
+    google_search round trip on the way.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    from app.models import Selection
+
+    print("\n=== Test: chat never hijacks real commands ===")
+    passed = failed = 0
+    settings = SimpleNamespace(gemini_api_key="", openai_api_key="")
+
+    sel = Selection(center=[0.0, 0.1, 0.0], normal=[0.0, 1.0, 0.0],
+                    parts=["body"], radius=0.05)
+    CAD_SCRIPT = "import cadquery as cq\nresult = cq.Workplane('XY').box(1,1,1)"
+
+    async def _run(text, last_backend, selection=None, script=None):
+        return (
+            await intent_mod.parse_intent(
+                text, settings, None, {},
+                current_script=script, last_backend=last_backend,
+                selection=selection,
+            )
+        )[0]
+
+    # (text, session backend, selection, current_script)
+    must_build = [
+        # The wake word is normalized to a "hey percy," prefix, never stripped.
+        ("hey percy, add wings to my cube", "cad", sel, CAD_SCRIPT),
+        ("hey percy, make it taller", "cad", sel, CAD_SCRIPT),
+        ("hey percy, give it wings", "mesh", sel, None),
+        ("hey percy, add a hat", "mesh", sel, None),
+        # Deepgram punctuates; a polite build/edit request is still a command.
+        ("can you add wings to my cube?", "cad", sel, CAD_SCRIPT),
+        ("can you make it bigger?", "cad", sel, CAD_SCRIPT),
+        ("can you add a hat to it?", "mesh", sel, None),
+        ("could you put a horn on it?", "mesh", sel, None),
+    ]
+    for text, backend, selection, script in must_build:
+        got = asyncio.run(_run(text, backend, selection, script))
+        if got.action != "chat":
+            print(f"  [ok] stays on build path: {text!r} -> {got.action}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} hijacked by chat")
+            failed += 1
+
+    # Supplying the dimensions the model asked for must not make it refuse.
+    got = asyncio.run(_run("add two wings on the sides, 30 mm long", "mesh", sel, None))
+    if got.action == "semantic_edit":
+        print("  [ok] a sized semantic edit on a sculpt is not refused")
+        passed += 1
+    else:
+        print(f"  [FAIL] sized semantic edit got action={got.action!r} reply={got.reply!r}")
+        failed += 1
+
+    # Genuine conversation must still reach chat, wake word and all.
+    must_chat = [
+        ("hey percy, how's the weather?", "mesh", None, None),
+        ("hey percy, what can you do?", "cad", None, CAD_SCRIPT),
+        ("hey percy", "mesh", None, None),
+        ("what can you build?", "cad", None, CAD_SCRIPT),
+        ("how are you", "mesh", None, None),
+    ]
+    for text, backend, selection, script in must_chat:
+        got = asyncio.run(_run(text, backend, selection, script))
+        if got.action == "chat":
+            print(f"  [ok] chat: {text!r}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} should be chat, got action={got.action!r}")
+            failed += 1
+
+    return passed, failed
+
+
 def run_all_tests():
     """Run all intent parsing regression tests."""
     print("=" * 60)
@@ -1144,14 +1298,18 @@ def run_all_tests():
     mb_pass, mb_fail = test_mesh_boolean_rung()
     sel_pass, sel_fail = test_selection_in_codegen_payload()
     ui_pass, ui_fail = test_ui_mode_rung()
+    se_pass, se_fail = test_semantic_edit_rung()
+    hj_pass, hj_fail = test_chat_never_hijacks_real_commands()
 
     total_pass = (
         w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass
-        + ch_pass + co_pass + h_pass + a_pass + mb_pass + sel_pass + ui_pass
+        + ch_pass + co_pass + h_pass + a_pass + mb_pass + sel_pass + ui_pass + se_pass
+        + hj_pass
     )
     total_fail = (
         w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail
-        + ch_fail + co_fail + h_fail + a_fail + mb_fail + sel_fail + ui_fail
+        + ch_fail + co_fail + h_fail + a_fail + mb_fail + sel_fail + ui_fail + se_fail
+        + hj_fail
     )
 
     print("\n" + "=" * 60)
@@ -1172,6 +1330,8 @@ def run_all_tests():
     print(f"Mesh boolean rung:          {mb_pass}/{mb_pass + mb_fail} passed")
     print(f"Selection in payload:       {sel_pass}/{sel_pass + sel_fail} passed")
     print(f"ui_mode rung:               {ui_pass}/{ui_pass + ui_fail} passed")
+    print(f"Semantic edit rung:         {se_pass}/{se_pass + se_fail} passed")
+    print(f"Chat never hijacks cmds:    {hj_pass}/{hj_pass + hj_fail} passed")
     print(f"TOTAL:                      {total_pass}/{total_pass + total_fail} passed")
     
     if total_fail > 0:

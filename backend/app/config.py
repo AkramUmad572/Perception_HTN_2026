@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     # Google Gemini (preferred when set — free-tier friendly)
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
+    # Image-in / image-out model for semantic sculpt edits (mesh/edit.py).
+    gemini_image_model: str = "gemini-2.5-flash-image"
 
     deepgram_api_key: str = ""
     elevenlabs_api_key: str = ""

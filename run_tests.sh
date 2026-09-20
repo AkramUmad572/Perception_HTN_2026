@@ -170,7 +170,8 @@ fi
 # Test 7: suites that live in the tree but were never wired into this runner,
 # plus the HTTP-surface regression tests.
 for M in mesh.test_cleanup mesh.test_factory mesh.test_hf_space \
-         mesh.test_meshy mesh.test_three_ws photos.test_drive app.test_api; do
+         mesh.test_meshy mesh.test_three_ws photos.test_drive app.test_api \
+         composio_app.test_router composio_app.test_adapters mesh.test_edit; do
     echo ""
     echo ">>> Running $M..."
     echo ""
