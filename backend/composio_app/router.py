@@ -54,6 +54,15 @@ _PICKUP = re.compile(
     re.I,
 )
 _BUILD_THAT = re.compile(r"\b(?:yeah,?\s*)?(?:build|make|sculpt) that\b", re.I)
+_CONNECTIONS = re.compile(
+    r"\bwhat\s+(?:are\s+your|apps?\s+are\s+you)\s+connect(?:ed|ions?)\b"
+    r"|\bwhat\s+connections?\s+do\s+you\s+have\b"
+    r"|\blist\s+(?:your\s+|my\s+)?connections?\b"
+    r"|\bwhat\s+(?:integrations?|accounts?)\s+(?:are\s+you\s+connected\s+to|do\s+you\s+have)\b"
+    r"|\bwhich\s+apps?\s+are\s+you\s+connected\s+to\b"
+    r"|\bwhat\s+apps?\s+(?:do\s+you\s+have\s+connected|are\s+connected)\b",
+    re.I,
+)
 
 
 def _tokens(text: str) -> str:
@@ -184,6 +193,9 @@ def route_composio(text: str, *, has_brief: bool = False, object_hint: str | Non
 
     if _BUILD_THAT.search(t) and has_brief:
         return Intent(action="build_from_brief", backend="cad", reply="Building that from the brief.")
+
+    if _CONNECTIONS.search(t):
+        return Intent(action="list_connections", backend="mesh", reply="Let me check, sir…")
 
     blocked = _disconnected(t)
     if blocked:

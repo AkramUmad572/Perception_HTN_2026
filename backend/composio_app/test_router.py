@@ -17,6 +17,11 @@ def test_named() -> None:
         ("go through all of my photos across all apps and find pikachu", "image_find", None, "photos"),
         ("I don't have slack — wait, pull slack", "clarify", None, None),
         ("yeah build that", "build_from_brief", None, None),
+        ("hey percy, what are your connections", "list_connections", None, None),
+        ("what connections do you have", "list_connections", None, None),
+        ("which apps are you connected to", "list_connections", None, None),
+        ("list your connections", "list_connections", None, None),
+        ("what integrations are you connected to", "list_connections", None, None),
     ]
     fail = 0
     for text, action, apps, kind in cases:

@@ -931,6 +931,34 @@ async def apply_intent(
         # construction exactly like it does for action="clarify" today.
         pass
 
+    elif action == "list_connections":
+        # "What are your connections?" — a live Composio account listing,
+        # not a content pull, so it runs synchronously (sub-second) rather
+        # than through the job-based pull_app path. Never touches build state.
+        from composio_app.client import ComposioAuthError, list_connected_apps
+
+        response_backend = "mesh"
+        if not settings.composio_api_key:
+            intent.reply = "Composio isn't connected yet, sir — no API key configured."
+        else:
+            try:
+                labels = await list_connected_apps(settings)
+            except ComposioAuthError:
+                intent.reply = "I couldn't authenticate with Composio, sir — the API key may be invalid."
+                error_msg = "Composio auth failed"
+            except Exception as exc:
+                logger.warning("Listing Composio connections failed: %s", exc)
+                intent.reply = "I couldn't reach Composio just now, sir. Try again in a moment."
+                error_msg = str(exc)
+            else:
+                if not labels:
+                    intent.reply = "I don't have any connections active right now, sir."
+                elif len(labels) == 1:
+                    intent.reply = f"I'm connected to {labels[0]}, sir."
+                else:
+                    spoken = ", ".join(labels[:-1]) + f", and {labels[-1]}"
+                    intent.reply = f"I'm connected to {spoken}, sir."
+
     if rebuilt and result_model_id and action in _VERSION_OPS:
         new_object = action == "create" or (
             action == "generate" and _is_new_object_request(transcript or "")

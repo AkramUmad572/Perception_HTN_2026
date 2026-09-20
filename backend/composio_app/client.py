@@ -103,6 +103,42 @@ def execute_sync(settings: Settings, slug: str, arguments: dict[str, Any] | None
     )
 
 
+def _toolkit_slug(toolkit: Any) -> str | None:
+    if isinstance(toolkit, dict):
+        return toolkit.get("slug")
+    slug = getattr(toolkit, "slug", None)
+    return slug if slug else (toolkit if isinstance(toolkit, str) else None)
+
+
+def list_connected_apps_sync(settings: Settings) -> list[str]:
+    """Friendly labels of every ACTIVE Composio connection for the resolved user."""
+    from composio_app.apps import APPS
+
+    user_id = resolve_user_id(settings)
+    client = _sdk(settings)
+    rows = _account_rows(client)
+    slugs: list[str] = []
+    for acc in rows:
+        uid = _acc_field(acc, "user_id", "userId")
+        status = str(_acc_field(acc, "status") or "").upper()
+        if str(uid) != user_id or status != "ACTIVE":
+            continue
+        slug = _toolkit_slug(_acc_field(acc, "toolkit", "app_name", "appName"))
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    return [APPS.get(s, {}).get("label", s.replace("_", " ").title()) for s in slugs]
+
+
+async def list_connected_apps(settings: Settings) -> list[str]:
+    try:
+        return await asyncio.to_thread(list_connected_apps_sync, settings)
+    except Exception as exc:
+        msg = str(exc)
+        if "401" in msg or "Invalid API key" in msg:
+            raise ComposioAuthError(msg) from exc
+        raise
+
+
 async def execute(settings: Settings, slug: str, arguments: dict[str, Any] | None = None) -> Any:
     try:
         return await asyncio.to_thread(execute_sync, settings, slug, arguments)

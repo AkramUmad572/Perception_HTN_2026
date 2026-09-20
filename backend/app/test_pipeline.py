@@ -1167,6 +1167,82 @@ async def test_chat_action_never_touches_build_state():
     return 1, 0
 
 
+async def test_list_connections_never_touches_build_state():
+    """'What are your connections?' must speak every connected app, untouched build state."""
+    print("\n=== Test: list_connections leaves build state untouched ===")
+    session = SessionState(
+        session_id="test",
+        model_id="old_model_123",
+        glb_url="/media/glb/old_model_123.glb",
+        color="#C0C0C0",
+    )
+    intent = Intent(action="list_connections", reply="Let me check, sir…")
+    settings = _mock_settings()
+    settings.composio_api_key = "test-key"
+
+    with patch(
+        "composio_app.client.list_connected_apps",
+        AsyncMock(return_value=["Google Drive", "Notion", "Gmail"]),
+    ):
+        with patch("app.pipeline._execute_with_retry") as mock_cad:
+            with patch("app.pipeline.generate_mesh_glb") as mock_mesh:
+                with patch("app.pipeline.synthesize_speech") as mock_tts:
+                    mock_tts.return_value = (None, 0.0)
+                    with patch("app.pipeline.save_session"):
+                        result = await apply_intent(intent, session, settings)
+
+    errors = []
+    if mock_cad.called:
+        errors.append("list_connections must not touch the CAD sandbox")
+    if mock_mesh.called:
+        errors.append("list_connections must not touch the mesh factory")
+    if result.rebuilt:
+        errors.append("rebuilt should be False")
+    if session.model_id != "old_model_123":
+        errors.append("must not mutate session.model_id")
+    for label in ("Google Drive", "Notion", "Gmail"):
+        if label not in result.reply:
+            errors.append(f"reply should name {label!r}, got {result.reply!r}")
+    if result.action != "list_connections":
+        errors.append(f"action should stay 'list_connections', got {result.action!r}")
+
+    if errors:
+        print("  [FAIL]")
+        for e in errors:
+            print(f"    - {e}")
+        return 0, 1
+    print("  [ok] list_connections speaks every connection, leaves build state untouched")
+    return 1, 0
+
+
+async def test_list_connections_no_api_key():
+    """No Composio key configured → graceful spoken reply, no crash."""
+    print("\n=== Test: list_connections with no Composio key ===")
+    session = SessionState(session_id="test")
+    intent = Intent(action="list_connections", reply="Let me check, sir…")
+    settings = _mock_settings()
+    settings.composio_api_key = ""
+
+    with patch("app.pipeline.synthesize_speech") as mock_tts:
+        mock_tts.return_value = (None, 0.0)
+        with patch("app.pipeline.save_session"):
+            result = await apply_intent(intent, session, settings)
+
+    errors = []
+    if "composio" not in result.reply.lower():
+        errors.append(f"reply should mention Composio isn't configured, got {result.reply!r}")
+    if result.rebuilt:
+        errors.append("rebuilt should be False")
+
+    if errors:
+        print("  [FAIL]")
+        for e in errors:
+            print(f"    - {e}")
+        return 0, 1
+    print("  [ok] no API key → graceful reply, no crash")
+    return 1, 0
+
+
 # ============================================================================
 # WS-A: project versions
 # ============================================================================
@@ -1523,6 +1599,14 @@ def run_all_tests():
         total_fail += f
 
         p, f = loop.run_until_complete(test_chat_action_never_touches_build_state())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_list_connections_never_touches_build_state())
+        total_pass += p
+        total_fail += f
+
+        p, f = loop.run_until_complete(test_list_connections_no_api_key())
         total_pass += p
         total_fail += f
 
