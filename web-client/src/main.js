@@ -31,6 +31,7 @@ import {
 } from "./interaction/twoHand.js";
 import { createDimensionsLabel } from "./interaction/dimensionsLabel.js";
 import { createTapeMeasure } from "./interaction/tapeMeasure.js";
+import { selectEventDrivesPtt } from "./interaction/pttSource.js";
 import { makeTextSprite } from "./interaction/textSprite.js";
 import {
   paramsForPart,
@@ -1258,11 +1259,15 @@ function setTapeMode(on) {
   setStatus(on ? "Tape measure: pinch two points on the model." : "Tape measure off.", true);
 }
 
+// A tracked hand fires these too, on top of the gap pollHand already latches
+// every frame — see interaction/pttSource.js. Two drivers meant one jittered
+// frame could barge in and cut Percy off mid-reply, so hands are left to
+// pollHand and these listeners serve actual controllers.
 left.controller.addEventListener("selectstart", () => {
-  percy.beginTalk();
+  if (selectEventDrivesPtt(left.hand)) percy.beginTalk();
 });
 left.controller.addEventListener("selectend", () => {
-  percy.endTalk();
+  if (selectEventDrivesPtt(left.hand)) percy.endTalk();
 });
 
 right.controller.addEventListener("selectstart", () => {
@@ -1789,7 +1794,7 @@ renderer.domElement.addEventListener(
 );
 
 window.addEventListener("keydown", (e) => {
-  if (e.key === "m" || e.key === "M") {
+  if ((e.key === "m" || e.key === "M") && !e.repeat) {
     percy.toggleMute();
     return;
   }

@@ -14,10 +14,16 @@
  *
  * The first three drive the real PercyAssistant with the browser bits stubbed.
  * The fourth replays main.js's pollHand edge logic, which has no DOM in it.
+ *
+ * The last group covers the opposite failure: Percy going quiet. A tracked
+ * hand emits BOTH the select events main.js binds on the controller and the
+ * joint gaps pollHand samples, so push-to-talk had two drivers and a single
+ * jittered frame could barge in and drop a reply mid-sentence.
  */
 
 import { PercyAssistant } from "./PercyAssistant.js";
 import { voiceState } from "./VoiceState.js";
+import { selectEventDrivesPtt } from "../interaction/pttSource.js";
 
 const assert = (condition, message) => {
   if (!condition) {
@@ -292,6 +298,137 @@ await test("a held pinch stays held while it jitters inside the dead band", () =
   assert(begins === 1, `one beginTalk, got ${begins}`);
   assert(ends === 0, `jitter must not end the hold, got ${ends} endTalk`);
   assert(held, "still holding at the end");
+});
+
+console.log("\n=== Left-hand PTT must have exactly one driver ===");
+
+await test("a tracked hand leaves the select events alone", () => {
+  const trackedHand = { joints: { "index-finger-tip": {}, "thumb-tip": {}, wrist: {} } };
+  assert(
+    !selectEventDrivesPtt(trackedHand),
+    "pollHand already latches a tracked hand's pinch — taking the select event too " +
+      "gives push-to-talk a second, hysteresis-free driver"
+  );
+});
+
+await test("a controller still drives PTT through the select events", () => {
+  assert(selectEventDrivesPtt({ joints: {} }), "a controller has no hand joints to sample");
+  assert(selectEventDrivesPtt(undefined), "no hand object at all is still a controller");
+});
+
+/**
+ * main.js's left-hand wiring, with the DOM taken out: pollHand's hysteresis
+ * latch plus the controller select listeners, both pointed at one Percy.
+ * A frame is { gap, select } — `gap` is the thumb/index distance (null when
+ * the hand is not tracked) and `select` is what the XR runtime's own pinch
+ * detector emitted that frame. The latch persists across calls, the way it
+ * does across render frames in main.js.
+ */
+function leftHandDriver(percy) {
+  const PINCH_THRESHOLD_START = 0.032;
+  const PINCH_THRESHOLD_END = 0.045;
+  let held = false;
+
+  return function feed(...frames) {
+    for (const { gap, select } of frames) {
+      const hand = gap === null ? { joints: {} } : { joints: { "index-finger-tip": {} } };
+
+      // left.controller select listeners (main.js)
+      if (select === "start" && selectEventDrivesPtt(hand)) percy.beginTalk();
+      if (select === "end" && selectEventDrivesPtt(hand)) percy.endTalk();
+
+      // pollHand (main.js)
+      const wasHeld = held;
+      if (gap === null) held = false;
+      else if (gap < PINCH_THRESHOLD_START) held = true;
+      else if (gap > PINCH_THRESHOLD_END) held = false;
+      if (held && !wasHeld) percy.beginTalk();
+      else if (!held && wasHeld) percy.endTalk();
+    }
+  };
+}
+
+await test("a pinch blip during a reply does not cut Percy off", async () => {
+  const percy = makePercy();
+  await percy.beginTalk();
+  percy.endTalk();
+  await settle();
+  assert(voiceState.state === "speaking", `reply playing, got "${voiceState.state}"`);
+  const playing = percy.replyAudio;
+  assert(playing, "a reply with audio should be holding an Audio element");
+
+  // The hand is open the whole time — the user is listening, not talking.
+  // The runtime's pinch detector fires anyway on one occluded frame.
+  leftHandDriver(percy)(
+    { gap: 0.07, select: null },
+    { gap: 0.07, select: "start" },
+    { gap: 0.07, select: "end" },
+    { gap: 0.07, select: null }
+  );
+  await settle();
+
+  assert(
+    percy.replyAudio === playing,
+    "a stray select event paused the reply and dropped it — this is Percy going " +
+      "quiet mid-sentence with nothing in the log"
+  );
+  assert(
+    voiceState.state === "speaking",
+    `the reply should still be playing, got "${voiceState.state}"`
+  );
+});
+
+await test("a real hand pinch still holds and sends, once", async () => {
+  const percy = makePercy();
+  let sent = 0;
+  percy._sendVoice = async () => {
+    sent++;
+    return { ok: true, reply: "sure", action: "chat" };
+  };
+
+  // A real pinch: the runtime sees it too, so both drivers fire.
+  const feed = leftHandDriver(percy);
+  feed({ gap: 0.07, select: null }, { gap: 0.02, select: "start" });
+  await settle();
+  assert(voiceState.state === "listening", `holding, got "${voiceState.state}"`);
+
+  feed({ gap: 0.07, select: "end" });
+  await settle();
+  assert(sent === 1, `one utterance per hold, got ${sent}`);
+});
+
+await test("a controller trigger still holds and sends", async () => {
+  const percy = makePercy();
+  let sent = 0;
+  percy._sendVoice = async () => {
+    sent++;
+    return { ok: true, reply: "sure", action: "chat" };
+  };
+
+  // No hand joints: gap is null every frame, so pollHand never latches and
+  // the select events are the only driver left.
+  const feed = leftHandDriver(percy);
+  feed({ gap: null, select: "start" });
+  await settle();
+  assert(voiceState.state === "listening", `trigger held, got "${voiceState.state}"`);
+
+  feed({ gap: null, select: "end" });
+  await settle();
+  assert(sent === 1, `one utterance per trigger pull, got ${sent}`);
+});
+
+await test("barging in on purpose still interrupts the reply", async () => {
+  const percy = makePercy();
+  await percy.beginTalk();
+  percy.endTalk();
+  await settle();
+  assert(voiceState.state === "speaking", `reply playing, got "${voiceState.state}"`);
+
+  // An actual pinch, not a blip: this one is allowed to talk over Percy.
+  leftHandDriver(percy)({ gap: 0.02, select: "start" });
+  await settle();
+  assert(voiceState.state === "listening", `barge-in should take the mic, got "${voiceState.state}"`);
+  assert(percy.replyAudio === null, "a real barge-in drops the reply audio");
 });
 
 // Summary
