@@ -54,6 +54,12 @@ export class PercyAssistant {
     // matches the local table runs here instead of /api/command — no LLM
     // round trip for "bigger" / "pull it out" / etc. on a selection.
     this.onRegionCommand = options.onRegionCommand || null;
+    // Applies a dimensional edit to the selected CAD part by rewriting its
+    // PARAMS value (interaction/partEdit.js). Returns null when it cannot
+    // resolve the utterance to a real parameter, in which case the command
+    // falls through to /api/command exactly as before. ~67 ms vs ~15 s for
+    // the same edit through codegen.
+    this.onPartEdit = options.onPartEdit || null;
     this.onJobProgress = options.onJobProgress || (() => {});
     this.onItems = options.onItems || (() => {});
 
@@ -285,6 +291,19 @@ export class PercyAssistant {
         this.onStatusMessage(`Error: ${e.message}`, false);
         setTimeout(() => voiceState.toIdle(), 3000);
         return null;
+      }
+    }
+
+    // A dimensional edit on a selected CAD part is a PARAMS rewrite, not a
+    // codegen round trip. onPartEdit returns null when it cannot resolve the
+    // utterance to a real parameter, and we fall through to the server.
+    if (this.selection && this.onPartEdit) {
+      const selection = this.selection;
+      const pending = await this.onPartEdit(text, selection);
+      if (pending) {
+        this._takeSelection();
+        await this._handleResponse(pending);
+        return pending;
       }
     }
 

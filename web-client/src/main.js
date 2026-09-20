@@ -40,6 +40,7 @@ import {
   paramPanelLines,
 } from "./interaction/paramPanel.js";
 import { selectionFromStroke, isTapRelease } from "./interaction/selection.js";
+import { planPartEdit } from "./interaction/partEdit.js";
 import {
   scaleRegion,
   pullRegion,
@@ -1355,10 +1356,32 @@ async function applyRegionCommand(cmd, selection, text) {
   return res.json();
 }
 
+/**
+ * A dimensional edit on the selected CAD part, applied by rewriting its PARAMS
+ * value rather than asking the LLM to rewrite the script.
+ *
+ * Returns null whenever this should not be handled locally — a sculpt, no
+ * project, no part in the selection, or an utterance that does not resolve to
+ * a real parameter. PercyAssistant falls through to /api/command on null, so a
+ * miss costs nothing and behaves exactly as it did before.
+ */
+async function applyPartEdit(text, selection) {
+  if (lastBackend !== "cad" || !currentProjectId) return null;
+  const part = selection?.parts?.[0];
+  if (!part) return null;
+
+  const plan = planPartEdit(cadParams, part, text);
+  if (!plan) return null;
+
+  setStatus(`${plan.key.replace(/_mm$/, "")} → ${plan.to} mm`, true);
+  return percy.postParamUpdate(currentProjectId, { [plan.key]: plan.to });
+}
+
 const percy = new PercyAssistant({
   onModelUpdate: (data) => setModelFromResponse(data),
   onStatusMessage: (msg, ok) => setStatus(msg, ok),
   onRegionCommand: (cmd, selection, text) => applyRegionCommand(cmd, selection, text),
+  onPartEdit: (text, selection) => applyPartEdit(text, selection),
   onSelectionCleared: () => clearSelectionHighlight(),
   onPhotoCandidates: (cands) => {
     if (!cands || !cands.length) {

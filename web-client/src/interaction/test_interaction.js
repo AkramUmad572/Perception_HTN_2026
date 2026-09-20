@@ -59,6 +59,12 @@ import {
   parseRegionCommand,
   REGION_COLOR_MAP,
 } from "./regionOps.js";
+import {
+  parseDimensionCommand,
+  resolveParamKey,
+  planPartEdit,
+  PART_SCALE_STEP,
+} from "./partEdit.js";
 
 const assert = (condition, message) => {
   if (!condition) throw new Error(`ASSERTION FAILED: ${message}`);
@@ -452,6 +458,158 @@ test("parseRegionCommand returns null for anything else", () => {
   eq(parseRegionCommand("paint it a color that doesn't exist"), null);
   eq(parseRegionCommand(""), null);
   eq(parseRegionCommand(undefined), null);
+});
+
+console.log("\n=== partEdit.js ===");
+
+// A realistic PARAMS dict, in the shape cad/params.py produces.
+const EAR_PARAMS = {
+  ear_length_mm: 16,
+  ear_base_r_mm: 5.5,
+  ear_top_r_mm: 1.6,
+  ear_spacing_mm: 20,
+  head_radius_mm: 16,
+  plate_thickness_mm: 6,
+  plate_width_mm: 26,
+};
+
+test("parseDimensionCommand reads relative length words", () => {
+  eq(parseDimensionCommand("make it longer").axis, "length");
+  eq(parseDimensionCommand("make it longer").dir, 1);
+  eq(parseDimensionCommand("make it shorter").dir, -1);
+  eq(parseDimensionCommand("taller").axis, "length");
+});
+
+test("parseDimensionCommand reads width and thickness", () => {
+  eq(parseDimensionCommand("make it wider").axis, "width");
+  eq(parseDimensionCommand("make it thicker").axis, "thickness");
+  eq(parseDimensionCommand("make it thinner").dir, -1);
+});
+
+test("parseDimensionCommand reads an explicit millimetre delta", () => {
+  const c = parseDimensionCommand("make it 5 mm longer");
+  eq(c.axis, "length");
+  eq(c.deltaMm, 5);
+  eq(c.dir, 1);
+});
+
+test("parseDimensionCommand reads centimetres as millimetres", () => {
+  eq(parseDimensionCommand("make it 2 cm longer").deltaMm, 20);
+});
+
+test("parseDimensionCommand handles an absolute target", () => {
+  const c = parseDimensionCommand("make it 20 mm long");
+  eq(c.absoluteMm, 20);
+  eq(c.axis, "length");
+});
+
+test("parseDimensionCommand ignores non-dimensional speech", () => {
+  eq(parseDimensionCommand("add wings"), null);
+  eq(parseDimensionCommand("give it a hat"), null);
+  eq(parseDimensionCommand("make it red"), null);
+  eq(parseDimensionCommand("paint it blue"), null);
+  eq(parseDimensionCommand("drill a hole"), null);
+  eq(parseDimensionCommand(""), null);
+  eq(parseDimensionCommand(undefined), null);
+});
+
+test("resolveParamKey finds the part's own dimension first", () => {
+  eq(resolveParamKey(EAR_PARAMS, "ear_l", "length"), "ear_length_mm");
+  eq(resolveParamKey(EAR_PARAMS, "plate", "thickness"), "plate_thickness_mm");
+  eq(resolveParamKey(EAR_PARAMS, "plate", "width"), "plate_width_mm");
+});
+
+test("resolveParamKey falls back to a radius for size words", () => {
+  eq(resolveParamKey(EAR_PARAMS, "head", "size"), "head_radius_mm");
+});
+
+test("resolveParamKey returns null when the part has no such dimension", () => {
+  eq(resolveParamKey(EAR_PARAMS, "head", "thickness"), null);
+  eq(resolveParamKey(EAR_PARAMS, "nonexistent", "length"), null);
+  eq(resolveParamKey({}, "ear_l", "length"), null);
+});
+
+test("planPartEdit scales by the step and snaps to 1 mm", () => {
+  const plan = planPartEdit(EAR_PARAMS, "ear_l", "make it longer");
+  eq(plan.key, "ear_length_mm");
+  eq(plan.from, 16);
+  eq(plan.to, Math.round(16 * PART_SCALE_STEP));
+});
+
+test("planPartEdit shrinks for a negative direction", () => {
+  const plan = planPartEdit(EAR_PARAMS, "ear_l", "make it shorter");
+  assert(plan.to < plan.from, `expected shrink, got ${plan.to}`);
+});
+
+test("planPartEdit applies an explicit delta exactly", () => {
+  const plan = planPartEdit(EAR_PARAMS, "ear_l", "make it 5 mm longer");
+  eq(plan.to, 21);
+});
+
+test("planPartEdit applies an absolute target exactly", () => {
+  eq(planPartEdit(EAR_PARAMS, "ear_l", "make it 20 mm long").to, 20);
+});
+
+test("planPartEdit never returns a non-positive value", () => {
+  const tiny = { ear_length_mm: 2 };
+  const plan = planPartEdit(tiny, "ear_l", "make it 50 mm shorter");
+  assert(plan === null || plan.to > 0, `got ${JSON.stringify(plan)}`);
+});
+
+test("planPartEdit returns null with no part, no match, or no params", () => {
+  eq(planPartEdit(EAR_PARAMS, "", "make it longer"), null);
+  eq(planPartEdit(EAR_PARAMS, null, "make it longer"), null);
+  eq(planPartEdit(EAR_PARAMS, "ear_l", "add wings"), null);
+  eq(planPartEdit({}, "ear_l", "make it longer"), null);
+  eq(planPartEdit(EAR_PARAMS, "head", "make it thicker"), null);
+});
+
+// ---------------------------------------------------------------------------
+// Dispatch guard: every utterance that is fast today must STAY on its own path.
+// This is the test that would have caught "make it red" being swallowed by the
+// semantic-edit rung. A new rung that steals traffic fails here.
+// ---------------------------------------------------------------------------
+console.log("\n=== dispatch guard ===");
+
+test("sculpt-only region ops are never claimed as a dimension edit", () => {
+  // These have no CAD meaning: they mutate vertices. partEdit must leave them
+  // to regionOps regardless of lane.
+  for (const text of ["smooth", "pull it out", "push it in", "flatten", "paint it red"]) {
+    assert(parseRegionCommand(text) !== null, `regionOps should claim ${text}`);
+    eq(planPartEdit(EAR_PARAMS, "ear_l", text), null);
+  }
+});
+
+test("size words are claimed by both, and the LANE decides which wins", () => {
+  // "bigger" means vertex-scale a sculpt and PARAMS-scale a CAD part. Both
+  // claiming is correct; the caller must pick by session backend, which is
+  // why the wiring only consults partEdit on a CAD session.
+  for (const text of ["bigger", "smaller"]) {
+    assert(parseRegionCommand(text) !== null, `regionOps should claim ${text} for mesh`);
+    assert(planPartEdit(EAR_PARAMS, "ear_l", text) !== null,
+           `partEdit should claim ${text} for CAD`);
+  }
+});
+
+test("recolours are never claimed as a dimension edit", () => {
+  for (const text of ["make it red", "make it blue", "turn it green",
+                      "colour it black", "paint the ears red"]) {
+    eq(planPartEdit(EAR_PARAMS, "ear_l", text), null);
+  }
+});
+
+test("structural additions are never claimed as a dimension edit", () => {
+  for (const text of ["add wings", "give it a hat", "put horns on it",
+                      "stick a handle on it", "drill a hole", "add a loop"]) {
+    eq(planPartEdit(EAR_PARAMS, "ear_l", text), null);
+  }
+});
+
+test("partEdit claims only what it can actually resolve", () => {
+  // resolvable -> claimed
+  assert(planPartEdit(EAR_PARAMS, "ear_l", "make it longer") !== null, "should claim");
+  // same words, no selected part -> not claimed, falls through to the server
+  eq(planPartEdit(EAR_PARAMS, null, "make it longer"), null);
 });
 
 console.log("\n" + "=".repeat(60));
