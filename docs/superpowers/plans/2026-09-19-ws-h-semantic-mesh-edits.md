@@ -859,7 +859,8 @@ def test_semantic_edit_rung():
     sel = Selection(center=[0.0, 0.0, 0.0], normal=[0.0, 1.0, 0.0])
     passed = failed = 0
 
-    claims = ["give it wings", "add a hat", "make it look angrier", "put horns on it"]
+    claims = ["give it wings", "add a hat", "make it look angrier", "put horns on it",
+              "give it red wings"]   # a colour inside a real addition still counts
     for text in claims:
         got = _check_semantic_edit(text, sel)
         if got is not None and got.action == "semantic_edit":
@@ -873,9 +874,13 @@ def test_semantic_edit_rung():
     else:
         print("  [FAIL] claimed without a selection"); failed += 1
 
-    # Deterministic ops keep their existing paths.
+    # Deterministic / fast paths keep their existing behaviour. The colour
+    # cases matter most: "make" is a semantic verb, so without _RECOLOR_ONLY_RE
+    # a recolour would cost a 40-70s regeneration.
     for text in ["drill a hole", "add a loop", "flatten the base",
-                 "make it bigger", "make it 8 cm tall", "paint it red"]:
+                 "make it bigger", "make it 8 cm tall", "paint it red",
+                 "make it red", "make it blue", "turn it green",
+                 "colour it black", "make the ears red"]:
         if _check_semantic_edit(text, sel) is None:
             print(f"  [ok] leaves {text!r} alone"); passed += 1
         else:
@@ -910,6 +915,15 @@ _NOT_SEMANTIC = re.compile(
     r"|\b\d+(?:\.\d+)?\s*(?:mm|cm|m|inch(?:es)?|millimet|centimet|met)",
     re.I,
 )
+# A pure recolour is NOT a semantic edit. "make" is in _SEMANTIC_VERBS, so
+# without this "make it red" would cost a 40-70s regeneration instead of the
+# instant recolour. "give it red wings" is still a semantic edit, because the
+# colour there is not the whole request.
+_RECOLOR_ONLY_RE = re.compile(
+    r"^(?:make|turn|paint|colou?r)\s+(?:it|this|that|the\s+\w+)\s+"
+    r"(?:" + "|".join(re.escape(c) for c in COLOR_MAP) + r")\b\s*[.!?]*$",
+    re.I,
+)
 
 
 def _check_semantic_edit(text: str, selection: Selection | None) -> Intent | None:
@@ -918,6 +932,8 @@ def _check_semantic_edit(text: str, selection: Selection | None) -> Intent | Non
     if selection is None or not getattr(selection, "center", None):
         return None
     if _is_new_object_request(t) or _NOT_SEMANTIC.search(t):
+        return None
+    if _RECOLOR_ONLY_RE.match(t):
         return None
     if not _SEMANTIC_VERBS.search(t):
         return None
