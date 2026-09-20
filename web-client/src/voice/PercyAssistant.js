@@ -565,6 +565,41 @@ export class PercyAssistant {
     }
   }
 
+  /**
+   * Drop everything this session is holding and wipe the server-side session
+   * too, so the next command starts from nothing. Silent by design — main.js
+   * owns the status line and the re-greeting, since it also has a whole scene
+   * to tear down and does not want two voices narrating one reset.
+   */
+  async resetSession() {
+    this._cancelPending = false;
+    this.recorder.abort();
+    if (this.replyAudio) {
+      try {
+        this.replyAudio.pause();
+      } catch (_) {}
+      this.replyAudio = null;
+    }
+    this.clearSelection();
+    this.onTalkingChange(false);
+    // Muted stays muted: a reset clears work, not the user's mic preference.
+    if (!voiceState.isMuted) voiceState.toIdle();
+
+    try {
+      await this._fetchJson(
+        `${API_BASE}/api/session/${SESSION_ID}/reset`,
+        { method: "POST" },
+        15000
+      );
+      return true;
+    } catch (e) {
+      // The headset is already clean; a server that missed the wipe only
+      // means a stale photo list over there, not a broken reset here.
+      console.warn("[Percy] Session reset failed server-side:", e);
+      return false;
+    }
+  }
+
   getState() {
     return voiceState.state;
   }

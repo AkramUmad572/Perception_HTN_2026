@@ -68,6 +68,12 @@ import {
 } from "./partEdit.js";
 import { ndcToPixels, circleRadiusPx, clampCircle } from "./viewCapture.js";
 import { createFrameGuard } from "./frameGuard.js";
+import {
+  XR_BUTTON,
+  RESET_HOLD_MS,
+  buttonPressed,
+  createHoldLatch,
+} from "./resetHold.js";
 
 const assert = (condition, message) => {
   if (!condition) throw new Error(`ASSERTION FAILED: ${message}`);
@@ -839,6 +845,82 @@ test("a non-Error throw is handled", () => {
     false
   );
   assert(lines[0].includes("a string"), `lost the value: ${lines[0]}`);
+});
+
+// --- resetHold: hold left Y to wipe the session --------------------------
+
+test("Y is button 5 on the xr-standard mapping", () => {
+  eq(XR_BUTTON.Y_OR_B, 5);
+  eq(XR_BUTTON.TRIGGER, 0);
+});
+
+function fakeSession(sources) {
+  return { inputSources: sources };
+}
+
+test("buttonPressed reads the hand, not the input-source order", () => {
+  const rightFirst = fakeSession([
+    { handedness: "right", gamepad: { buttons: [{}, {}, {}, {}, {}, { pressed: true }] } },
+    { handedness: "left", gamepad: { buttons: [{}, {}, {}, {}, {}, { pressed: false }] } },
+  ]);
+  eq(buttonPressed(rightFirst, "left", XR_BUTTON.Y_OR_B), false);
+  eq(buttonPressed(rightFirst, "right", XR_BUTTON.Y_OR_B), true);
+});
+
+test("buttonPressed survives hands, missing gamepads and no session", () => {
+  eq(buttonPressed(null, "left", 5), false);
+  eq(buttonPressed(fakeSession([]), "left", 5), false);
+  eq(buttonPressed(fakeSession([{ handedness: "left" }]), "left", 5), false);
+  eq(buttonPressed(fakeSession([{ handedness: "left", gamepad: { buttons: [] } }]), "left", 5), false);
+});
+
+test("a tap never fires the reset", () => {
+  const latch = createHoldLatch({ holdMs: RESET_HOLD_MS });
+  eq(latch.update(true, 0).fired, false);
+  eq(latch.update(true, 300).fired, false);
+  eq(latch.update(false, 320).fired, false);
+  // ...and the abandoned hold does not carry over into the next press.
+  eq(latch.update(true, 900).fired, false);
+  eq(latch.update(true, 1100).progress < 1, true);
+});
+
+test("a full hold fires once, and only once", () => {
+  const latch = createHoldLatch({ holdMs: 1000 });
+  latch.update(true, 0);
+  eq(latch.update(true, 500).progress, 0.5);
+  eq(latch.update(true, 999).fired, false);
+  eq(latch.update(true, 1000).fired, true);
+  // Still held past the threshold: must not re-reset every frame.
+  eq(latch.update(true, 1200).fired, false);
+  eq(latch.update(true, 5000).fired, false);
+  eq(latch.update(true, 5000).progress, 1);
+});
+
+test("releasing and pressing again arms a fresh hold", () => {
+  const latch = createHoldLatch({ holdMs: 1000 });
+  latch.update(true, 0);
+  eq(latch.update(true, 1000).fired, true);
+  eq(latch.update(false, 1100).active, false);
+  latch.update(true, 2000);
+  eq(latch.update(true, 2500).fired, false);
+  eq(latch.update(true, 3000).fired, true);
+});
+
+test("cancel abandons a hold in flight", () => {
+  const latch = createHoldLatch({ holdMs: 1000 });
+  latch.update(true, 0);
+  latch.update(true, 900);
+  latch.cancel();
+  eq(latch.update(true, 1000).fired, false);
+  eq(latch.update(true, 1900).fired, false);
+  eq(latch.update(true, 2000).fired, true);
+});
+
+test("a backwards clock cannot stall the hold", () => {
+  const latch = createHoldLatch({ holdMs: 1000 });
+  latch.update(true, 5000);
+  eq(latch.update(true, 100).progress, 0);
+  eq(latch.update(true, 1100).fired, true);
 });
 
 console.log("\n" + "=".repeat(60));

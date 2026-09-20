@@ -44,6 +44,12 @@ import { planPartEdit } from "./interaction/partEdit.js";
 import { ndcToPixels, circleRadiusPx, clampCircle } from "./interaction/viewCapture.js";
 import { createFrameGuard } from "./interaction/frameGuard.js";
 import {
+  XR_BUTTON,
+  RESET_HOLD_MS,
+  buttonPressed,
+  createHoldLatch,
+} from "./interaction/resetHold.js";
+import {
   scaleRegion,
   pullRegion,
   flattenRegion,
@@ -1638,6 +1644,8 @@ renderer.setAnimationLoop(() => {
     }
   });
 
+  frameGuard("resetHold", updateResetHold);
+
   frameGuard("render", () => renderer.render(scene, camera));
 });
 
@@ -1853,3 +1861,186 @@ window.PerceptionCAD = {
     }
   },
 };
+
+// --- Hold left Y to reset -------------------------------------------------
+// Everything built, pointed at, measured and opened goes away and Percy
+// greets the user again — a clean slate without leaving the session.
+//
+// Y (xr-standard button 5) is the only free left-hand button far enough from
+// the resting thumb to be safe for something destructive, and even then it
+// needs a full second held down, with a ring filling in front of the user so
+// an accidental press can be abandoned by letting go.
+
+const resetLatch = createHoldLatch({ holdMs: RESET_HOLD_MS });
+
+const resetCue = new THREE.Group();
+resetCue.visible = false;
+scene.add(resetCue);
+
+const RESET_RING_INNER = 0.028;
+const RESET_RING_OUTER = 0.036;
+
+const resetTrack = new THREE.Mesh(
+  new THREE.RingGeometry(RESET_RING_INNER, RESET_RING_OUTER, 48),
+  new THREE.MeshBasicMaterial({
+    color: 0xff5722,
+    transparent: true,
+    opacity: 0.22,
+    side: THREE.DoubleSide,
+    depthTest: false,
+  })
+);
+resetTrack.renderOrder = 998;
+resetCue.add(resetTrack);
+
+// The filled arc. Its geometry encodes the angle, so it is rebuilt as the
+// hold advances — but only when the angle moved enough to see, rather than
+// once per frame at 90 fps.
+const resetArc = new THREE.Mesh(
+  new THREE.RingGeometry(RESET_RING_INNER, RESET_RING_OUTER, 48, 1, Math.PI / 2, 0),
+  new THREE.MeshBasicMaterial({
+    color: 0xff5722,
+    transparent: true,
+    opacity: 0.95,
+    side: THREE.DoubleSide,
+    depthTest: false,
+  })
+);
+resetArc.renderOrder = 999;
+resetCue.add(resetArc);
+
+const resetLabel = makeTextSprite({ widthM: 0.11, aspect: 0.32 });
+resetLabel.sprite.position.set(0, -0.055, 0);
+resetLabel.setText(["Hold to reset"]);
+resetCue.add(resetLabel.sprite);
+
+let resetArcProgress = -1;
+
+function setResetArc(progress) {
+  if (Math.abs(progress - resetArcProgress) < 0.02 && progress < 1) return;
+  resetArcProgress = progress;
+  resetArc.geometry.dispose();
+  // Clockwise from twelve o'clock, so it reads as a timer rather than a dial.
+  resetArc.geometry = new THREE.RingGeometry(
+    RESET_RING_INNER,
+    RESET_RING_OUTER,
+    48,
+    1,
+    Math.PI / 2 - progress * Math.PI * 2,
+    progress * Math.PI * 2
+  );
+}
+
+function layoutResetCue() {
+  const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
+  cam.updateMatrixWorld(true);
+  cam.getWorldPosition(_camPos);
+  cam.getWorldQuaternion(_camQuat);
+  _forward.set(0, 0, -1).applyQuaternion(_camQuat).normalize();
+  resetCue.position.copy(_camPos).addScaledVector(_forward, 0.5);
+  resetCue.quaternion.copy(_camQuat);
+}
+
+function updateResetHold() {
+  const session = renderer.xr.getSession();
+  const pressed = buttonPressed(session, "left", XR_BUTTON.Y_OR_B);
+  const { active, progress, fired } = resetLatch.update(pressed, performance.now());
+
+  resetCue.visible = active;
+  if (active) {
+    layoutResetCue();
+    setResetArc(progress);
+  }
+  if (fired) {
+    resetCue.visible = false;
+    resetEverything();
+  }
+}
+
+/** Drop the loaded model and every disposable thing hanging off it. */
+function disposeCurrentModel() {
+  if (!currentModel) return;
+  modelRoot.remove(currentModel);
+  currentModel.traverse((child) => {
+    if (!child.isMesh) return;
+    child.geometry?.dispose();
+    if (!child.material) return;
+    const mats = Array.isArray(child.material) ? child.material : [child.material];
+    mats.forEach((m) => m.dispose());
+  });
+  currentModel = null;
+}
+
+/**
+ * Full reset: back to the state right after entering AR, with no model, no
+ * panels, no selection and a fresh server session.
+ */
+function resetEverything() {
+  console.log("[Percy] Full reset");
+  setStatus("Resetting…", true);
+
+  // Modes first: each one narrates itself through setStatus, and the reset's
+  // own message should be the one left standing.
+  if (selectMode) setSelectMode(false);
+  if (tapeMode) setTapeMode(false);
+
+  // Gestures. endGrab() also parks the halo, and the pinch latches have to be
+  // cleared by hand or a hand still closed at reset reads as a fresh pinch.
+  if (grabbing) endGrab();
+  twoHandOn = false;
+  held[0] = held[1] = false;
+  wasPinching = { 0: false, 1: false };
+  pinchStartTime = { 0: 0, 1: 0 };
+  paramDrag = null;
+  pickerDragging = false;
+
+  // Anything drawn on or about the model.
+  clearSelectionHighlight();
+  clearHoverHighlight();
+  tape.clear();
+  paramPanel.sprite.visible = false;
+  activeParamRows = [];
+  dimsLabel.setVisible(false);
+  photoPicker.hide();
+  searchHud.hide();
+  itemPicker.hide();
+
+  // The model itself, plus every cached fact about it — without clearing
+  // lastLoadedGlbUrl, rebuilding the same prompt would be treated as "already
+  // loaded" and nothing would appear.
+  disposeCurrentModel();
+  lastLoadedGlbUrl = null;
+  lastModelId = null;
+  lastBackend = null;
+  lastTextured = false;
+  modelBaseMaxDim = 1;
+  modelBaseSize.set(1, 1, 1);
+  cadParams = {};
+  currentProjectId = null;
+  lastProjectId = null;
+  currentColor = "#C0C0C0";
+
+  // Placement and display scale.
+  navScale = 1;
+  navScaleAtTwoHandStart = 1;
+  modelRoot.scale.setScalar(1);
+  halo.material.opacity = 0.0;
+  halo.material.color.setHex(0x4f8cff);
+  placeholder.visible = renderer.xr.isPresenting;
+  if (renderer.xr.isPresenting) placeModelInFrontOfUser(0.7);
+
+  // The scene is already clean; the server wipe and the greeting must not be
+  // able to leave the status line stuck on "Resetting…" if either one throws.
+  percy
+    .resetSession()
+    .catch((err) => console.warn("[Percy] Session reset threw:", err))
+    .then(() => {
+      setStatus("Clean slate. Hold left trigger to talk.", true);
+      // Re-greet so a reset lands as Percy coming back rather than as
+      // silence. The AR session is still running, so the greeting's audio is
+      // not blocked by autoplay policy the way it would be on a cold load.
+      if (!voiceState.isMuted) percy.greet();
+    });
+}
+
+window.PerceptionCAD.resetEverything = resetEverything;
