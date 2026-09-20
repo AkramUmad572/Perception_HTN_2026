@@ -315,6 +315,7 @@ async def _execute_mesh(
     latency: dict[str, float],
     size_mm: float | None = None,
     use_nvidia: bool = True,
+    timeout_s: float = 150.0,
 ) -> tuple[bool, str | None, str | None, bool]:
     """Text-to-3D via three.ws / NVIDIA / Meshy. Never falls back to CadQuery."""
     nvidia_key = getattr(settings, "nvidia_api_key", "") or ""
@@ -324,7 +325,7 @@ async def _execute_mesh(
         meshy_api_key=settings.meshy_api_key or "",
         nvidia_api_key=nvidia_key if use_nvidia else "",
         three_ws=bool(getattr(settings, "three_ws_enabled", True)),
-        timeout_s=150.0,
+        timeout_s=timeout_s,
     )
     latency["mesh_ms"] = result.get("exec_ms", 0)
     if not result.get("ok"):
@@ -1491,8 +1492,12 @@ async def build_from_image(
                 logger.warning("Photo describe failed: %s", exc)
 
         if text_prompt:
+            # This is already the third fallback layer (hf_space and three.ws's
+            # own image lane both just failed above), with a fast, reliable
+            # CAD-from-photo fallback right behind it — so don't burn the full
+            # 150s a standalone voice sculpt would get; fail over to CAD sooner.
             ok, model_id, mesh_error, textured = await _execute_mesh(
-                text_prompt, session, settings, latency, use_nvidia=False
+                text_prompt, session, settings, latency, use_nvidia=False, timeout_s=45.0
             )
             if ok:
                 model_id = _record_version(

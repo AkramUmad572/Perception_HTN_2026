@@ -298,7 +298,7 @@ async def generate_three_ws_glb(
             raise MeshError(f"three.ws returned non-JSON object: {type(data)}")
         logger.info("three.ws status=%s keys=%s", data.get("status"), list(data)[:12])
         try:
-            glb_url = await _wait_for_glb(client, data, deadline, base)
+            glb_url = await _wait_for_glb(client, data, deadline, base, stall_s=QUEUE_STALL_S)
         except MeshError as exc:
             if base == THREE_WS_GENERATE and deadline - time.monotonic() > 25:
                 logger.warning("three.ws /generate job failed (%s); retrying once", exc)
@@ -308,7 +308,7 @@ async def generate_three_ws_glb(
                     if isinstance(data, dict):
                         try:
                             glb_url = await _wait_for_glb(
-                                client, data, deadline, THREE_WS_GENERATE
+                                client, data, deadline, THREE_WS_GENERATE, stall_s=QUEUE_STALL_S
                             )
                             await _download_glb(client, glb_url, dest)
                             return {"ok": True, "textured": True, "provider": "three_ws"}
@@ -330,7 +330,7 @@ async def generate_three_ws_glb(
             data = resp.json()
             if not isinstance(data, dict):
                 raise MeshError("three.ws forge text returned non-JSON.") from exc
-            glb_url = await _wait_for_glb(client, data, deadline, base)
+            glb_url = await _wait_for_glb(client, data, deadline, base, stall_s=QUEUE_STALL_S)
         await _download_glb(client, glb_url, dest)
     return {"ok": True, "textured": True, "provider": "three_ws"}
 
