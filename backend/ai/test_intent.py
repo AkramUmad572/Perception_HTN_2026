@@ -1197,6 +1197,86 @@ def test_semantic_edit_rung():
     return passed, failed
 
 
+def test_chat_never_hijacks_real_commands():
+    """
+    Real transcripts, not hand-trimmed ones: the wake word survives
+    normalization ("hey percy, ...") and Deepgram punctuates questions.
+    Both used to hand ordinary build/edit commands to the grounded chat LLM,
+    which answered with questions instead of building and cost a
+    google_search round trip on the way.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    from app.models import Selection
+
+    print("\n=== Test: chat never hijacks real commands ===")
+    passed = failed = 0
+    settings = SimpleNamespace(gemini_api_key="", openai_api_key="")
+
+    sel = Selection(center=[0.0, 0.1, 0.0], normal=[0.0, 1.0, 0.0],
+                    parts=["body"], radius=0.05)
+    CAD_SCRIPT = "import cadquery as cq\nresult = cq.Workplane('XY').box(1,1,1)"
+
+    async def _run(text, last_backend, selection=None, script=None):
+        return (
+            await intent_mod.parse_intent(
+                text, settings, None, {},
+                current_script=script, last_backend=last_backend,
+                selection=selection,
+            )
+        )[0]
+
+    # (text, session backend, selection, current_script)
+    must_build = [
+        # The wake word is normalized to a "hey percy," prefix, never stripped.
+        ("hey percy, add wings to my cube", "cad", sel, CAD_SCRIPT),
+        ("hey percy, make it taller", "cad", sel, CAD_SCRIPT),
+        ("hey percy, give it wings", "mesh", sel, None),
+        ("hey percy, add a hat", "mesh", sel, None),
+        # Deepgram punctuates; a polite build/edit request is still a command.
+        ("can you add wings to my cube?", "cad", sel, CAD_SCRIPT),
+        ("can you make it bigger?", "cad", sel, CAD_SCRIPT),
+        ("can you add a hat to it?", "mesh", sel, None),
+        ("could you put a horn on it?", "mesh", sel, None),
+    ]
+    for text, backend, selection, script in must_build:
+        got = asyncio.run(_run(text, backend, selection, script))
+        if got.action != "chat":
+            print(f"  [ok] stays on build path: {text!r} -> {got.action}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} hijacked by chat")
+            failed += 1
+
+    # Supplying the dimensions the model asked for must not make it refuse.
+    got = asyncio.run(_run("add two wings on the sides, 30 mm long", "mesh", sel, None))
+    if got.action == "semantic_edit":
+        print("  [ok] a sized semantic edit on a sculpt is not refused")
+        passed += 1
+    else:
+        print(f"  [FAIL] sized semantic edit got action={got.action!r} reply={got.reply!r}")
+        failed += 1
+
+    # Genuine conversation must still reach chat, wake word and all.
+    must_chat = [
+        ("hey percy, how's the weather?", "mesh", None, None),
+        ("hey percy, what can you do?", "cad", None, CAD_SCRIPT),
+        ("hey percy", "mesh", None, None),
+        ("what can you build?", "cad", None, CAD_SCRIPT),
+        ("how are you", "mesh", None, None),
+    ]
+    for text, backend, selection, script in must_chat:
+        got = asyncio.run(_run(text, backend, selection, script))
+        if got.action == "chat":
+            print(f"  [ok] chat: {text!r}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {text!r} should be chat, got action={got.action!r}")
+            failed += 1
+
+    return passed, failed
+
+
 def run_all_tests():
     """Run all intent parsing regression tests."""
     print("=" * 60)
@@ -1219,14 +1299,17 @@ def run_all_tests():
     sel_pass, sel_fail = test_selection_in_codegen_payload()
     ui_pass, ui_fail = test_ui_mode_rung()
     se_pass, se_fail = test_semantic_edit_rung()
+    hj_pass, hj_fail = test_chat_never_hijacks_real_commands()
 
     total_pass = (
         w_pass + t_pass + c_pass + p_pass + r_pass + m_pass + s_pass + ph_pass
         + ch_pass + co_pass + h_pass + a_pass + mb_pass + sel_pass + ui_pass + se_pass
+        + hj_pass
     )
     total_fail = (
         w_fail + t_fail + c_fail + p_fail + r_fail + m_fail + s_fail + ph_fail
         + ch_fail + co_fail + h_fail + a_fail + mb_fail + sel_fail + ui_fail + se_fail
+        + hj_fail
     )
 
     print("\n" + "=" * 60)
@@ -1248,6 +1331,7 @@ def run_all_tests():
     print(f"Selection in payload:       {sel_pass}/{sel_pass + sel_fail} passed")
     print(f"ui_mode rung:               {ui_pass}/{ui_pass + ui_fail} passed")
     print(f"Semantic edit rung:         {se_pass}/{se_pass + se_fail} passed")
+    print(f"Chat never hijacks cmds:    {hj_pass}/{hj_pass + hj_fail} passed")
     print(f"TOTAL:                      {total_pass}/{total_pass + total_fail} passed")
     
     if total_fail > 0:
