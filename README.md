@@ -1,112 +1,231 @@
-# Perception CAD
+<div align="center">
 
-Voice-driven CAD on **Meta Quest 3** via **WebXR passthrough AR** (Quest Browser) + **CadQuery**.
+<img src="docs/assets/perception-hero.png" alt="Perception — design through conversation" width="100%">
 
-Say a command while **holding** left trigger / pinch → model floats in your **real room** → right-pinch to move/spin.
+<br><br>
 
-## Stack
+**Say it. Watch it appear in your room. Reach out and change it.**
 
-| Piece | Tech |
-|---|---|
-| Headset UI | Three.js WebXR **immersive-ar** passthrough |
-| CAD | CadQuery sandbox (dimensional / printable parts) |
-| Mesh | three.ws / NVIDIA TRELLIS (free) or Meshy (optional paid) |
-| API | FastAPI |
-| Voice | Hold-to-talk (left trigger / pinch) + ElevenLabs STT/TTS |
+Voice-driven CAD in passthrough AR on Meta Quest 3 — real parametric geometry, in your hands.
 
-## Quest Testing
+<br>
 
-### Prerequisites
+![WebXR](https://img.shields.io/badge/WebXR-immersive--ar-8A9A85?style=flat-square)
+![Quest 3](https://img.shields.io/badge/Meta_Quest_3-passthrough-2F2E2B?style=flat-square)
+![Three.js](https://img.shields.io/badge/three.js-r181-8A9A85?style=flat-square)
+![FastAPI](https://img.shields.io/badge/FastAPI-backend-2F2E2B?style=flat-square)
+![CadQuery](https://img.shields.io/badge/CadQuery-parametric-8A9A85?style=flat-square)
+![Gemini](https://img.shields.io/badge/Gemini-intent_%2B_codegen-2F2E2B?style=flat-square)
 
-1. **Same network**: Quest and dev machine on same Wi-Fi/hotspot
-2. **Backend running** with API keys configured
-3. **HTTPS** for Quest Browser (WebXR requires secure context)
+</div>
 
-### Step-by-step
+---
 
-1. **Start backend** (on dev machine):
+## The loop
+
+<div align="center">
+
+|  **Idea**  |  **Converse**  |  **Visualize**  |  **Refine**  |  **Build**  |
+|:---:|:---:|:---:|:---:|:---:|
+| Hold to talk | Percy parses intent | Model lands in your room | Hands, not menus | STL / STEP / GLB out |
+| *"a 12-tooth gear"* | CAD or sculpt | passthrough AR | drag a dimension | printable |
+
+</div>
+
+Two engines behind one sentence. **Dimensional, printable parts** go to a CadQuery sandbox that emits a script with its sizes declared up front — so *"make the ears 4 mm longer"* is a parameter rewrite, not a re-roll. **Organic, characterful things** go to text-to-3D (three.ws, NVIDIA TRELLIS, or Meshy). Percy picks; you just talk.
+
+---
+
+## Quickstart
+
+<table>
+<tr><td width="50%" valign="top">
+
+**1 · Backend**
 
 ```bash
-conda activate perception_cad
+python3 -m venv .venv
+.venv/bin/pip install -r backend/requirements.txt
+
+cp backend/.env.example backend/.env   # add keys
 cd backend
-cp .env.example .env  # GEMINI_API_KEY, ELEVENLABS_API_KEY, MESHY_API_KEY
-PYTHONPATH=. uvicorn app.main:app --host 0.0.0.0 --port 8000
+PYTHONPATH=. uvicorn app.main:app \
+  --host 0.0.0.0 --port 8000
 ```
 
-2. **Start web client with HTTPS**:
+</td><td width="50%" valign="top">
+
+**2 · Client**
 
 ```bash
 cd web-client
 npm install
-npm run dev:https
+npm run dev
 ```
 
-3. **Find your IP**: `ifconfig | grep inet` or check network settings
+HTTPS is on by default — WebXR needs it.
+Open `https://<your-ip>:5173` in the
+Quest Browser and tap **Enter AR**.
 
-4. **On Quest Browser**: Navigate to `https://YOUR_IP:5173`
-   - Accept the self-signed certificate warning
-   - Allow microphone access when prompted
+</td></tr>
+</table>
 
-5. **Tap "Enter AR"** to start passthrough mode
+> [!TIP]
+> Find your IP with `ipconfig getifaddr en0`. Quest and dev machine must share a network, and you'll have to accept the self-signed certificate once.
 
-6. **Talk**:
-   - Hold **left trigger** or **left pinch** (anywhere — not on the model) and speak
-   - Release to send. Try: "build me a ring", "make it yellow", "bigger"
-   - Model appears in front of you
-   - **Right** pinch near the model to grab/move/spin
+**Desktop preview** — same server, opened at `https://localhost:5173`, boots the IWER Quest 3 emulator. Hold **Space** to talk.
 
-### Voice Commands
+---
 
-Free-rein: describe any object. CadQuery for dimensional/printable parts; Meshy for characters and organic models.
+## Talking to Percy
 
-| Say (while holding to talk) | Result |
-|---|---|
-| "build me a Pikachu keychain" | CadQuery charm + lug hole |
-| "make me a Pikachu" | Meshy sculpted character |
-| "build me a 12 tooth gear" | CadQuery |
-| "make me a toy car" | Meshy |
-| "make the ears longer" | Gemini edits the current CAD script |
-| "add a hole for a keychain" | Same CAD object, extra feature |
-| "make it twice as big" | CAD: scales dimensions. Mesh: re-sculpts |
-| "make it navy" / "paint it gold" | Recolor + rebuild |
-| "change the color" | Percy asks which color |
+Hold **left trigger** (or left pinch, or the on-screen **Hold** button, or **Space**) — speak — release.
 
-### Controls
+| Say this | What happens |
+|:---|:---|
+| *"build me a 12-tooth gear"* | CadQuery part, dimensioned and printable |
+| *"build me a Pikachu keychain"* | CadQuery charm with a lug hole |
+| *"make me a toy car"* | Text-to-3D sculpt |
+| *"make the ears longer"* | Rewrites one named dimension — no re-generation |
+| *"add a hole for a keychain"* | Boolean feature on the same object |
+| *"make it twice as big"* | CAD rescales dimensions; a sculpt re-sizes |
+| *"paint it gold"* / *"make it navy"* | Recolor and rebuild |
+| *"change the color"* | Percy asks which one |
+| *"find that photo of Pikachu in my photos"* | Searches connected apps, opens the AR photo carousel |
+| *"what should I work on?"* | Pulls a brief from Gmail / Notion / GitHub / Calendar |
+| *"publish this to the repo"* | Writes back to the app you named |
 
-- **Talk**: Hold left trigger, left pinch, overlay **Hold** button, or **Space**. Release to send.
-- **Mute**: Press **M** (desktop)
-- **Grab**: Right pinch near the model, or right controller trigger near the model
-- **Move/Spin**: While grabbing, move the right hand
+---
 
-### Troubleshooting
+## Controls
 
-| Issue | Fix |
-|---|---|
-| "API offline" | Check backend is running on port 8000 |
-| Nothing happens on hold | Allow microphone; hold longer than a tap |
-| Model not appearing | Look forward after entering AR |
-| Certificate error | Accept self-signed cert in Quest Browser |
-| Mic blocked | Quest Settings → Apps → Browser → Permissions |
+<table>
+<tr><th align="left">Hands & controllers</th><th align="left">Desktop</th></tr>
+<tr><td valign="top">
 
-## Desktop Preview
+| Do | Get |
+|:---|:---|
+| Hold **left trigger** / left pinch | Push to talk |
+| **Right pinch** near the model | Grab, move, spin |
+| **Both hands** pinch | Zoom, yaw, reposition *(view only)* |
+| Off-hand pinch while dragging | Fine mode — 0.1× movement |
+| Pinch-drag a dimension row | Live parametric resize |
+| Pinch two surface points | Tape measure |
+| Right-pinch stroke on the model | Lasso a region to edit |
+| Hold **left Y** for 1s | Full session reset (with a filling cue) |
 
-```bash
-cd web-client && npm run dev
+</td><td valign="top">
+
+| Key | Action |
+|:---:|:---|
+| `Space` | Hold to talk |
+| `M` | Mute |
+| `T` | Tape measure |
+| `V` | Select / lasso mode |
+| Scroll | Zoom |
+
+</td></tr>
+</table>
+
+---
+
+## How it fits together
+
+```mermaid
+flowchart LR
+  V([Voice]) --> STT[ElevenLabs STT]
+  STT --> I{Gemini<br/>intent}
+  I -->|dimensional| CQ[CadQuery sandbox]
+  I -->|organic| M[Text-to-3D]
+  I -->|named app| CP[Composio]
+  CP --> PK[Photo / work picker]
+  PK --> M
+  CQ --> G[(versioned GLB)]
+  M --> G
+  G --> XR[WebXR passthrough]
+  XR --> H[Hands: grab · measure · lasso · drag dimensions]
+  H -->|no LLM| G
 ```
 
-Open **https://localhost:5173** (IWSDK emulator window). Hold **Space** or the **Hold** button to talk. Right-controller trigger near the model to grab.
+The fast path matters: a hand edit on a named dimension is a **~67 ms** round trip, against ~15 s for the same change through codegen. Long image-to-3D builds run **detached** and the client polls — a dropped headset connection costs one poll, not the model.
 
-## API Endpoints
+<details>
+<summary><b>Repository layout</b></summary>
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/health` | GET | Check system status |
-| `/api/command` | POST | Text command (JSON: `{text, session_id}`) |
-| `/api/voice` | POST | Voice command (multipart: audio file) |
-| `/api/script` | POST | Execute CadQuery script (JSON: `{script, session_id, color}`) |
-| `/api/session/{id}` | GET | Get session state |
+```
+backend/
+  app/            FastAPI routes, pipeline, sessions, detached jobs
+    projects.py   Per-object version history — undo/redo over GLBs
+  cad/            CadQuery builder, sandbox, PARAMS read/rewrite, STL/STEP export
+  mesh/           Text-to-3D factories, boolean features, semantic sculpt edits
+  ai/             Intent parsing + CAD/mesh routing
+  voice/          ElevenLabs STT / TTS
+  photos/         Drive search, subject isolation, staging
+  composio_app/   Eight-app voice router: pickup, image-find, publish
 
-### Script Execution (for codegen integration)
+web-client/src/
+  main.js               WebXR scene, hands, model interaction
+  voice/
+    VoiceState.js       idle │ listening │ thinking │ speaking │ error │ muted
+    PTTRecorder.js      Hold-to-talk MediaRecorder
+    PercyAssistant.js   Orchestrator
+  interaction/          Pure, Node-testable math:
+    measure · twoHand · selection · regionOps · paramPanel · partEdit
+    tapeMeasure · viewCapture · resetHold · pttSource · frameGuard
+  PhotoPicker.js · ItemPicker.js · SearchHUD.js
+```
+
+Everything in `interaction/` avoids importing Three.js so the math runs — and is tested — in plain Node.
+
+</details>
+
+---
+
+## Connected apps
+
+Eight apps are wired through Composio. Percy routes by name, shows a logo HUD while each one runs, then hands back photos or a spoken receipt.
+
+<div align="center">
+
+| | | | | | | | |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Gmail | Drive | Photos | Calendar | Sheets | Notion | GitHub | Figma |
+
+</div>
+
+**Pickup** — Gmail, Notion, GitHub, Calendar, Sheets, Drive. **Image-find** — Photos, Drive, Figma, Gmail attachments. **Publish** — only the app you name. Anything else (Slack, Linear, Jira…) gets an honest *"that's not connected."*
+
+---
+
+## API
+
+<details open>
+<summary><b>Endpoints</b></summary>
+
+| Method | Endpoint | Description |
+|:---|:---|:---|
+| `GET` | `/api/health` | System status, CAD + mesh provider readiness |
+| `GET` | `/api/greet` | Deterministic, no-LLM greeting on entering AR |
+| `POST` | `/api/command` | Text command — `{text, session_id}` |
+| `POST` | `/api/voice` | Voice command — multipart audio (+ optional selection) |
+| `POST` | `/api/script` | Run a CadQuery script in the sandbox |
+| `POST` | `/api/image` | Image-to-3D — returns a job id |
+| `GET` | `/api/jobs/{id}` | Poll a detached build |
+| `GET` | `/api/session/{id}` | Session state |
+| `POST` | `/api/session/{id}/reset` | Wipe the session |
+| `GET` | `/api/projects/{id}` | Version history (read-only) |
+| `POST` | `/api/projects/{id}/undo` · `/redo` | Step through versions |
+| `POST` | `/api/projects/{id}/versions` | Save a hand-edited GLB as a new version |
+| `POST` | `/api/projects/{id}/params` | Rewrite named dimensions, rerun — no LLM |
+| `POST` | `/api/projects/{id}/resize` | Two-hand-stretch release → real-size rescale |
+| `POST` | `/api/projects/{id}/semantic_edit` | Edit a render inside a circled region, re-sculpt |
+| `GET` | `/api/photos/{file_id}/preview` | Same-origin photo for the AR picker |
+| `POST` | `/api/photos/confirm` · `/choose` | Confirm, then build the picked photo |
+
+</details>
+
+<details>
+<summary><b>Script execution (codegen integration)</b></summary>
 
 ```bash
 curl -X POST http://localhost:8000/api/script \
@@ -118,64 +237,88 @@ curl -X POST http://localhost:8000/api/script \
   }'
 ```
 
-Scripts run in a sandbox with:
-- 30s timeout (kills hung execution)
-- No filesystem access
-- No network access  
-- Non-manifold mesh rejection
-- Memory limits
+Scripts run sandboxed: **30 s timeout**, no filesystem, no network, memory limits, and non-manifold meshes rejected.
 
-## Architecture
+Named dimensions travel with the script as a module-level literal, which is what makes hand edits instant:
 
-```
-backend/
-  app/           FastAPI routes + pipeline
-  cad/           CadQuery builder + sandbox
-  mesh/          Text-to-3D factories (three.ws, NVIDIA, Meshy)
-  ai/            Intent parsing + cad/mesh router
-  voice/         STT/TTS (ElevenLabs)
-
-web-client/
-  src/
-    main.js      WebXR scene + model interaction
-    voice/
-      VoiceState.js       State machine (idle|listening|thinking|speaking|error|muted)
-      PTTRecorder.js      Hold-to-talk MediaRecorder
-      PercyAssistant.js    Orchestrator
+```python
+PARAMS = {"ear_length_mm": 16, "head_radius_mm": 16}
 ```
 
-## VoiceState Hooks (for HUD integration)
+`cad/params.py` reads and rewrites that literal with `ast` plus text splicing — **never by executing the script** — so it is safe on untrusted code and fast enough to run on every drag.
 
-The client exposes `window.voiceState` for in-world HUD:
+</details>
+
+<details>
+<summary><b>VoiceState hooks (for in-world HUD)</b></summary>
 
 ```javascript
 import { voiceState, VoiceStates } from './voice/VoiceState.js';
 
-// Subscribe to state changes
 voiceState.subscribe(({ state, isMuted, errorMessage }) => {
-  // state: 'idle' | 'listening' | 'thinking' | 'speaking' | 'error' | 'muted'
+  // 'idle' | 'listening' | 'thinking' | 'speaking' | 'error' | 'muted'
   updateHudIndicator(state);
 });
 
-// Check current state
 if (voiceState.isListening) { /* show recording indicator */ }
-
-// Toggle mute
 voiceState.toggleMute();
 ```
 
-## Environment Variables
+Also exposed as `window.voiceState`.
 
-Copy `.env.example` to `.env` and configure:
+</details>
+
+---
+
+## Configuration
+
+Copy `backend/.env.example` to `backend/.env`:
 
 ```bash
-# Required for voice
-ELEVENLABS_API_KEY=your_key
+# Voice
+ELEVENLABS_API_KEY=            # STT + TTS
+DEEPGRAM_API_KEY=              # optional, better STT
 
-# LLM for intent parsing (one of)
-GEMINI_API_KEY=your_key
-OPENAI_API_KEY=your_key
+# Intent, codegen, semantic edits (one of)
+GEMINI_API_KEY=                # preferred — free-tier friendly
+OPENAI_API_KEY=
 
-# Optional: better STT
-DEEPGRAM_API_KEY=your_key
+# Text-to-3D — any one works; three.ws needs no key
+NVIDIA_API_KEY=                # free TRELLIS
+MESHY_API_KEY=                 # optional, paid
+HF_TOKEN=                      # optional, raises ZeroGPU budget
+
+# Connected apps + photo search (optional)
+COMPOSIO_API_KEY=
+COMPOSIO_USER_ID=
+GOOGLE_DRIVE_API_KEY=
+GOOGLE_DRIVE_FOLDER_ID=        # empty = photo search off
 ```
+
+---
+
+## Tests
+
+```bash
+./run_tests.sh
+```
+
+Backend suites run on the project venv (`.venv`) so missing deps report honestly instead of as phantom failures. Client suites are plain `node` — the interaction math is pure by design.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|:---|:---|
+| **"API offline"** | Backend isn't up on port 8000 |
+| **Nothing happens on hold** | Allow the microphone; hold longer than a tap |
+| **Certificate error** | Accept the self-signed cert in Quest Browser |
+| **Mic blocked** | Quest Settings → Apps → Browser → Permissions |
+| **Model not appearing** | Look forward after entering AR |
+| **Build never lands** | It's detached — check `GET /api/jobs/{id}` |
+
+<div align="center">
+<br>
+<sub><b>Perception</b> · spatial design for a more intuitive tomorrow</sub>
+</div>
