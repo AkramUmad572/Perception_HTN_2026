@@ -172,6 +172,54 @@ def test_run_publish_no_model() -> None:
     asyncio.run(go())
 
 
+def test_run_publish_email_only_no_model() -> None:
+    async def go() -> None:
+        intent = Intent(
+            action="publish_work",
+            apps=["gmail"],
+            pull_kind="publish",
+            params={
+                "format": "stl",
+                "export": False,
+                "drive": False,
+                "gmail": True,
+                "wants_email": True,
+                "recipient": "Omer",
+                "attach": False,
+                "email_body": "the demo is ready whenever you want to see it",
+            },
+        )
+        session = _session(last_script=None, glb_url=None)
+        settings = _settings(Path("/tmp/perception_publish_test"))
+        with (
+            patch("composio_app.runner.export_session_model") as exp,
+            patch("composio_app.runner.upload_drive_file", new_callable=AsyncMock) as drive,
+            patch("composio_app.runner.send_gmail", new_callable=AsyncMock, return_value={"ok": True}) as gmail,
+            patch("composio_app.runner.synthesize_speech", new_callable=AsyncMock, return_value=(None, 0)),
+            patch("composio_app.runner.jobs.set_app_status"),
+            patch("composio_app.runner.jobs.get", return_value=SimpleNamespace(progress={"apps": []})),
+            patch("composio_app.runner.save_session"),
+        ):
+            result = await run_publish(intent, session, settings, "job9")
+        assert result.ok and result.action == "published"
+        assert "Build something first" not in result.reply
+        assert "emailed omer" in result.reply.lower()
+        exp.assert_not_called()
+        drive.assert_not_called()
+        gmail.assert_called_once()
+        kwargs = gmail.call_args.kwargs
+        args = gmail.call_args.args
+        to = kwargs.get("recipient") or (args[1] if len(args) > 1 else None)
+        body = kwargs.get("body") or (args[3] if len(args) > 3 else None)
+        attach = kwargs.get("attachment") if "attachment" in kwargs else (args[4] if len(args) > 4 else None)
+        assert to == "omer.sjd05@gmail.com"
+        assert "the demo is ready whenever you want to see it" in body
+        assert attach is None
+        print("ok run_publish_email_only_no_model")
+
+    asyncio.run(go())
+
+
 def test_run_publish_drive_only() -> None:
     async def go() -> None:
         tmp = Path("/tmp/perception_publish_test")
@@ -213,6 +261,7 @@ if __name__ == "__main__":
     test_start_publish_job_hud()
     test_run_publish_export_and_email()
     test_run_publish_no_model()
+    test_run_publish_email_only_no_model()
     test_run_publish_print_and_email_both_files()
     test_run_publish_drive_only()
     print("all publish job tests passed")

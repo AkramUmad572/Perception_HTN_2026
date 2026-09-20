@@ -290,13 +290,14 @@ def _needed_formats(spec: dict[str, Any]) -> list[str]:
 def _publish_reply(spec: dict[str, Any], dest_name: str, emailed: str | None) -> str:
     fmt = (spec.get("format") or "stl").upper()
     bits: list[str] = []
-    if spec.get("drive"):
-        if " and " in dest_name:
-            bits.append(f"saved as {dest_name} files successfully in Google Drive")
+    if dest_name:
+        if spec.get("drive"):
+            if " and " in dest_name:
+                bits.append(f"saved as {dest_name} files successfully in Google Drive")
+            else:
+                bits.append(f"saved as a {dest_name} file successfully in Google Drive")
         else:
-            bits.append(f"saved as a {dest_name} file successfully in Google Drive")
-    else:
-        bits.append(f"exported {dest_name}")
+            bits.append(f"exported {dest_name}")
     if emailed:
         bits.append(f"emailed {emailed}")
     if not bits:
@@ -311,7 +312,13 @@ async def run_publish(intent: Intent, session: SessionState, settings: Settings,
     fmt = formats[0]
     apps = list(intent.apps or [])
 
-    if not _has_model(session):
+    # Exporting (and therefore needing a model on screen) is only required
+    # when something actually consumes the exported file: an attachment or
+    # a Drive upload. A plain "email John saying X" touches neither, so it
+    # must work with nothing built yet.
+    needs_model = bool(spec.get("attach")) or bool(spec.get("drive"))
+
+    if needs_model and not _has_model(session):
         reply = "Build something first, then I can export it."
         audio_url, tts_ms = await synthesize_speech(reply, settings)
         return CommandResponse(
@@ -325,57 +332,61 @@ async def run_publish(intent: Intent, session: SessionState, settings: Settings,
             latency_ms={"tts_ms": tts_ms},
         )
 
-    stem = safe_stem(spec.get("filename"), default_stem(session))
-    exported_by_fmt: dict[str, dict[str, Any]] = {}
+    paths: dict[str, Path] = {}
+    dest_path: Path | None = None
+    dest_name = ""
     export_ms = 0.0
-    last_error = ""
-    dest = Path(settings.glb_dir) / "publish" / f"{stem}.stl"
-    for item in formats:
-        dest = Path(settings.glb_dir) / "publish" / f"{stem}.{'step' if item == 'step' else 'stl'}"
-        exported = export_session_model(session, settings, dest, item)
-        export_ms += float(exported.get("ms") or 0)
-        if not exported.get("ok") and item == "step" and not spec.get("format_explicit"):
-            if "stl" not in exported_by_fmt:
-                dest = dest.with_suffix(".stl")
-                exported = export_session_model(session, settings, dest, "stl")
-                export_ms += float(exported.get("ms") or 0)
-                item = "stl"
-            else:
-                logger.warning("STEP export failed (%s); keeping STL", exported.get("error"))
-                continue
-        if exported.get("ok"):
-            exported_by_fmt[item] = exported
-        else:
-            last_error = str(exported.get("error") or "export failed")
-    if not exported_by_fmt:
-        err = last_error or "export failed"
-        if err == "step_needs_cad":
-            reply = "I need the CAD script to export STEP. Ask me to rebuild it, then try again."
-        elif err == "no_model":
-            reply = "Build something first, then I can export it."
-        else:
-            reply = "I couldn't export that. Rebuild it, then try again."
-        audio_url, tts_ms = await synthesize_speech(reply, settings)
-        return CommandResponse(
-            ok=False,
-            reply=reply,
-            action="clarify",
-            session=session,
-            backend="mesh",
-            reply_audio_url=audio_url,
-            error=str(err),
-            apps=jobs.get(job_id).progress.get("apps") if jobs.get(job_id) else [],
-            latency_ms={"tts_ms": tts_ms},
-        )
 
-    paths = {key: Path(val.get("path") or "") for key, val in exported_by_fmt.items() if val.get("path")}
-    dest_path = paths.get("stl") or paths.get("step") or Path(next(iter(exported_by_fmt.values())).get("path") or dest)
-    dest_name = " and ".join(p.name for p in (paths.get("stl"), paths.get("step")) if p)
-    if not dest_name:
-        dest_name = dest_path.name
-    exported = next(iter(exported_by_fmt.values()))
-    exported["ms"] = export_ms
-    spec["format"] = "step" if "step" in paths and "stl" not in paths else ("stl" if "stl" in paths else fmt)
+    if needs_model:
+        stem = safe_stem(spec.get("filename"), default_stem(session))
+        exported_by_fmt: dict[str, dict[str, Any]] = {}
+        last_error = ""
+        dest = Path(settings.glb_dir) / "publish" / f"{stem}.stl"
+        for item in formats:
+            dest = Path(settings.glb_dir) / "publish" / f"{stem}.{'step' if item == 'step' else 'stl'}"
+            exported = export_session_model(session, settings, dest, item)
+            export_ms += float(exported.get("ms") or 0)
+            if not exported.get("ok") and item == "step" and not spec.get("format_explicit"):
+                if "stl" not in exported_by_fmt:
+                    dest = dest.with_suffix(".stl")
+                    exported = export_session_model(session, settings, dest, "stl")
+                    export_ms += float(exported.get("ms") or 0)
+                    item = "stl"
+                else:
+                    logger.warning("STEP export failed (%s); keeping STL", exported.get("error"))
+                    continue
+            if exported.get("ok"):
+                exported_by_fmt[item] = exported
+            else:
+                last_error = str(exported.get("error") or "export failed")
+        if not exported_by_fmt:
+            err = last_error or "export failed"
+            if err == "step_needs_cad":
+                reply = "I need the CAD script to export STEP. Ask me to rebuild it, then try again."
+            elif err == "no_model":
+                reply = "Build something first, then I can export it."
+            else:
+                reply = "I couldn't export that. Rebuild it, then try again."
+            audio_url, tts_ms = await synthesize_speech(reply, settings)
+            return CommandResponse(
+                ok=False,
+                reply=reply,
+                action="clarify",
+                session=session,
+                backend="mesh",
+                reply_audio_url=audio_url,
+                error=str(err),
+                apps=jobs.get(job_id).progress.get("apps") if jobs.get(job_id) else [],
+                latency_ms={"tts_ms": tts_ms},
+            )
+
+        paths = {key: Path(val.get("path") or "") for key, val in exported_by_fmt.items() if val.get("path")}
+        dest_path = paths.get("stl") or paths.get("step") or Path(next(iter(exported_by_fmt.values())).get("path") or dest)
+        dest_name = " and ".join(p.name for p in (paths.get("stl"), paths.get("step")) if p)
+        if not dest_name:
+            dest_name = dest_path.name
+        spec["format"] = "step" if "step" in paths and "stl" not in paths else ("stl" if "stl" in paths else fmt)
+
     emailed: str | None = None
     auth_failed = False
     perm_failed = False
@@ -438,16 +449,17 @@ async def run_publish(intent: Intent, session: SessionState, settings: Settings,
             jobs.set_app_status(job_id, "gmail", "live")
         try:
             attach: Path | list[Path] | None = None
-            if spec.get("attach", True):
+            if spec.get("attach"):
                 files = [p for p in (paths.get("step"), paths.get("stl")) if p]
                 if len(files) == 1:
                     attach = files[0]
                 elif files:
                     attach = files
+            subject = (dest_path.stem.replace("_", " ") if dest_path else "") or "Message from Percy"
             sent = await send_gmail(
                 settings,
                 to,
-                subject=dest_path.stem.replace("_", " ") or "CAD model",
+                subject=subject,
                 body=compose_email_body(spec),
                 attachment=attach,
             )
@@ -499,7 +511,7 @@ async def run_publish(intent: Intent, session: SessionState, settings: Settings,
         glb_url=session.glb_url,
         model_id=session.model_id,
         apps=progress_apps,
-        latency_ms={"tts_ms": tts_ms, "export_ms": exported.get("ms") or 0},
+        latency_ms={"tts_ms": tts_ms, "export_ms": export_ms},
     )
 
 

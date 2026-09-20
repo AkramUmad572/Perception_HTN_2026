@@ -34,6 +34,9 @@ def test_email_named() -> None:
     assert spec["drive"] is False
     assert spec["email_body"] == "we finished the model"
     assert spec["signoff"] and "Umad" in spec["signoff"]
+    # A plain "email X saying Y" must never require a model to attach.
+    assert spec["attach"] is False
+    assert spec["export"] is False
     body = compose_email_body(spec)
     assert "we finished the model" in body
     assert "export" not in body.lower()
@@ -56,6 +59,8 @@ def test_combined_export_email() -> None:
     assert "export" not in spec["email_body"].lower()
     assert "stl" not in spec["email_body"].lower()
     assert "attach" not in spec["email_body"].lower()
+    assert spec["attach"] is True
+    assert spec["export"] is True
     print("ok combined_export_email")
 
 
@@ -96,6 +101,16 @@ def test_unnamed_email() -> None:
     assert spec["recipient"] is None
     assert spec["gmail"] is False
     print("ok unnamed_email")
+
+
+def test_explicit_attach_without_export_words() -> None:
+    spec = parse_publish("send this model to Omer saying take a look")
+    assert spec
+    assert spec["gmail"] is True
+    assert spec["recipient"] == "Omer"
+    assert spec["attach"] is True
+    assert spec["export"] is True
+    print("ok explicit_attach_without_export_words")
 
 
 def test_not_publish() -> None:
@@ -148,6 +163,7 @@ if __name__ == "__main__":
     test_address_plus_drive()
     test_send_email_to_name()
     test_unnamed_email()
+    test_explicit_attach_without_export_words()
     test_not_publish()
     test_step()
     test_print_vs_send_format()

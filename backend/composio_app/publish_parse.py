@@ -44,6 +44,13 @@ _RECIPIENT = re.compile(
     re.I,
 )
 _SAYING = re.compile(r"\b(?:saying|tell them|that says)\s+(.+)$", re.I)
+# Attaching the model is opt-in: a plain "email John saying X" must never
+# require a model to exist. Only an explicit export/print cue, or explicitly
+# naming "the model"/"this file"/"attach", pulls the model in.
+_EXPLICIT_ATTACH = re.compile(
+    r"\bsend\s+(?:this|it|the)\s+(?:model|file)\b|\battach(?:ed|ing)?\b",
+    re.I,
+)
 _NAME_IT = re.compile(r"\bname(?:d)?\s+it\s+([A-Za-z0-9][A-Za-z0-9_\-]*)", re.I)
 _AS_NAME = re.compile(
     r"\bas\s+(?!an?\s)(?!stl\b)(?!step\b)(?!stp\b)([A-Za-z0-9][A-Za-z0-9_\-]*)",
@@ -213,19 +220,23 @@ def parse_publish(text: str) -> dict[str, Any] | None:
         filename = named.group(1)
     # Print / bare export land on Drive. Email-only stays local unless they named Drive or print.
     drive = wants_drive or wants_print or (wants_export and not wants_email)
+    # Attaching the model is opt-in — "email John saying the demo is ready"
+    # must not require a model to exist. Only an explicit export/print cue,
+    # or explicitly naming "the model"/"this file"/"attach", pulls it in.
+    attach = wants_export or bool(_EXPLICIT_ATTACH.search(t))
     return {
         "format": fmt,
         "formats": formats,
         "format_reason": reason,
         "format_explicit": reason == "explicit",
-        "export": True,
+        "export": attach or drive,
         "drive": drive,
         "gmail": bool(wants_email and recipient),
         "wants_email": wants_email,
         "folder": _folder_of(t),
         "filename": filename,
         "recipient": recipient,
-        "attach": True,
+        "attach": attach,
         "signoff": _signoff_of(t) if wants_email else None,
         "email_body": _body_of(t) if wants_email else None,
     }
