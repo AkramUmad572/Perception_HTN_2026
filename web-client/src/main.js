@@ -1376,6 +1376,31 @@ async function captureViewWithCircle(selection) {
   const W = 1024;
   const H = 1024;
 
+  // Render the MODEL only. renderer.render(scene, ...) would also draw the
+  // voice indicator, the dimensions label, the param panel and the tracked
+  // hand meshes, and Gemini would faithfully edit a picture of the model with
+  // floating hands and text labels in it. Hide every top-level child that is
+  // not the model or a light, then put it all back.
+  const hidden = [];
+  for (const child of scene.children) {
+    if (child === modelRoot || child.isLight) continue;
+    if (child.visible) {
+      hidden.push(child);
+      child.visible = false;
+    }
+  }
+  // These two are parented to currentModel, so the loop above misses them.
+  // Hide them explicitly rather than relying on the clear-order of whoever
+  // consumed the selection.
+  for (const marker of [selectionMarker, hoverMarker]) {
+    if (marker.visible) {
+      hidden.push(marker);
+      marker.visible = false;
+    }
+  }
+  const prevBg = scene.background;
+  scene.background = new THREE.Color(0xffffff);
+
   const rt = new THREE.WebGLRenderTarget(W, H);
   const prevTarget = renderer.getRenderTarget();
   let buf;
@@ -1387,6 +1412,8 @@ async function captureViewWithCircle(selection) {
   } finally {
     renderer.setRenderTarget(prevTarget);
     rt.dispose();
+    scene.background = prevBg;
+    for (const child of hidden) child.visible = true;
   }
 
   // readRenderTargetPixels is bottom-up; a canvas is top-down.
