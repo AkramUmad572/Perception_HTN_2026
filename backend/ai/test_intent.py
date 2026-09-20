@@ -899,23 +899,23 @@ def test_photo_search_fast_path():
         )[0]
 
     intent = asyncio.run(_run())
-    # Since the Composio work (3bfa524), an image request naming a source app
-    # is claimed by route_composio ABOVE the is_photo_search rung, on purpose:
-    # COMPOSIO_PLAN.md's `image-sources` todo widens the search from Drive
-    # alone to Photos / Drive / Figma / Gmail. It returns pull_app immediately
-    # with a job_id; the job's RESULT is what carries action="find_photos" and
-    # the candidate list (composio_app/runner.py:196), so the user still ends
-    # at the same pinchable photo card. This asserts the routing contract; the
-    # picker payload is the runner's contract, below.
-    if intent.action == "pull_app" and "googlephotos" in (intent.apps or []):
-        print(f"  [ok] parse_intent → pull_app apps={intent.apps} kind={intent.pull_kind}")
+    # The Composio work (3bfa524) put route_composio above this rung, which
+    # swallowed "from my photos" phrasing before the picker ever saw it. That
+    # was found twice independently and fixed two ways; d3b3d11's fix won and
+    # is the one kept: is_photo_search runs FIRST, so the local demo-folder
+    # picker stays reachable. The tradeoff against Composio's overlapping
+    # trigger phrases is documented in ai/intent.py at the reorder.
+    if intent.action == "find_photos" and "pikachu" in (intent.photo_query or "").lower():
+        print(f"  [ok] parse_intent → find_photos {intent.photo_query!r}")
         passed += 1
     else:
-        print(f"  [FAIL] parse_intent {intent.action} apps={getattr(intent, 'apps', None)}")
+        print(f"  [FAIL] parse_intent {intent.action} {intent.photo_query}")
         failed += 1
 
-    # The guarantee that actually matters to the client: a successful photos
-    # pull still answers in the shape PhotoPicker consumes.
+    # Independent of which rung wins: when a Composio pull DOES run and finds
+    # photos, it must still answer in the shape PhotoPicker consumes, or the
+    # app-search path silently stops producing a pinchable card. Verified
+    # red-green by flipping that action in the runner.
     import inspect
 
     from composio_app import runner
