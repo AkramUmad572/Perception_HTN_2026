@@ -14,6 +14,11 @@ const SESSION_ID = "default";
 const READY_HINT =
   "Hold left trigger / pinch to talk. Right pinch the model to move it.";
 
+// Thrown by _awaitJob when a newer turn has overtaken the one it's polling
+// for — distinguishes "abandoned, not an error" from a real failure so
+// _deliverResponse/choosePhoto can drop it silently instead of surfacing it.
+class StaleTurnError extends Error {}
+
 // Kept under the proxy's own limit so a stall surfaces here, with a message,
 // rather than as a severed connection.
 const REQUEST_TIMEOUT_MS = 180000;
@@ -440,10 +445,11 @@ export class PercyAssistant {
         { file_id: fileId, session_id: SESSION_ID },
         30000
       );
-      const result = started.job_id ? await this._awaitJob(started.job_id) : started;
+      const result = started.job_id ? await this._awaitJob(started.job_id, turnSeq) : started;
       await this._handleResponse(result, turnSeq);
       return result;
     } catch (e) {
+      if (e instanceof StaleTurnError) return null;
       voiceState.toError(e.message);
       this.onStatusMessage(`Error: ${e.message}`, false);
       setTimeout(() => voiceState.toIdle(), 3000);
@@ -512,13 +518,20 @@ export class PercyAssistant {
     }
   }
 
-  async _awaitJob(jobId) {
+  async _awaitJob(jobId, turnSeq) {
     const url = `${API_BASE}/api/jobs/${jobId}?session_id=${SESSION_ID}`;
     const deadline = Date.now() + JOB_MAX_MS;
     let misses = 0;
 
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, JOB_POLL_MS));
+      // A newer turn started while this one was still polling (e.g. reset,
+      // or a faster later command) — stop polling and progress-narrating for
+      // a build nobody's waiting on anymore instead of running for up to
+      // JOB_MAX_MS against an abandoned turn.
+      if (typeof turnSeq === "number" && turnSeq < this._turnSeq) {
+        throw new StaleTurnError("superseded by a newer turn");
+      }
       let data;
       try {
         data = await this._fetchJson(url, {}, 20000);
@@ -555,10 +568,11 @@ export class PercyAssistant {
     }
     await this._handleResponse(result, turnSeq);
     try {
-      const final = await this._awaitJob(result.job_id);
+      const final = await this._awaitJob(result.job_id, turnSeq);
       await this._handleResponse(final, turnSeq);
       return final;
     } catch (e) {
+      if (e instanceof StaleTurnError) return null;
       voiceState.toError(e.message);
       this.onStatusMessage(`Error: ${e.message}`, false);
       setTimeout(() => voiceState.toIdle(), 3000);
@@ -568,6 +582,22 @@ export class PercyAssistant {
 
   async _handleResponse(data, turnSeq) {
     if (data && typeof turnSeq === "number") data.__seq = turnSeq;
+
+    // A response whose turn is behind the one most recently started belongs
+    // to a command that's been superseded — a build still running when the
+    // user reset, or one a faster later command already overtook. Voicing it
+    // or touching voiceState here would clobber whatever the newer turn is
+    // doing: in particular, if the user is already mid-recording a fresh
+    // command, an unguarded toSpeaking() here flips voiceState away from
+    // "listening" out from under them, and the real endTalk() release that
+    // follows then finds voiceState no longer listening and silently drops
+    // it — the mic looks stuck ("won't talk") until something else happens
+    // to reset state. Drop the whole response instead of just the model.
+    if (typeof turnSeq === "number" && turnSeq < this._turnSeq) {
+      console.log("[Percy] Dropping stale response (turn", turnSeq, "< latest", this._turnSeq, ")");
+      return;
+    }
+
     const heard = data.transcript ? `"${data.transcript}" → ` : "";
     const ms = data.latency_ms?.total_ms ? ` (${Math.round(data.latency_ms.total_ms)}ms)` : "";
 
@@ -629,6 +659,10 @@ export class PercyAssistant {
    */
   async resetSession() {
     this._cancelPending = false;
+    // A live recording this abort() interrupts never reaches endTalk()'s own
+    // reset of this flag, since abort() bypasses endTalk() entirely — left
+    // set, it would only self-correct on the next beginTalk().
+    this._releasePending = false;
     this.recorder.abort();
     if (this.replyAudio) {
       try {

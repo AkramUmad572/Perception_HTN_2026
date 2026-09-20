@@ -204,6 +204,40 @@ await test("a prompt during a running build is still sent", async () => {
   assert(voiceState.state !== "listening", `stuck in "${voiceState.state}"`);
 });
 
+await test("a stale build response does not clobber a fresh recording", async () => {
+  const percy = makePercy();
+  let resolveJob;
+  percy._sendVoice = async () => ({
+    ok: true,
+    reply: "building",
+    action: "building",
+    job_id: "job-stale",
+  });
+  percy._awaitJob = () => new Promise((resolve) => (resolveJob = resolve));
+
+  await percy.beginTalk();
+  const deliver = percy.endTalk(); // starts the stale build; _awaitJob never resolves yet
+  await settle();
+
+  // The user gives up and resets — main.js's resetEverything() bumps the
+  // turn counter this same way — then starts a brand new recording.
+  percy._nextTurn();
+  await percy.beginTalk();
+  assert(voiceState.state === "listening", "the fresh recording never started listening");
+
+  // NOW the stale build finally resolves and lands, with a spoken reply.
+  resolveJob({ ok: true, reply: "finished the stale model", action: "generate" });
+  await deliver;
+  await settle();
+
+  assert(
+    voiceState.state === "listening",
+    `the stale build response clobbered the active recording — state is now "${voiceState.state}"`
+  );
+
+  voiceState.toIdle(); // done with the still-open recording; no network round trip needed
+});
+
 console.log("\n=== Release before the mic is open ===");
 
 await test("a tap released during getUserMedia does not strand the mic", async () => {
