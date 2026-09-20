@@ -67,6 +67,7 @@ import {
   PART_SCALE_STEP,
 } from "./partEdit.js";
 import { ndcToPixels, circleRadiusPx, clampCircle } from "./viewCapture.js";
+import { createFrameGuard } from "./frameGuard.js";
 
 const assert = (condition, message) => {
   if (!condition) throw new Error(`ASSERTION FAILED: ${message}`);
@@ -687,6 +688,157 @@ test("clampCircle handles a point projected off-screen behind the camera", () =>
   assert(Number.isFinite(c.cx) && Number.isFinite(c.cy), "non-finite centre");
   assert(c.cx >= c.r && c.cx <= 512 - c.r, `cx off canvas: ${c.cx}`);
   assert(c.cy >= c.r && c.cy <= 512 - c.r, `cy off canvas: ${c.cy}`);
+});
+
+console.log("\n=== frameGuard.js ===");
+
+test("a throwing step does not stop the steps after it", () => {
+  const guard = createFrameGuard({ log: () => {} });
+  const ran = [];
+  guard("a", () => ran.push("a"));
+  guard("b", () => {
+    throw new Error("boom");
+  });
+  guard("c", () => ran.push("c"));
+  eq(ran.join(","), "a,c");
+});
+
+test("guard never rethrows, so the caller can re-queue the next frame", () => {
+  const guard = createFrameGuard({ log: () => {} });
+  let reached = false;
+  // If guard rethrew, `reached` would stay false -- this is the whole point:
+  // three.js re-queues rAF AFTER the callback returns, so a throw that escapes
+  // stops rendering permanently.
+  guard("x", () => {
+    throw new Error("boom");
+  });
+  reached = true;
+  assert(reached, "guard rethrew");
+});
+
+test("guard reports success and failure", () => {
+  const guard = createFrameGuard({ log: () => {} });
+  eq(guard("ok", () => {}), true);
+  eq(
+    guard("bad", () => {
+      throw new Error("boom");
+    }),
+    false
+  );
+});
+
+test("repeated failures are logged once per throttle window, not every frame", () => {
+  // At 90fps an unthrottled log would emit 90 lines a second and bury the
+  // console, which is where the actual error would be.
+  let clock = 0;
+  const lines = [];
+  const guard = createFrameGuard({ log: (m) => lines.push(m), now: () => clock, throttleMs: 5000 });
+  for (let i = 0; i < 200; i++) {
+    clock += 11; // ~90fps
+    guard("spin", () => {
+      throw new Error("boom");
+    });
+  }
+  eq(lines.length, 1);
+});
+
+test("logging resumes after the throttle window", () => {
+  let clock = 0;
+  const lines = [];
+  const guard = createFrameGuard({ log: (m) => lines.push(m), now: () => clock, throttleMs: 1000 });
+  const boom = () => {
+    throw new Error("boom");
+  };
+  guard("s", boom);
+  clock += 1500;
+  guard("s", boom);
+  eq(lines.length, 2);
+});
+
+test("different steps are throttled independently", () => {
+  let clock = 0;
+  const lines = [];
+  const guard = createFrameGuard({ log: (m) => lines.push(m), now: () => clock, throttleMs: 5000 });
+  const boom = () => {
+    throw new Error("boom");
+  };
+  guard("one", boom);
+  guard("two", boom);
+  eq(lines.length, 2);
+});
+
+test("the log names the step and counts repeats", () => {
+  let clock = 0;
+  const lines = [];
+  const guard = createFrameGuard({ log: (m) => lines.push(m), now: () => clock, throttleMs: 0 });
+  const boom = () => {
+    throw new Error("kaboom");
+  };
+  guard("updateTwoHand", boom);
+  guard("updateTwoHand", boom);
+  assert(lines[0].includes("updateTwoHand"), `no step name: ${lines[0]}`);
+  assert(lines[1].includes("2"), `no repeat count: ${lines[1]}`);
+  assert(lines[0].includes("kaboom"), `no message: ${lines[0]}`);
+});
+
+test("failures() counts throws per step", () => {
+  const guard = createFrameGuard({ log: () => {} });
+  const boom = () => {
+    throw new Error("boom");
+  };
+  guard("z", boom);
+  guard("z", boom);
+  guard("ok", () => {});
+  eq(guard.failures("z"), 2);
+  eq(guard.failures("ok"), 0);
+  eq(guard.failures("never"), 0);
+});
+
+test("the render loop survives a throwing step (three.js loop semantics)", () => {
+  // Reproduces WebGLAnimation.onAnimationFrame: it runs the callback and only
+  // THEN re-queues, so a throw that escapes never reaches the re-queue and
+  // rendering stops for good. Unguarded this survives 0 frames.
+  function runLoop(callback, maxFrames) {
+    let frames = 0;
+    function onAnimationFrame() {
+      callback();
+      if (++frames < maxFrames) onAnimationFrame();
+    }
+    try {
+      onAnimationFrame();
+    } catch (e) {
+      /* loop is dead, exactly as in the browser */
+    }
+    return frames;
+  }
+  const boom = () => {
+    throw new Error("null model");
+  };
+
+  const unguarded = runLoop(() => boom(), 50);
+  eq(unguarded, 0);
+
+  let rendered = 0;
+  const guard = createFrameGuard({ log: () => {} });
+  const guarded = runLoop(() => {
+    guard("bad", boom);
+    guard("render", () => rendered++);
+  }, 50);
+  eq(guarded, 50);
+  eq(rendered, 50);
+  eq(guard.failures("bad"), 50);
+});
+
+test("a non-Error throw is handled", () => {
+  const lines = [];
+  const guard = createFrameGuard({ log: (m) => lines.push(m), throttleMs: 0 });
+  eq(
+    guard("odd", () => {
+      throw "a string";
+    }),
+    false
+  );
+  assert(lines[0].includes("a string"), `lost the value: ${lines[0]}`);
 });
 
 console.log("\n" + "=".repeat(60));

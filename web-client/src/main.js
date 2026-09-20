@@ -42,6 +42,7 @@ import {
 import { selectionFromStroke, isTapRelease } from "./interaction/selection.js";
 import { planPartEdit } from "./interaction/partEdit.js";
 import { ndcToPixels, circleRadiusPx, clampCircle } from "./interaction/viewCapture.js";
+import { createFrameGuard } from "./interaction/frameGuard.js";
 import {
   scaleRegion,
   pullRegion,
@@ -1571,6 +1572,8 @@ window.addEventListener("resize", () => {
 let pulsePhase = 0;
 let lastTick = performance.now();
 
+const frameGuard = createFrameGuard();
+
 renderer.setAnimationLoop(() => {
   if (needsUserPlacement && renderer.xr.isPresenting) {
     placeFrameCount += 1;
@@ -1602,28 +1605,38 @@ renderer.setAnimationLoop(() => {
     }
   }
 
-  pollHand(left, 0);
-  pollHand(right, 1);
-  updateTwoHand();
-  if (!twoHandOn) updateGrab();
-  updateParamPanel();
-  updateParamDrag();
-  updateSelectionHover();
-  dimsLabel.follow(currentModel, camera);
-  tape.update();
-  const nowTick = performance.now();
-  const dt = (nowTick - lastTick) / 1000;
-  photoPicker.tick(dt);
-  searchHud.tick(dt);
-  lastTick = nowTick;
+  // Each step is guarded: three.js re-queues the next frame only after this
+  // callback returns, so one uncaught throw here would stop rendering for good
+  // and freeze the headset. See interaction/frameGuard.js.
+  frameGuard("pollHand", () => {
+    pollHand(left, 0);
+    pollHand(right, 1);
+  });
+  frameGuard("updateTwoHand", updateTwoHand);
+  frameGuard("updateGrab", () => {
+    if (!twoHandOn) updateGrab();
+  });
+  frameGuard("updateParamPanel", updateParamPanel);
+  frameGuard("updateParamDrag", updateParamDrag);
+  frameGuard("updateSelectionHover", updateSelectionHover);
+  frameGuard("dimsLabel", () => dimsLabel.follow(currentModel, camera));
+  frameGuard("tape", () => tape.update());
+  frameGuard("tick", () => {
+    const nowTick = performance.now();
+    const dt = (nowTick - lastTick) / 1000;
+    photoPicker.tick(dt);
+    searchHud.tick(dt);
+    lastTick = nowTick;
+  });
+  frameGuard("halo", () => {
+    if (!grabbing && !twoHandOn) {
+      const decay = 0.92;
+      halo.material.opacity *= decay;
+      if (halo.material.opacity < 0.01) halo.material.opacity = 0;
+    }
+  });
 
-  if (!grabbing && !twoHandOn) {
-    const decay = 0.92;
-    halo.material.opacity *= decay;
-    if (halo.material.opacity < 0.01) halo.material.opacity = 0;
-  }
-
-  renderer.render(scene, camera);
+  frameGuard("render", () => renderer.render(scene, camera));
 });
 
 let desktopMode = null;
