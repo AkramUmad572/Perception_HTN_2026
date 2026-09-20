@@ -23,12 +23,21 @@ class ComposioPermissionError(RuntimeError):
 
 
 def _sdk(settings: Settings):
+    from pathlib import Path
+
     from composio import Composio
 
     key = (settings.composio_api_key or "").strip()
     if not key:
         raise ComposioAuthError("COMPOSIO_API_KEY is not set.")
-    return Composio(api_key=key)
+    upload_dirs = [str(Path(settings.glb_dir).resolve())]
+    home_temp = Path.home() / ".composio" / "temp"
+    upload_dirs.append(str(home_temp))
+    return Composio(
+        api_key=key,
+        dangerously_allow_auto_upload_download_files=True,
+        file_upload_dirs=upload_dirs,
+    )
 
 
 def composio_ready(settings: Settings) -> bool:

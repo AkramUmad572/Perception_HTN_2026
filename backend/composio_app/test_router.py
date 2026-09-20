@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
+from datetime import date
+
 from composio_app.router import route_composio
+
+_TODAY = date.today().strftime("%Y/%m/%d")
 
 
 def test_named() -> None:
@@ -22,6 +26,24 @@ def test_named() -> None:
         ("which apps are you connected to", "list_connections", None, None),
         ("list your connections", "list_connections", None, None),
         ("what integrations are you connected to", "list_connections", None, None),
+        ("Export this to STL.", "publish_work", ["googledrive"], "publish"),
+        ("Export this model for 3d printing.", "publish_work", ["googledrive"], "publish"),
+        ("Send this model to Omer saying we finished.", "publish_work", ["gmail"], "publish"),
+        ("Store it in the HTN folder and name it pikachu_keychain.", "publish_work", ["googledrive"], "publish"),
+        ("Email Omer saying we finished the model, best regards from Umad.", "publish_work", ["gmail"], "publish"),
+        (
+            "Export this to STL and email Omer saying we finished the model, attach it, best regards from Umad.",
+            "publish_work",
+            ["gmail"],
+            "publish",
+        ),
+        (
+            "Export to STL, put it in HTN as pikachu_keychain, and email Omer saying we finished",
+            "publish_work",
+            ["googledrive", "gmail"],
+            "publish",
+        ),
+        ("email them saying we finished", "clarify", None, None),
     ]
     fail = 0
     for text, action, apps, kind in cases:
@@ -104,7 +126,7 @@ def test_named() -> None:
     else:
         print("ok notes →", notes.photo_query, notes.params)
     today = route_composio("emails about tesla from today")
-    if not today or (today.params or {}).get("on_date") != "2026/09/19":
+    if not today or (today.params or {}).get("on_date") != _TODAY:
         print("FAIL today date", getattr(today, "params", None))
         fail += 1
     else:
@@ -115,6 +137,26 @@ def test_named() -> None:
         fail += 1
     else:
         print("ok range →", ranged.params)
+    unnamed = route_composio("email them saying we finished")
+    if not unnamed or unnamed.action != "clarify" or "Who" not in (unnamed.reply or ""):
+        print("FAIL unnamed email", getattr(unnamed, "action", None), getattr(unnamed, "reply", None))
+        fail += 1
+    else:
+        print("ok unnamed email clarify")
+    combo = route_composio(
+        "Export this to STL and email Omer saying we finished the model please take a look, attach it, and send best regards from Umad."
+    )
+    if not combo or combo.params.get("email_body") != "we finished the model please take a look":
+        print("FAIL combo body", getattr(combo, "params", None))
+        fail += 1
+    else:
+        print("ok combo body →", combo.params.get("email_body"))
+    slack_plus = route_composio("Export this to STL and slack @everyone")
+    if not slack_plus or slack_plus.action != "publish_work":
+        print("FAIL slack ignored", getattr(slack_plus, "action", None))
+        fail += 1
+    else:
+        print("ok slack ignored on export")
     if fail:
         raise SystemExit(fail)
 

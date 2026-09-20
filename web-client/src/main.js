@@ -632,7 +632,7 @@ async function setModelFromResponse(data) {
   cadParams = data.cad_params || {};
   if (data.session?.project_id) currentProjectId = data.session.project_id;
   if (data.session?.project_id) lastProjectId = data.session.project_id;
-  if (data.action === "find_photos" || data.action === "browse_photos" || data.action === "searching" || data.action === "show_items" || data.action === "publishing") {
+  if (data.action === "find_photos" || data.action === "browse_photos" || data.action === "searching" || data.action === "show_items" || data.action === "publishing" || data.action === "published") {
     return;
   }
   if (data.action === "ui_mode") {

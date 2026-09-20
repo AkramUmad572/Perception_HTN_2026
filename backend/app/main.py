@@ -569,11 +569,13 @@ async def job_status(job_id: str, session_id: str = "default"):
 
     # No reply_audio_url: a poll every few seconds must not talk over itself.
     apps = (job.progress or {}).get("apps") or []
-    if apps:
+    kind = (job.progress or {}).get("kind")
+    if apps or kind == "publish":
+        publishing = kind == "publish"
         return CommandResponse(
             ok=True,
-            reply=(job.progress or {}).get("caption") or "Still looking…",
-            action="searching",
+            reply=(job.progress or {}).get("caption") or ("Still sending…" if publishing else "Still looking…"),
+            action="publishing" if publishing else "searching",
             session=session,
             backend="mesh",
             job_id=job_id,

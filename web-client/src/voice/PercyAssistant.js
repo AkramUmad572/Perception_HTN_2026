@@ -347,7 +347,6 @@ export class PercyAssistant {
         body.lon = _cachedLocation.lon;
       }
       const result = await this._postJson(`${API_BASE}/api/command`, body);
-
       // The router says this is a semantic edit but has no picture yet: the
       // headset renders the current view with the selection circled and posts
       // it to /semantic_edit, which answers with a job to poll.
@@ -359,8 +358,7 @@ export class PercyAssistant {
         return result;
       }
 
-      await this._deliverResponse(result);
-      return result;
+      return await this._deliverResponse(result);
     } catch (e) {
       voiceState.toError(e.message);
       this.onStatusMessage(`Error: ${e.message}`, false);

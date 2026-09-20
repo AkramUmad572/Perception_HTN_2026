@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     # Public Drive folder of demo photos. Empty = photo search is off.
     google_drive_api_key: str = ""
     google_drive_folder_id: str = ""
+    # CAD STL/STEP publish uploads (HTN_Files).
+    composio_drive_export_folder_id: str = "121UctsMUXz9NyGu0sSV_bUdMN_pELW8q"
 
     glb_dir: Path = STORAGE / "glb"
     audio_dir: Path = STORAGE / "audio"

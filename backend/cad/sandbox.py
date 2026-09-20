@@ -410,6 +410,39 @@ def _export_assembly(assy, out_glb: str) -> bool:
     return True
 
 
+def exec_cad_script(script: str) -> Any:
+    """Run a generated script in the same environment the headset viewer uses.
+
+    Hex cq.Color, the CadQuery allowlist, and result discovery stay in one place
+    so publish STL/STEP cannot drift from the model already on screen.
+    """
+    import math
+
+    _validate_script(script)
+    safe_globals = _create_safe_builtins()
+    safe_globals["__import__"] = _safe_import
+    safe_cq = _SafeCadQueryProxy()
+    safe_globals["cq"] = safe_cq
+    safe_globals["cadquery"] = safe_cq
+    safe_globals["math"] = math
+    local_vars: dict[str, Any] = {}
+    exec(script, safe_globals, local_vars)
+    result = (
+        local_vars.get("result")
+        or local_vars.get("solid")
+        or local_vars.get("model")
+        or local_vars.get("assembly")
+    )
+    if result is None:
+        for val in local_vars.values():
+            if _is_assembly(val) or hasattr(val, "val") or hasattr(val, "toOCC"):
+                result = val
+                break
+    if result is None:
+        raise SandboxError("Script must define 'result', 'solid', 'model', or 'assembly'")
+    return result
+
+
 def _run_in_sandbox(script: str, out_glb: str, result_queue: multiprocessing.Queue):
     """Execute script in sandboxed subprocess."""
     try:
@@ -420,31 +453,7 @@ def _run_in_sandbox(script: str, out_glb: str, result_queue: multiprocessing.Que
         except (ImportError, ValueError):
             pass
 
-        _validate_script(script)
-
-        safe_globals = _create_safe_builtins()
-        safe_globals["__import__"] = _safe_import
-
-        safe_cq = _SafeCadQueryProxy()
-        safe_globals["cq"] = safe_cq
-        safe_globals["cadquery"] = safe_cq
-
-        import math
-        safe_globals["math"] = math
-
-        local_vars: dict[str, Any] = {}
-
-        exec(script, safe_globals, local_vars)
-
-        result = local_vars.get("result") or local_vars.get("solid") or local_vars.get("model") or local_vars.get("assembly")
-        if result is None:
-            for name, val in local_vars.items():
-                if _is_assembly(val) or hasattr(val, "val") or hasattr(val, "toOCC"):
-                    result = val
-                    break
-
-        if result is None:
-            raise SandboxError("Script must define 'result', 'solid', 'model', or 'assembly'")
+        result = exec_cad_script(script)
 
         multi_color = False
         if _is_assembly(result):

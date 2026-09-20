@@ -10,6 +10,9 @@ from app import jobs
 from app.config import Settings
 from app.models import CommandResponse, Intent, SessionState
 from app.session import save_session
+from pathlib import Path
+
+from cad.export import default_stem, export_session_model, safe_stem
 from composio_app.adapters import (
     public_folder_images,
     pull_calendar,
@@ -22,9 +25,13 @@ from composio_app.adapters import (
     pull_last_email,
     pull_notion_pages,
     pull_sheets,
+    lookup_gmail_person,
+    send_gmail,
+    upload_drive_file,
 )
 from composio_app.apps import APPS, chip
 from composio_app.client import ComposioAuthError, ComposioPermissionError
+from composio_app.publish_parse import compose_email_body, resolve_recipient
 from composio_app.summary import summarize_emails
 from voice.speech import synthesize_speech
 
@@ -263,4 +270,265 @@ def start_pull_job(
         backend="mesh",
         job_id=job_id,
         apps=apps,
+    )
+
+
+def _has_model(session: SessionState) -> bool:
+    return bool((session.last_script or "").strip() or (session.glb_url or "").strip())
+
+
+def _needed_formats(spec: dict[str, Any]) -> list[str]:
+    raw = spec.get("formats") or [spec.get("format") or "stl"]
+    out: list[str] = []
+    for item in raw:
+        fmt = "step" if item in ("step", "stp") else "stl"
+        if fmt not in out:
+            out.append(fmt)
+    return out or ["stl"]
+
+
+def _publish_reply(spec: dict[str, Any], dest_name: str, emailed: str | None) -> str:
+    fmt = (spec.get("format") or "stl").upper()
+    bits: list[str] = []
+    if spec.get("drive"):
+        if " and " in dest_name:
+            bits.append(f"saved as {dest_name} files successfully in Google Drive")
+        else:
+            bits.append(f"saved as a {dest_name} file successfully in Google Drive")
+    else:
+        bits.append(f"exported {dest_name}")
+    if emailed:
+        bits.append(f"emailed {emailed}")
+    if not bits:
+        bits.append(f"exported to {fmt}")
+    text = " and ".join(bits)
+    return text[0].upper() + text[1:] + "."
+
+
+async def run_publish(intent: Intent, session: SessionState, settings: Settings, job_id: str) -> CommandResponse:
+    spec = dict(intent.params or {})
+    formats = _needed_formats(spec)
+    fmt = formats[0]
+    apps = list(intent.apps or [])
+
+    if not _has_model(session):
+        reply = "Build something first, then I can export it."
+        audio_url, tts_ms = await synthesize_speech(reply, settings)
+        return CommandResponse(
+            ok=False,
+            reply=reply,
+            action="clarify",
+            session=session,
+            backend="mesh",
+            reply_audio_url=audio_url,
+            apps=jobs.get(job_id).progress.get("apps") if jobs.get(job_id) else [],
+            latency_ms={"tts_ms": tts_ms},
+        )
+
+    stem = safe_stem(spec.get("filename"), default_stem(session))
+    exported_by_fmt: dict[str, dict[str, Any]] = {}
+    export_ms = 0.0
+    last_error = ""
+    dest = Path(settings.glb_dir) / "publish" / f"{stem}.stl"
+    for item in formats:
+        dest = Path(settings.glb_dir) / "publish" / f"{stem}.{'step' if item == 'step' else 'stl'}"
+        exported = export_session_model(session, settings, dest, item)
+        export_ms += float(exported.get("ms") or 0)
+        if not exported.get("ok") and item == "step" and not spec.get("format_explicit"):
+            if "stl" not in exported_by_fmt:
+                dest = dest.with_suffix(".stl")
+                exported = export_session_model(session, settings, dest, "stl")
+                export_ms += float(exported.get("ms") or 0)
+                item = "stl"
+            else:
+                logger.warning("STEP export failed (%s); keeping STL", exported.get("error"))
+                continue
+        if exported.get("ok"):
+            exported_by_fmt[item] = exported
+        else:
+            last_error = str(exported.get("error") or "export failed")
+    if not exported_by_fmt:
+        err = last_error or "export failed"
+        if err == "step_needs_cad":
+            reply = "I need the CAD script to export STEP. Ask me to rebuild it, then try again."
+        elif err == "no_model":
+            reply = "Build something first, then I can export it."
+        else:
+            reply = "I couldn't export that. Rebuild it, then try again."
+        audio_url, tts_ms = await synthesize_speech(reply, settings)
+        return CommandResponse(
+            ok=False,
+            reply=reply,
+            action="clarify",
+            session=session,
+            backend="mesh",
+            reply_audio_url=audio_url,
+            error=str(err),
+            apps=jobs.get(job_id).progress.get("apps") if jobs.get(job_id) else [],
+            latency_ms={"tts_ms": tts_ms},
+        )
+
+    paths = {key: Path(val.get("path") or "") for key, val in exported_by_fmt.items() if val.get("path")}
+    dest_path = paths.get("stl") or paths.get("step") or Path(next(iter(exported_by_fmt.values())).get("path") or dest)
+    dest_name = " and ".join(p.name for p in (paths.get("stl"), paths.get("step")) if p)
+    if not dest_name:
+        dest_name = dest_path.name
+    exported = next(iter(exported_by_fmt.values()))
+    exported["ms"] = export_ms
+    spec["format"] = "step" if "step" in paths and "stl" not in paths else ("stl" if "stl" in paths else fmt)
+    emailed: str | None = None
+    auth_failed = False
+    perm_failed = False
+
+    if spec.get("drive") and "googledrive" in apps:
+        jobs.set_app_status(job_id, "googledrive", "live")
+        try:
+            to_upload = [p for p in (paths.get("stl"), paths.get("step")) if p] or [dest_path]
+            uploaded = {"ok": False}
+            for cad_path in to_upload:
+                uploaded = await upload_drive_file(settings, cad_path, spec.get("folder"))
+                if not uploaded.get("ok"):
+                    break
+            jobs.set_app_status(job_id, "googledrive", "done" if uploaded.get("ok") else "error")
+            if uploaded.get("ok") and session.project_id:
+                from app import projects
+
+                projects.mark_saved_to_drive(settings, session.project_id)
+        except ComposioAuthError as exc:
+            logger.warning("Drive upload auth failed: %s", exc)
+            jobs.set_app_status(job_id, "googledrive", "error")
+            auth_failed = True
+        except ComposioPermissionError as exc:
+            logger.warning("Drive upload permission failed: %s", exc)
+            jobs.set_app_status(job_id, "googledrive", "error")
+            perm_failed = True
+        except Exception as exc:
+            logger.warning("Drive upload failed: %s", exc)
+            jobs.set_app_status(job_id, "googledrive", "error")
+
+    if spec.get("wants_email"):
+        spoken = spec.get("recipient")
+        to = resolve_recipient(spoken, session.last_items)
+        if not to and spoken and "@" not in str(spoken):
+            try:
+                to = await lookup_gmail_person(settings, str(spoken))
+            except Exception as exc:
+                logger.warning("Gmail people lookup failed: %s", exc)
+                to = None
+        if not to:
+            reply = (
+                f"I don't have an email for {spoken}. Say the address?"
+                if spoken
+                else "Who should I send it to?"
+            )
+            if "gmail" in apps:
+                jobs.set_app_status(job_id, "gmail", "error")
+            audio_url, tts_ms = await synthesize_speech(reply, settings)
+            return CommandResponse(
+                ok=False,
+                reply=reply,
+                action="clarify",
+                session=session,
+                backend="mesh",
+                reply_audio_url=audio_url,
+                apps=jobs.get(job_id).progress.get("apps") if jobs.get(job_id) else [],
+                latency_ms={"tts_ms": tts_ms},
+            )
+        if "gmail" in apps:
+            jobs.set_app_status(job_id, "gmail", "live")
+        try:
+            attach: Path | list[Path] | None = None
+            if spec.get("attach", True):
+                files = [p for p in (paths.get("step"), paths.get("stl")) if p]
+                if len(files) == 1:
+                    attach = files[0]
+                elif files:
+                    attach = files
+            sent = await send_gmail(
+                settings,
+                to,
+                subject=dest_path.stem.replace("_", " ") or "CAD model",
+                body=compose_email_body(spec),
+                attachment=attach,
+            )
+            if "gmail" in apps:
+                jobs.set_app_status(job_id, "gmail", "done" if sent.get("ok") else "error")
+            if sent.get("ok"):
+                emailed = spoken or to
+            else:
+                perm_failed = True
+        except ComposioAuthError as exc:
+            logger.warning("Gmail send auth failed: %s", exc)
+            if "gmail" in apps:
+                jobs.set_app_status(job_id, "gmail", "error")
+            auth_failed = True
+        except ComposioPermissionError as exc:
+            logger.warning("Gmail send permission failed: %s", exc)
+            if "gmail" in apps:
+                jobs.set_app_status(job_id, "gmail", "error")
+            perm_failed = True
+        except Exception as exc:
+            logger.warning("Gmail send failed: %s", exc)
+            if "gmail" in apps:
+                jobs.set_app_status(job_id, "gmail", "error")
+            perm_failed = True
+
+    save_session(session)
+    progress_apps = jobs.get(job_id).progress.get("apps") if jobs.get(job_id) else [chip(s, "done") for s in apps]
+    if auth_failed and not emailed and not spec.get("drive"):
+        reply = "Composio's API key was rejected. Add a valid project key and I'll send this out."
+        action = "clarify"
+        ok = False
+    elif perm_failed and not emailed and spec.get("wants_email"):
+        reply = "I couldn't send that email. Check the Gmail connection and try again."
+        action = "clarify"
+        ok = False
+    else:
+        reply = _publish_reply(spec, dest_name, emailed)
+        action = "published"
+        ok = True
+
+    audio_url, tts_ms = await synthesize_speech(reply, settings)
+    return CommandResponse(
+        ok=ok,
+        reply=reply,
+        action=action,
+        session=session,
+        backend=session.last_backend or "cad",
+        reply_audio_url=audio_url,
+        glb_url=session.glb_url,
+        model_id=session.model_id,
+        apps=progress_apps,
+        latency_ms={"tts_ms": tts_ms, "export_ms": exported.get("ms") or 0},
+    )
+
+
+def start_publish_job(
+    intent: Intent,
+    session: SessionState,
+    settings: Settings,
+    transcript: str | None,
+) -> CommandResponse:
+    apps = [chip(s, "queued") for s in (intent.apps or [])]
+    caption = intent.reply or "Sending this out…"
+    box: dict[str, str] = {}
+
+    async def work() -> CommandResponse:
+        result = await run_publish(intent, session, settings, box["id"])
+        result.transcript = transcript
+        return result
+
+    job_id = jobs.start(work, progress={"apps": apps, "caption": caption, "kind": "publish"})
+    box["id"] = job_id
+
+    return CommandResponse(
+        ok=True,
+        transcript=transcript,
+        reply=caption,
+        action="publishing",
+        session=session,
+        backend="mesh",
+        job_id=job_id,
+        apps=apps,
+        progress={"apps": apps, "caption": caption, "kind": "publish"},
     )

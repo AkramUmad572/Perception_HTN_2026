@@ -7,6 +7,7 @@ from typing import Any
 
 from app.models import Intent
 from composio_app.apps import ALIASES, APPS, DISCONNECTED, IMAGE_SET, PICKUP_SET, PUBLISH_SET
+from composio_app.publish_parse import parse_publish
 
 _ALL_PHOTOS = re.compile(
     r"\b(?:all|every|across)\b.+\b(?:photos?|pictures?|pics|images?)\b"
@@ -197,8 +198,9 @@ def route_composio(text: str, *, has_brief: bool = False, object_hint: str | Non
     if _CONNECTIONS.search(t):
         return Intent(action="list_connections", backend="mesh", reply="Let me check, sir…")
 
+    spec = parse_publish(t)
     blocked = _disconnected(t)
-    if blocked:
+    if blocked and not spec:
         return Intent(
             action="clarify",
             backend="mesh",
@@ -206,6 +208,36 @@ def route_composio(text: str, *, has_brief: bool = False, object_hint: str | Non
         )
 
     apps = _named_apps(t)
+
+    if spec:
+        if spec.get("wants_email") and not spec.get("recipient"):
+            return Intent(
+                action="clarify",
+                backend="mesh",
+                reply="Who should I send it to?",
+            )
+        named: list[str] = []
+        if spec.get("drive"):
+            named.append("googledrive")
+        if spec.get("gmail"):
+            named.append("gmail")
+        if spec.get("drive") and spec.get("gmail"):
+            reply = "Sending this out…"
+        elif spec.get("gmail"):
+            reply = "Sending the email…"
+        elif spec.get("drive") and spec.get("folder"):
+            reply = "Saving to Drive…"
+        else:
+            fmt = (spec.get("format") or "stl").upper()
+            reply = f"Exporting to {fmt}…"
+        return Intent(
+            action="publish_work",
+            backend="mesh",
+            reply=reply,
+            apps=named,
+            pull_kind="publish",
+            params=spec,
+        )
 
     if _PUBLISH.search(t) and apps:
         named = [a for a in apps if a in PUBLISH_SET]
@@ -216,6 +248,17 @@ def route_composio(text: str, *, has_brief: bool = False, object_hint: str | Non
                 reply="Sending this out…",
                 apps=named,
                 pull_kind="publish",
+                params={
+                    "format": "step" if "gmail" in named or "notion" in named else "stl",
+                    "formats": ["step"] if "gmail" in named or "notion" in named else ["stl"],
+                    "format_reason": "send" if "gmail" in named or "notion" in named else "default",
+                    "format_explicit": False,
+                    "export": True,
+                    "drive": "googledrive" in named,
+                    "gmail": "gmail" in named,
+                    "wants_email": "gmail" in named,
+                    "attach": True,
+                },
             )
 
     if _ALL_PHOTOS.search(t) or (

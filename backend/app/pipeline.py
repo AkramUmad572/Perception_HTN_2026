@@ -485,11 +485,14 @@ async def apply_intent(
     response_backend = intent.backend or session.last_backend or "cad"
     candidates: list[dict] = []
 
-    if action in ("pull_app", "image_find", "pickup_work", "publish_work"):
+    if action == "publish_work":
+        from composio_app.runner import start_publish_job
+
+        return start_publish_job(intent, session, settings, transcript)
+
+    if action in ("pull_app", "image_find", "pickup_work"):
         from composio_app.runner import start_pull_job
 
-        if action == "publish_work":
-            intent.reply = "Sending this out…"
         return start_pull_job(intent, session, settings, transcript)
 
     if action == "build_from_brief":

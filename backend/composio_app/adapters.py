@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from app.config import Settings
@@ -804,3 +805,142 @@ async def cache_prefixed(file_id: str, settings: Settings):
     path = settings.ref_dir / f"drive_{stem}_raw{suffix_for(mime)}"
     path.write_bytes(raw)
     return path, mime
+
+
+def _composio_ok(payload: Any) -> bool:
+    data = _as_dict(payload)
+    if data.get("successful") is False:
+        return False
+    err = data.get("error") or data.get("error_message")
+    return not err
+
+
+def _first_id(payload: Any) -> str | None:
+    for layer in _payload_layers(payload):
+        for key in ("id", "fileId", "file_id", "folderId", "folder_id"):
+            val = layer.get(key)
+            if val:
+                return str(val)
+        file_obj = layer.get("file") or layer.get("folder")
+        if isinstance(file_obj, dict) and file_obj.get("id"):
+            return str(file_obj["id"])
+    return None
+
+
+async def find_or_create_drive_folder(settings: Settings, hint: str) -> str | None:
+    folder_id = await _find_drive_folder(settings, hint)
+    if folder_id:
+        return folder_id
+    raw = await execute(settings, "GOOGLEDRIVE_CREATE_FOLDER", {"name": hint})
+    created = _first_id(raw)
+    logger.info("Drive created folder %r → %s", hint, created)
+    return created
+
+
+async def upload_drive_file(
+    settings: Settings,
+    path: Path,
+    folder_hint: str | None = None,
+) -> dict[str, Any]:
+    folder_id = (getattr(settings, "composio_drive_export_folder_id", None) or "").strip()
+    if not folder_id and folder_hint:
+        try:
+            folder_id = await find_or_create_drive_folder(settings, folder_hint)
+        except Exception as exc:
+            logger.warning("Drive folder resolve failed (%s); uploading to root", exc)
+    args: dict[str, Any] = {"file_to_upload": str(Path(path).resolve())}
+    if folder_id:
+        args["folder_to_upload_to"] = folder_id
+    raw = await execute(settings, "GOOGLEDRIVE_UPLOAD_FILE", args)
+    data = _as_dict(raw)
+    data["ok"] = _composio_ok(raw)
+    data["file_id"] = _first_id(raw)
+    data["folder_id"] = folder_id
+    return data
+
+
+def _emails_from_people(payload: Any) -> list[tuple[str, str]]:
+    """Return (display_name, email) pairs from GMAIL_SEARCH_PEOPLE."""
+    out: list[tuple[str, str]] = []
+    people: list[Any] = []
+    for layer in _payload_layers(payload):
+        for key in ("results", "people", "connections", "otherContacts"):
+            val = layer.get(key)
+            if isinstance(val, list):
+                people.extend(val)
+        person = layer.get("person")
+        if isinstance(person, dict):
+            people.append(person)
+    for person in people:
+        if not isinstance(person, dict):
+            continue
+        wrapped = isinstance(person.get("person"), dict) and "emailAddresses" not in person and "names" not in person
+        if wrapped:
+            person = person["person"]
+        names = person.get("names") or []
+        display = ""
+        if isinstance(names, list) and names:
+            display = str(names[0].get("displayName") or names[0].get("givenName") or "")
+        addrs = person.get("emailAddresses") or person.get("email_addresses") or []
+        if isinstance(addrs, dict):
+            addrs = [addrs]
+        for addr in addrs if isinstance(addrs, list) else []:
+            email = ""
+            if isinstance(addr, dict):
+                email = str(addr.get("value") or addr.get("email") or "")
+            elif isinstance(addr, str):
+                email = addr
+            if email and "@" in email:
+                out.append((display, email))
+    return out
+
+
+async def lookup_gmail_person(settings: Settings, name: str) -> str | None:
+    """Resolve a spoken first name via Gmail contacts / Other Contacts."""
+    query = (name or "").strip()
+    if not query or "@" in query:
+        return None
+    raw = await execute(
+        settings,
+        "GMAIL_SEARCH_PEOPLE",
+        {"query": query, "page_size": 8, "other_contacts": True},
+    )
+    pairs = _emails_from_people(raw)
+    if not pairs:
+        return None
+    needle = query.lower()
+    exact = [email for display, email in pairs if needle in (display or "").lower()]
+    chosen = exact[0] if exact else pairs[0][1]
+    logger.info("Gmail people %r → %s (%s matches)", query, chosen, len(pairs))
+    return chosen
+
+
+async def send_gmail(
+    settings: Settings,
+    recipient: str,
+    subject: str,
+    body: str,
+    attachment: Path | list[Path] | None = None,
+) -> dict[str, Any]:
+    to = (recipient or "").strip()
+    if not to or to.lower() == "me":
+        raise ValueError("Gmail needs a named recipient, not me.")
+    args: dict[str, Any] = {
+        "recipient_email": to,
+        "subject": subject,
+        "body": body,
+        "is_html": False,
+    }
+    files: list[str] = []
+    if isinstance(attachment, list):
+        files = [str(Path(p).resolve()) for p in attachment if p]
+    elif attachment:
+        files = [str(Path(attachment).resolve())]
+    if len(files) == 1:
+        args["attachment"] = files[0]
+    elif len(files) > 1:
+        args["attachment"] = files
+    raw = await execute(settings, "GMAIL_SEND_EMAIL", args)
+    data = _as_dict(raw)
+    data["ok"] = _composio_ok(raw)
+    return data

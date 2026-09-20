@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from composio_app.adapters import (
+    _emails_from_people,
     _files_from,
     _is_web_image,
     _name_score,
@@ -14,6 +16,8 @@ from composio_app.adapters import (
     drive_folder_hint,
     drive_search_terms,
     file_refs,
+    send_gmail,
+    upload_drive_file,
 )
 from composio_app.router import route_composio
 
@@ -116,6 +120,61 @@ def test_drive_terms_and_folder() -> None:
     print("ok drive_terms_and_folder")
 
 
+def test_people_payload_unwraps_person() -> None:
+    payload = {
+        "successful": True,
+        "data": {
+            "results": [
+                {
+                    "person": {
+                        "names": [{"displayName": "Omer Sajid", "givenName": "Omer"}],
+                        "emailAddresses": [{"value": "omer.sjd05@gmail.com"}],
+                    }
+                }
+            ]
+        },
+    }
+    pairs = _emails_from_people(payload)
+    assert pairs == [("Omer Sajid", "omer.sjd05@gmail.com")]
+    print("ok people_payload_unwraps_person")
+
+
+def test_upload_and_gmail_args() -> None:
+    async def go() -> None:
+        settings = SimpleNamespace()
+        path = Path("/tmp/perception_publish_test/model.stl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"solid x\nendsolid x\n" + b"n" * 40)
+        with patch("composio_app.adapters.execute", new_callable=AsyncMock) as exe:
+            exe.return_value = {"successful": True, "data": {"id": "file1"}}
+            settings = SimpleNamespace(composio_drive_export_folder_id="121UctsMUXz9NyGu0sSV_bUdMN_pELW8q")
+            with patch("composio_app.adapters.find_or_create_drive_folder", new_callable=AsyncMock) as resolve:
+                uploaded = await upload_drive_file(settings, path, "htn")
+            resolve.assert_not_called()
+            assert uploaded["ok"] is True
+            assert exe.call_args.args[1] == "GOOGLEDRIVE_UPLOAD_FILE"
+            args = exe.call_args.args[2]
+            assert args["folder_to_upload_to"] == "121UctsMUXz9NyGu0sSV_bUdMN_pELW8q"
+            assert args["file_to_upload"].endswith("model.stl")
+            exe.reset_mock()
+            exe.return_value = {"successful": True}
+            sent = await send_gmail(settings, "omer.sjd05@gmail.com", "keychain", "we finished the model", path)
+            assert sent["ok"] is True
+            assert exe.call_args.args[1] == "GMAIL_SEND_EMAIL"
+            gargs = exe.call_args.args[2]
+            assert gargs["recipient_email"] == "omer.sjd05@gmail.com"
+            assert gargs["body"] == "we finished the model"
+            assert gargs["recipient_email"] != "me"
+        try:
+            await send_gmail(settings, "me", "x", "y")
+            raise AssertionError("me should be rejected")
+        except ValueError:
+            print("ok gmail rejects me")
+        print("ok upload_and_gmail_args")
+
+    asyncio.run(go())
+
+
 if __name__ == "__main__":
     test_files_from()
     test_web_image()
@@ -124,4 +183,6 @@ if __name__ == "__main__":
     test_bytes_from_b64()
     test_drive_photo_query_keeps_subject()
     test_drive_terms_and_folder()
+    test_people_payload_unwraps_person()
+    test_upload_and_gmail_args()
     print("all adapter tests passed")
