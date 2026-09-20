@@ -606,6 +606,19 @@ test("structural additions are never claimed as a dimension edit", () => {
   }
 });
 
+test("MIXED utterances containing a size word still defer to the right path", () => {
+  // These are the cases the exclusion list actually earns its keep on: each
+  // contains a real axis word ("longer"/"bigger"/"taller"), so without the
+  // colour/structural exclusions they WOULD be claimed as a plain resize and
+  // the addition or recolour would silently never happen.
+  for (const text of ["add a longer handle", "give it a taller hat",
+                      "put a bigger lug on it", "paint it red and make it bigger",
+                      "make it red and longer", "drill a bigger hole",
+                      "add a loop and make it thicker"]) {
+    eq(planPartEdit(EAR_PARAMS, "ear_l", text), null);
+  }
+});
+
 test("partEdit claims only what it can actually resolve", () => {
   // resolvable -> claimed
   assert(planPartEdit(EAR_PARAMS, "ear_l", "make it longer") !== null, "should claim");
