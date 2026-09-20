@@ -963,9 +963,18 @@ function pollHand(handEntry, key) {
   else if (gap > PINCH_THRESHOLD_END) held[key] = false;
   if (gap !== null) heldPos[key].copy(handEntry.pinchAnchor.position);
 
+  // Push-to-talk rides the `held` hysteresis latch rather than the raw
+  // isPinching/wasOpen pair below. That pair leaves a dead band: a gap
+  // between START and END is neither, so a release sampled there cleared
+  // `wasPinching` without ever emitting the release, and a slow finger
+  // release left Percy listening with nothing left to end the hold.
+  if (key === 0) {
+    if (held[0] && !wasHeld) percy.beginTalk();
+    else if (!held[0] && wasHeld) percy.endTalk();
+  }
+
   if (gap === null) {
     if (wasPinching[key]) {
-      if (key === 0) percy.endTalk();
       if (grabHandKey === key) endGrab();
       endParamDrag(key);
     }
@@ -1026,7 +1035,6 @@ function pollHand(handEntry, key) {
   if (isPinching && !wasPinching[key]) {
     pinchStartTime[key] = now;
     pinchStartPos[key].copy(pos);
-    if (key === 0) percy.beginTalk();
   }
 
   if (key === 1 && isPinching && wasPinching[key] && !grabbing && !twoHandOn && !paramDrag) {
@@ -1050,7 +1058,6 @@ function pollHand(handEntry, key) {
   }
 
   if (wasOpen && wasPinching[key]) {
-    if (key === 0) percy.endTalk();
     const wasGrabbingThisHand = grabHandKey === key;
     const wasDraggingThisHand = Boolean(paramDrag && paramDrag.key === key);
     if (wasGrabbingThisHand) endGrab();

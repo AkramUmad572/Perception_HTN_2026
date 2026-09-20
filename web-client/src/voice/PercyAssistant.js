@@ -80,6 +80,9 @@ export class PercyAssistant {
     // newer one already landed can be recognized as stale and dropped
     // instead of silently overwriting the model the newer turn just set.
     this._turnSeq = 0;
+    // A release that lands while the mic is still opening, replayed by
+    // beginTalk() once it does. See endTalk().
+    this._releasePending = false;
     // What the user last pointed at (interaction/selection.js). Consumed by
     // the next voice or text command, then cleared.
     this.selection = null;
@@ -194,6 +197,7 @@ export class PercyAssistant {
     if (voiceState.isListening || voiceState.isThinking) return;
     _requestLocationOnce();
     this._cancelPending = false;
+    this._releasePending = false;
 
     if (this.replyAudio) {
       try {
@@ -214,6 +218,13 @@ export class PercyAssistant {
       voiceState.toListening();
       this.onTalkingChange(true);
       this.onStatusMessage("Listening… hold to talk, release to send.", true);
+      if (this._releasePending) {
+        // endTalk() arrived while the mic was still opening, so it saw a
+        // state that was not yet `listening` and did nothing. Nothing else
+        // ever ends this hold — run the release now that it can take.
+        await this.endTalk();
+        return;
+      }
     } catch (e) {
       console.error("[Percy] Failed to start recording:", e);
       voiceState.toError("Microphone access required");
@@ -235,12 +246,15 @@ export class PercyAssistant {
   }
 
   async endTalk() {
+    this._releasePending = true;
     if (!voiceState.isListening || this._ending) return;
+    this._releasePending = false;
     this._ending = true;
     this.onTalkingChange(false);
 
+    let audioBlob = null;
     try {
-      const audioBlob = await this.recorder.stop();
+      audioBlob = await this.recorder.stop();
       if (!audioBlob) {
         voiceState.toIdle();
         this.onStatusMessage(`Hold a bit longer, then release. ${READY_HINT}`, true);
@@ -249,18 +263,34 @@ export class PercyAssistant {
 
       voiceState.toThinking();
       this.onStatusMessage("Looking that up…", true);
+    } catch (e) {
+      this._failTurn(e);
+      return;
+    } finally {
+      // The guard is released here rather than after delivery. It only has to
+      // cover the handoff off `listening`; past that, `isListening` alone
+      // keeps a second release out. Delivery runs for minutes — a spoken
+      // reply, then a job poll of up to JOB_MAX_MS — and a guard held that
+      // long swallowed every release in the window, leaving the indicator
+      // showing a live mic that nothing would ever end.
+      this._ending = false;
+    }
 
+    try {
       const turnSeq = this._nextTurn();
       const result = await this._sendVoice(audioBlob);
       await this._deliverResponse(result, turnSeq);
     } catch (e) {
-      console.error("[Percy] Error in voice pipeline:", e);
-      voiceState.toError(e.message);
-      this.onStatusMessage(`Error: ${e.message}`, false);
-      setTimeout(() => voiceState.toIdle(), 3000);
-    } finally {
-      this._ending = false;
+      this._failTurn(e);
     }
+  }
+
+  /** Speak up about a failed turn, then hand the mic back. */
+  _failTurn(e) {
+    console.error("[Percy] Error in voice pipeline:", e);
+    voiceState.toError(e.message);
+    this.onStatusMessage(`Error: ${e.message}`, false);
+    setTimeout(() => voiceState.toIdle(), 3000);
   }
 
   async _fetchJson(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -566,16 +596,25 @@ export class PercyAssistant {
       voiceState.toSpeaking();
       this.onStatusMessage(`${heard}${data.reply}${ms}`, data.ok);
 
+      const audio = new Audio(data.reply_audio_url);
+      this.replyAudio = audio;
       try {
-        this.replyAudio = new Audio(data.reply_audio_url);
         await new Promise((resolve) => {
-          this.replyAudio.onended = resolve;
-          this.replyAudio.onerror = resolve;
-          this.replyAudio.play().catch(resolve);
+          audio.onended = resolve;
+          audio.onerror = resolve;
+          // beginTalk() pauses the reply to make room for the user, and pause
+          // fires neither onended nor onerror — without this the turn never
+          // ends, and endTalk()'s guard is never released. Same trap greet()
+          // documents.
+          audio.onpause = resolve;
+          audio.play().catch(resolve);
         });
       } catch (_) {}
+      if (this.replyAudio === audio) this.replyAudio = null;
 
-      voiceState.toIdle();
+      // Only hand back a state we still own: the user may have talked over
+      // the reply, and dropping a live recording to idle strands the mic.
+      if (voiceState.isSpeaking) voiceState.toIdle();
     } else {
       this.onStatusMessage(`${heard}${data.reply}${ms}`, data.ok);
       voiceState.toIdle();

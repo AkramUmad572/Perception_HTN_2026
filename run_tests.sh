@@ -156,6 +156,17 @@ else
     TOTAL_FAIL=$((TOTAL_FAIL + 1))
 fi
 
+# Test 5b: Hold-to-talk state machine (stuck "listening" regressions)
+echo ""
+echo ">>> Running Voice State Tests..."
+echo ""
+if node web-client/src/voice/test_voice_state.js; then
+    echo "Voice state tests: PASSED"
+else
+    echo "Voice state tests: FAILED"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+fi
+
 # Test 6: Interaction math (two-hand, measurement, tape measure)
 echo ""
 echo ">>> Running Interaction Tests..."
