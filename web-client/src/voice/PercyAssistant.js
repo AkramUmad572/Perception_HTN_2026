@@ -144,18 +144,31 @@ export class PercyAssistant {
         {},
         15000
       );
+      // The greeting is fire-and-forget, so by the time it lands the user may
+      // already have grabbed the mic. Speaking over them — and then dropping
+      // the state machine back to idle underneath a live recording — is worse
+      // than skipping the greeting, so the mic always wins.
+      if (voiceState.isListening || voiceState.isThinking) return;
       if (data.reply_audio_url) {
         voiceState.toSpeaking();
         this.onStatusMessage(data.reply, true);
+        const audio = new Audio(data.reply_audio_url);
+        this.replyAudio = audio;
         try {
-          this.replyAudio = new Audio(data.reply_audio_url);
           await new Promise((resolve) => {
-            this.replyAudio.onended = resolve;
-            this.replyAudio.onerror = resolve;
-            this.replyAudio.play().catch(resolve);
+            audio.onended = resolve;
+            audio.onerror = resolve;
+            // beginTalk() pauses the reply audio to make room for the user;
+            // pause fires neither onended nor onerror, so watch for it here
+            // or this promise never settles.
+            audio.onpause = resolve;
+            audio.play().catch(resolve);
           });
         } catch (_) {}
-        voiceState.toIdle();
+        if (this.replyAudio === audio) this.replyAudio = null;
+        // Only hand back a state we still own: the user may have started
+        // talking while the greeting was playing.
+        if (voiceState.isSpeaking) voiceState.toIdle();
       } else {
         this.onStatusMessage(data.reply, true);
       }
