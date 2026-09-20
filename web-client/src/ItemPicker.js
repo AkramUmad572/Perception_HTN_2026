@@ -36,11 +36,11 @@ const ICONS = {
   forward: "M12 8V4l8 8-8 8v-4H4V8z",
 };
 
-function paintCard(item) {
-  const c = document.createElement("canvas");
-  c.width = 1024;
-  c.height = 720;
-  const ctx = c.getContext("2d");
+function isEmailItem(item) {
+  return item.kind === "email" || item.source === "gmail";
+}
+
+function paintGmailCard(ctx, c, item) {
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, c.width, c.height);
   ctx.fillStyle = "#EA4335";
@@ -66,6 +66,44 @@ function paintCard(item) {
   ctx.fillStyle = "#222";
   ctx.font = "400 28px Roboto, sans-serif";
   wrap(ctx, item.body || "", 48, 320, 920, 38);
+}
+
+// Non-Gmail items (calendar events, Notion pages, GitHub issues, ...) get a
+// card styled after their own app — brand color + label, not Gmail's "to me"
+// inbox chrome, which made every pulled item look like an email regardless
+// of where it actually came from.
+function paintGenericCard(ctx, c, item) {
+  const brand = BRANDS[item.source] || { color: "#5f6368", label: item.source || "" };
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.fillStyle = brand.color;
+  ctx.fillRect(0, 0, c.width, 8);
+  ctx.fillStyle = brand.color;
+  ctx.font = "700 24px Roboto, sans-serif";
+  ctx.fillText(brand.label.toUpperCase(), 48, 56);
+  ctx.fillStyle = "#1f1f1f";
+  ctx.font = "400 44px Roboto, sans-serif";
+  wrap(ctx, item.title || "Untitled", 48, 120, 920, 52);
+  if (item.subtitle) {
+    ctx.fillStyle = "#5f6368";
+    ctx.font = "400 26px Roboto, sans-serif";
+    ctx.fillText(String(item.subtitle).slice(0, 60), 48, 220);
+  }
+  ctx.fillStyle = "#222";
+  ctx.font = "400 28px Roboto, sans-serif";
+  wrap(ctx, item.body || "", 48, 280, 920, 38);
+}
+
+function paintCard(item) {
+  const c = document.createElement("canvas");
+  c.width = 1024;
+  c.height = 720;
+  const ctx = c.getContext("2d");
+  if (isEmailItem(item)) {
+    paintGmailCard(ctx, c, item);
+  } else {
+    paintGenericCard(ctx, c, item);
+  }
   return c;
 }
 
@@ -155,18 +193,24 @@ export class ItemPicker {
     this.hide();
     const list = items || [];
     const inXR = !!renderer?.xr?.isPresenting;
-    const emails = list.filter((it) => it.kind === "email" || it.source === "gmail");
+    const emails = list.filter((it) => isEmailItem(it));
+    // Only use the full Gmail inbox chrome when every result actually came
+    // from Gmail — a mixed or non-email pull (calendar, Notion, "pick up
+    // everywhere") must not silently drop its non-email items just because
+    // one email happened to be in the mix.
+    const allEmails = list.length > 0 && emails.length === list.length;
     if (this.overlay) {
       this.overlay.innerHTML = "";
-      this.overlay.classList.toggle("gmail-window", !inXR && emails.length > 0);
+      this.overlay.classList.toggle("gmail-window", !inXR && allEmails);
       if (!inXR) {
-        if (emails.length) {
+        if (allEmails) {
           this.overlay.innerHTML = renderGmail(emails);
         } else {
           for (const it of list) {
+            const brand = BRANDS[it.source];
             const el = document.createElement("article");
             el.className = "item-card";
-            el.innerHTML = `<p class="item-kicker">${escapeHtml(it.subtitle || it.source || "")}</p>
+            el.innerHTML = `<p class="item-kicker">${escapeHtml(brand?.label || it.subtitle || it.source || "")}</p>
             <h2>${escapeHtml(it.title || "")}</h2>
             <p class="item-body">${escapeHtml(it.body || "")}</p>
             ${it.meta ? `<p class="item-meta">${escapeHtml(it.meta)}</p>` : ""}`;
@@ -177,14 +221,14 @@ export class ItemPicker {
       this.overlay.hidden = inXR || list.length === 0;
     }
     if (inXR) {
-      (emails.length ? emails : list).forEach((it, i) => {
+      list.forEach((it, i) => {
         const tex = new THREE.CanvasTexture(paintCard(it));
         tex.colorSpace = THREE.SRGBColorSpace;
         const mesh = new THREE.Mesh(
           new THREE.PlaneGeometry(CARD_W, CARD_H),
           new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide })
         );
-        mesh.position.x = (i - ((emails.length ? emails : list).length - 1) / 2) * (CARD_W + GAP);
+        mesh.position.x = (i - (list.length - 1) / 2) * (CARD_W + GAP);
         this.group.add(mesh);
       });
       this._place(renderer);
