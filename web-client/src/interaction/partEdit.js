@@ -16,6 +16,7 @@
  */
 
 import { snap } from "./measure.js";
+import { parseRegionCommand } from "./regionOps.js";
 
 /** One relative step, matching regionOps' REGION_SCALE_STEP. */
 export const PART_SCALE_STEP = 1.2;
@@ -153,4 +154,20 @@ export function planPartEdit(params, part, text) {
   if (!Number.isFinite(to) || to <= 0) return null;
   if (to === from) return null;
   return { key, from, to };
+}
+
+/**
+ * Does this utterance only make sense against a selected part?
+ *
+ * A region op or a dimensional change needs something pointed at. Before this
+ * existed, saying one with no active selection fell through to the LLM and
+ * quietly did something else -- and because the selection is cleared on every
+ * model swap, the *second* such command in a row always hit that path. The
+ * caller uses this to say "point at a part first" instead.
+ */
+export function needsSelection(text) {
+  const t = (text || "").toLowerCase().trim();
+  if (!t) return false;
+  if (parseRegionCommand(t)) return true;
+  return parseDimensionCommand(t) !== null;
 }

@@ -7,6 +7,7 @@
 import { voiceState } from "./VoiceState.js";
 import { PTTRecorder } from "./PTTRecorder.js";
 import { parseRegionCommand } from "../interaction/regionOps.js";
+import { needsSelection } from "../interaction/partEdit.js";
 
 const API_BASE = "";
 const SESSION_ID = "default";
@@ -305,6 +306,15 @@ export class PercyAssistant {
         await this._handleResponse(pending);
         return pending;
       }
+    }
+
+    // "bigger" / "make it longer" only mean something against a part. With no
+    // selection these used to fall through to the LLM and quietly do something
+    // else, which is the failure mode this guard exists to stop.
+    if (!this.selection && needsSelection(text)) {
+      this.onStatusMessage("Point at a part first, then say that again.", false);
+      voiceState.toIdle();
+      return null;
     }
 
     voiceState.toThinking();

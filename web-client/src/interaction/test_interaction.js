@@ -63,6 +63,7 @@ import {
   parseDimensionCommand,
   resolveParamKey,
   planPartEdit,
+  needsSelection,
   PART_SCALE_STEP,
 } from "./partEdit.js";
 
@@ -610,6 +611,22 @@ test("partEdit claims only what it can actually resolve", () => {
   assert(planPartEdit(EAR_PARAMS, "ear_l", "make it longer") !== null, "should claim");
   // same words, no selected part -> not claimed, falls through to the server
   eq(planPartEdit(EAR_PARAMS, null, "make it longer"), null);
+});
+
+test("needsSelection spots a part-scoped edit with no selection", () => {
+  // These only mean something against a selected part, so with no selection
+  // the user must be told -- not silently handed to the LLM.
+  for (const text of ["make it longer", "make it thinner", "bigger", "smaller",
+                      "smooth", "pull it out", "paint it red", "flatten"]) {
+    assert(needsSelection(text), `should need a selection: ${text}`);
+  }
+});
+
+test("needsSelection leaves whole-model and structural speech alone", () => {
+  for (const text of ["build me a gear", "add wings", "give it a hat",
+                      "undo", "make it red", "what is this"]) {
+    assert(!needsSelection(text), `should NOT need a selection: ${text}`);
+  }
 });
 
 console.log("\n" + "=".repeat(60));

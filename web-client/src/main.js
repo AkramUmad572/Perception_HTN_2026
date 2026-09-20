@@ -706,8 +706,14 @@ async function setModelFromResponse(data) {
       lastBackend = data.backend || (textured ? "mesh" : "cad");
       refreshDimensions();
       tape.clear();
+      // Re-point at the same part after a rebuild the user just caused, so a
+      // run of edits ("longer"... "longer") keeps working. Without this the
+      // selection died on every swap and the next command fell through.
+      const keepPart = percy.selection?.parts?.[0] || null;
       clearSelectionHighlight();
       percy.clearSelection();
+      const again = keepPart ? reselectPartByName(keepPart) : null;
+      if (again) percy.setSelection(again);
       photoPicker.hide();
 
       if (wasGrabbing && savedOffset && savedSource) {
@@ -1354,6 +1360,29 @@ async function applyRegionCommand(cmd, selection, text) {
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
+}
+
+/**
+ * Re-establish a selection on a named part of the freshly-loaded model.
+ *
+ * Returns a Selection shaped exactly like selectionFromStroke's, centred on
+ * the part's bounding box, or null when that part no longer exists (a codegen
+ * rebuild may have renamed or removed it).
+ */
+function reselectPartByName(part) {
+  if (!currentModel || !part) return null;
+  const node = currentModel.getObjectByName(part);
+  if (!node) return null;
+  const box = new THREE.Box3().setFromObject(node);
+  if (box.isEmpty()) return null;
+  const mid = box.getCenter(new THREE.Vector3());
+  const local = currentModel.worldToLocal(mid.clone());
+  return {
+    parts: [part],
+    center: [local.x, local.y, local.z],
+    normal: [0, 1, 0],
+    radius: 0,
+  };
 }
 
 /**
