@@ -887,11 +887,33 @@ def test_photo_search_fast_path():
         )[0]
 
     intent = asyncio.run(_run())
-    if intent.action == "find_photos" and "pikachu" in (intent.photo_query or "").lower():
-        print(f"  [ok] parse_intent → find_photos {intent.photo_query!r}")
+    # Since the Composio work (3bfa524), an image request naming a source app
+    # is claimed by route_composio ABOVE the is_photo_search rung, on purpose:
+    # COMPOSIO_PLAN.md's `image-sources` todo widens the search from Drive
+    # alone to Photos / Drive / Figma / Gmail. It returns pull_app immediately
+    # with a job_id; the job's RESULT is what carries action="find_photos" and
+    # the candidate list (composio_app/runner.py:196), so the user still ends
+    # at the same pinchable photo card. This asserts the routing contract; the
+    # picker payload is the runner's contract, below.
+    if intent.action == "pull_app" and "googlephotos" in (intent.apps or []):
+        print(f"  [ok] parse_intent → pull_app apps={intent.apps} kind={intent.pull_kind}")
         passed += 1
     else:
-        print(f"  [FAIL] parse_intent {intent.action} {intent.photo_query}")
+        print(f"  [FAIL] parse_intent {intent.action} apps={getattr(intent, 'apps', None)}")
+        failed += 1
+
+    # The guarantee that actually matters to the client: a successful photos
+    # pull still answers in the shape PhotoPicker consumes.
+    import inspect
+
+    from composio_app import runner
+
+    src = inspect.getsource(runner.run_pull) if hasattr(runner, "run_pull") else inspect.getsource(runner)
+    if 'action = "find_photos"' in src and "candidates=photos" in src:
+        print("  [ok] a photos pull still answers find_photos + candidates")
+        passed += 1
+    else:
+        print("  [FAIL] the photos pull no longer answers find_photos + candidates")
         failed += 1
 
     return passed, failed
