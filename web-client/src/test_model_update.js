@@ -237,6 +237,60 @@ test("Tracker handles color-only response (no glb_url)", () => {
   assert(tracker.lastModelId === "m1", "Model ID unchanged");
 });
 
+console.log("\n=== Testing Stale-Turn Guard (data.__seq vs latestTurnSeq) ===");
+
+// Mirrors main.js's setModelFromResponse guard: a response whose __seq is
+// behind the highest __seq already seen belongs to an older turn that lost
+// a race against a faster, later turn, and must be dropped rather than
+// applied (which would silently resurrect a stale model).
+class TurnGuard {
+  constructor() {
+    this.latestTurnSeq = 0;
+  }
+
+  // Called as soon as a response is received, before any async GLB load.
+  admit(data) {
+    if (typeof data.__seq !== "number") return true;
+    if (data.__seq < this.latestTurnSeq) return false;
+    this.latestTurnSeq = data.__seq;
+    return true;
+  }
+
+  // Called again after the async GLB load resolves, in case a newer turn
+  // overtook this one while the fetch/parse was in flight.
+  stillCurrent(data) {
+    if (typeof data.__seq !== "number") return true;
+    return data.__seq >= this.latestTurnSeq;
+  }
+}
+
+test("Newer turn admitted after an older turn already ran", () => {
+  const guard = new TurnGuard();
+  assert(guard.admit({ __seq: 1 }) === true, "turn 1 admitted");
+  assert(guard.admit({ __seq: 2 }) === true, "turn 2 admitted");
+});
+
+test("Older turn's late response is rejected once a newer turn landed", () => {
+  const guard = new TurnGuard();
+  guard.admit({ __seq: 2 }); // fast turn 2 finishes first
+  assert(guard.admit({ __seq: 1 }) === false, "stale turn 1 rejected");
+});
+
+test("A turn that outraces a newer one mid-flight is caught by stillCurrent", () => {
+  const guard = new TurnGuard();
+  guard.admit({ __seq: 1 }); // turn 1's GLB fetch starts
+  guard.admit({ __seq: 2 }); // turn 2 starts and finishes while turn 1 still loading
+  assert(guard.stillCurrent({ __seq: 1 }) === false, "turn 1 no longer current");
+  assert(guard.stillCurrent({ __seq: 2 }) === true, "turn 2 still current");
+});
+
+test("Responses without __seq are always admitted (backward compatible)", () => {
+  const guard = new TurnGuard();
+  guard.admit({ __seq: 5 });
+  assert(guard.admit({}) === true, "unstamped response admitted");
+  assert(guard.stillCurrent({}) === true, "unstamped response still current");
+});
+
 // Summary
 console.log("\n" + "=".repeat(60));
 console.log("SUMMARY");

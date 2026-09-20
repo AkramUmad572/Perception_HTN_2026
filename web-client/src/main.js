@@ -419,6 +419,11 @@ function applyColorToObject(obj, hex) {
 let lastLoadedGlbUrl = null;
 let lastModelId = null;
 let lastTextured = false;
+// Highest PercyAssistant turn seq seen so far (stamped as data.__seq). A
+// slow turn (e.g. a mesh build) can resolve after a later, faster turn
+// already swapped the model in — without this guard that stale response
+// would silently overwrite the newer model. See PercyAssistant._nextTurn().
+let latestTurnSeq = 0;
 // Longest edge the model should occupy, in metres. The backend decides it:
 // CAD parts arrive life size, sculpts get an estimate, and "make it bigger"
 // just moves this number.
@@ -652,6 +657,15 @@ async function setModelFromResponse(data) {
     }
     return;
   }
+
+  // Drop responses from an older turn that resolve after a newer turn's
+  // already landed — otherwise a slow build queued before a fast one can
+  // overwrite the model the fast one already swapped in.
+  if (typeof data.__seq === "number") {
+    if (data.__seq < latestTurnSeq) return;
+    latestTurnSeq = data.__seq;
+  }
+
   const newColor = data.color || currentColor;
   const newGlbUrl = data.glb_url;
   const newModelId = data.model_id;
@@ -674,6 +688,19 @@ async function setModelFromResponse(data) {
 
     try {
       const sceneObj = await loadGlb(bust);
+      if (typeof data.__seq === "number" && data.__seq < latestTurnSeq) {
+        // A newer turn started and already landed its own model while this
+        // GLB was still downloading/parsing — this one is stale, drop it.
+        console.log("[Percy] Dropping stale GLB load (turn", data.__seq, "< latest", latestTurnSeq, ")");
+        sceneObj.traverse((child) => {
+          if (child.isMesh) {
+            child.geometry?.dispose();
+            const mats = Array.isArray(child.material) ? child.material : [child.material];
+            mats.forEach((m) => m?.dispose());
+          }
+        });
+        return;
+      }
       const box = new THREE.Box3().setFromObject(sceneObj);
       const size = box.getSize(new THREE.Vector3());
       modelBaseMaxDim = Math.max(size.x, size.y, size.z) || 1;
@@ -2011,6 +2038,11 @@ function resetEverything() {
   disposeCurrentModel();
   lastLoadedGlbUrl = null;
   lastModelId = null;
+  // Also invalidate any build still in flight from before the reset — without
+  // this, a slow mesh sculpt started right before a reset could resolve after
+  // the scene is clean and silently resurrect itself (same race the __seq
+  // guard in setModelFromResponse exists to prevent for a plain new command).
+  latestTurnSeq = percy._nextTurn();
   lastBackend = null;
   lastTextured = false;
   modelBaseMaxDim = 1;

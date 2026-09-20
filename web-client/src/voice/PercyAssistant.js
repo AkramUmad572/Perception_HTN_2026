@@ -74,6 +74,12 @@ export class PercyAssistant {
     this.replyAudio = null;
     this.started = false;
     this._ending = false;
+    // Bumped once per user-initiated turn (voice/text command, photo choice,
+    // param drag, resize gesture) and stamped onto every response that turn
+    // produces, so a slow build from an older turn that resolves after a
+    // newer one already landed can be recognized as stale and dropped
+    // instead of silently overwriting the model the newer turn just set.
+    this._turnSeq = 0;
     // What the user last pointed at (interaction/selection.js). Consumed by
     // the next voice or text command, then cleared.
     this.selection = null;
@@ -100,6 +106,11 @@ export class PercyAssistant {
       this.onSelectionCleared();
     }
     return selection;
+  }
+
+  _nextTurn() {
+    this._turnSeq += 1;
+    return this._turnSeq;
   }
 
   async start() {
@@ -239,8 +250,9 @@ export class PercyAssistant {
       voiceState.toThinking();
       this.onStatusMessage("Looking that up…", true);
 
+      const turnSeq = this._nextTurn();
       const result = await this._sendVoice(audioBlob);
-      await this._deliverResponse(result);
+      await this._deliverResponse(result, turnSeq);
     } catch (e) {
       console.error("[Percy] Error in voice pipeline:", e);
       voiceState.toError(e.message);
@@ -293,6 +305,7 @@ export class PercyAssistant {
   async sendTextCommand(text) {
     if (voiceState.isMuted) return null;
     _requestLocationOnce();
+    const turnSeq = this._nextTurn();
 
     // A region edit on an active selection runs client-side (regionOps.js),
     // with no LLM round trip: parse the small local table first.
@@ -303,7 +316,7 @@ export class PercyAssistant {
       this.onStatusMessage(`Applying "${text}"…`, true);
       try {
         const result = await this.onRegionCommand(regionCmd, selection, text);
-        await this._handleResponse(result);
+        await this._handleResponse(result, turnSeq);
         return result;
       } catch (e) {
         voiceState.toError(e.message);
@@ -321,7 +334,7 @@ export class PercyAssistant {
       const pending = await this.onPartEdit(text, selection);
       if (pending) {
         this._takeSelection();
-        await this._handleResponse(pending);
+        await this._handleResponse(pending, turnSeq);
         return pending;
       }
     }
@@ -352,13 +365,13 @@ export class PercyAssistant {
       // it to /semantic_edit, which answers with a job to poll.
       if (result?.action === "semantic_edit" && !result?.rebuilt
           && selection && this.onSemanticEdit) {
-        await this._handleResponse(result);
+        await this._handleResponse(result, turnSeq);
         const started = await this.onSemanticEdit(text, selection);
-        if (started) return this._deliverResponse(started);
+        if (started) return this._deliverResponse(started, turnSeq);
         return result;
       }
 
-      return await this._deliverResponse(result);
+      return await this._deliverResponse(result, turnSeq);
     } catch (e) {
       voiceState.toError(e.message);
       this.onStatusMessage(`Error: ${e.message}`, false);
@@ -370,6 +383,7 @@ export class PercyAssistant {
   async choosePhoto(fileId) {
     voiceState.toThinking();
     this.onStatusMessage("Building that from the photo… this takes a bit.", true);
+    const turnSeq = this._nextTurn();
     try {
       try {
         const confirm = await this._postJson(
@@ -397,7 +411,7 @@ export class PercyAssistant {
         30000
       );
       const result = started.job_id ? await this._awaitJob(started.job_id) : started;
-      await this._handleResponse(result);
+      await this._handleResponse(result, turnSeq);
       return result;
     } catch (e) {
       voiceState.toError(e.message);
@@ -413,13 +427,14 @@ export class PercyAssistant {
    * this can fire on every release, like save_client_version.
    */
   async postParamUpdate(projectId, updates) {
+    const turnSeq = this._nextTurn();
     try {
       const result = await this._postJson(
         `${API_BASE}/api/projects/${projectId}/params`,
         { updates, session_id: SESSION_ID },
         30000
       );
-      await this._handleResponse(result);
+      await this._handleResponse(result, turnSeq);
       return result;
     } catch (e) {
       console.error("[Percy] Param update failed:", e);
@@ -451,13 +466,14 @@ export class PercyAssistant {
    * gesture, not on every frame of the stretch.
    */
   async postResize(projectId, factor) {
+    const turnSeq = this._nextTurn();
     try {
       const result = await this._postJson(
         `${API_BASE}/api/projects/${projectId}/resize`,
         { factor, session_id: SESSION_ID },
         30000
       );
-      await this._handleResponse(result);
+      await this._handleResponse(result, turnSeq);
       return result;
     } catch (e) {
       console.error("[Percy] Resize failed:", e);
@@ -500,17 +516,17 @@ export class PercyAssistant {
   // Percy can speak an instant ack instead of going silent for the sculpt's
   // full 10-90s+. Speak the ack, then poll the same way choosePhoto() does,
   // and hand the finished build to _handleResponse once it lands.
-  async _deliverResponse(result) {
+  async _deliverResponse(result, turnSeq) {
     if ((result?.action !== "building" && result?.action !== "searching"
          && result?.action !== "publishing" && result?.action !== "semantic_edit")
         || !result?.job_id) {
-      await this._handleResponse(result);
+      await this._handleResponse(result, turnSeq);
       return result;
     }
-    await this._handleResponse(result);
+    await this._handleResponse(result, turnSeq);
     try {
       const final = await this._awaitJob(result.job_id);
-      await this._handleResponse(final);
+      await this._handleResponse(final, turnSeq);
       return final;
     } catch (e) {
       voiceState.toError(e.message);
@@ -520,7 +536,8 @@ export class PercyAssistant {
     }
   }
 
-  async _handleResponse(data) {
+  async _handleResponse(data, turnSeq) {
+    if (data && typeof turnSeq === "number") data.__seq = turnSeq;
     const heard = data.transcript ? `"${data.transcript}" → ` : "";
     const ms = data.latency_ms?.total_ms ? ` (${Math.round(data.latency_ms.total_ms)}ms)` : "";
 
