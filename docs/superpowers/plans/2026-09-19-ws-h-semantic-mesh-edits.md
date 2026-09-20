@@ -20,6 +20,17 @@ tests.
 
 **Spec:** `docs/superpowers/specs/2026-09-19-semantic-mesh-edits-design.md`
 
+> **Status: implemented** (commit `de7f91b`). All seven tasks executed. Verified end to end
+> against the live Gemini API with the 3D build stubbed: 9.4 s for the edit, the change landed
+> inside the circle, the circle did not appear in the output, and the result was appended as a
+> new version with `op="semantic_edit"` and `parent` set.
+>
+> Two deviations from the plan as written, both recorded in the commit:
+> - `parent=` is **not** passed to `append_version`; that function derives it and `_RESERVED`
+>   strips any caller value.
+> - The plan placed the router rung before `_check_scale_only`. It is placed **after** it, last
+>   among the mesh rungs, so every deterministic path keeps winning.
+
 ## Global Constraints
 
 - **Commits must NOT contain a `Co-Authored-By: Claude` trailer or any Claude attribution.**
@@ -74,7 +85,7 @@ cannot tell whether your own changes broke something.
   ) -> bytes                                 # returns edited image bytes
   ```
 
-- [ ] **Step 1: Add the model setting**
+- [x] **Step 1: Add the model setting**
 
 In `backend/app/config.py`, beside `gemini_model`:
 
@@ -84,7 +95,7 @@ In `backend/app/config.py`, beside `gemini_model`:
     gemini_image_model: str = "gemini-2.5-flash-image"
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Create `backend/mesh/test_edit.py`:
 
@@ -251,12 +262,12 @@ if __name__ == "__main__":
     sys.exit(run_all_tests())
 ```
 
-- [ ] **Step 3: Run it to verify it fails**
+- [x] **Step 3: Run it to verify it fails**
 
 Run: `cd backend && ../.venv/bin/python -m mesh.test_edit`
 Expected: FAIL with `ModuleNotFoundError: No module named 'mesh.edit'`
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
 Create `backend/mesh/edit.py`:
 
@@ -358,19 +369,19 @@ async def edit_image(
     return raw
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cd backend && ../.venv/bin/python -m mesh.test_edit`
 Expected: `TOTAL: 9/9 passed` (counts may differ slightly; zero failures is the gate)
 
-- [ ] **Step 6: Register the suite**
+- [x] **Step 6: Register the suite**
 
 In `run_tests.sh`, add `mesh.test_edit` to the `for M in ...` list.
 
 Run: `./run_tests.sh`
 Expected: `mesh.test_edit: PASSED`, and no suite regressed.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add backend/mesh/edit.py backend/mesh/test_edit.py backend/app/config.py run_tests.sh
@@ -397,7 +408,7 @@ git commit -m "Add Gemini image-edit client for semantic sculpt edits"
 `main.js` gets the NDC from `vector.project(camera)`; everything after that is this module,
 so it is testable without a GPU.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `web-client/src/interaction/test_interaction.js`, and add the import at the top
 beside the existing interaction imports:
@@ -448,12 +459,12 @@ test("clampCircle shrinks a radius bigger than the canvas", () => {
 });
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `node web-client/src/interaction/test_interaction.js`
 Expected: FAIL — `Cannot find module './viewCapture.js'`
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `web-client/src/interaction/viewCapture.js`:
 
@@ -495,12 +506,12 @@ export function clampCircle(cx, cy, r, width, height) {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `node web-client/src/interaction/test_interaction.js`
 Expected: all pass, total up by 7.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web-client/src/interaction/viewCapture.js web-client/src/interaction/test_interaction.js
@@ -530,7 +541,7 @@ git commit -m "Add pure 2D view-capture helpers for semantic edits"
 `parent` set to the version that was edited. On **any** failure, append nothing and leave the
 current version in place.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `backend/app/test_pipeline.py`, matching its existing style:
 
@@ -616,12 +627,12 @@ def _session_with_mesh_project(s):
                         base_size_m=0.2, glb_url=info.glb_url)
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cd backend && ../.venv/bin/python -m app.test_pipeline`
 Expected: FAIL — `module 'app.pipeline' has no attribute 'apply_semantic_edit'`
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add the imports near the other mesh imports at the top of `backend/app/pipeline.py`:
 
@@ -723,12 +734,12 @@ Do **not** pass `parent=` — `append_version` sets it from the current version 
 `after.parent == before.version` assertion holds because of that derivation, not because we
 pass it.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cd backend && ../.venv/bin/python -m app.test_pipeline`
 Expected: all pass, including the two new ones.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add backend/app/pipeline.py backend/app/test_pipeline.py
@@ -748,7 +759,7 @@ git commit -m "Add semantic_edit orchestration: Gemini edit then image-to-3D"
 - Produces: `POST /api/projects/{project_id}/semantic_edit`, multipart
   (`image` file, `text` form field, `session_id` form field) → `CommandResponse` with `job_id`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `backend/app/test_api.py`, and add the route to `NEW_ROUTES` in that file:
 
@@ -776,12 +787,12 @@ def test_semantic_edit_route_is_mounted_and_safe():
     return t
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cd backend && ../.venv/bin/python -m app.test_api`
 Expected: FAIL — the unknown-project call returns 404/405 because the route does not exist.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add to `backend/app/main.py`, beside `project_update_params`:
 
@@ -818,12 +829,12 @@ async def project_semantic_edit(
 
 Add `apply_semantic_edit` to the `from app.pipeline import (...)` list at the top.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cd backend && ../.venv/bin/python -m app.test_api`
 Expected: all pass, including `no pre-existing route was removed`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add backend/app/main.py backend/app/test_api.py
@@ -846,7 +857,7 @@ git commit -m "Add POST /api/projects/{id}/semantic_edit as a polled job"
 — hole / loop / flat base / resize are deterministic and must keep winning — and **before**
 the `clarify_mesh` return, which it now replaces for selection-backed requests.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `backend/ai/test_intent.py`:
 
@@ -891,12 +902,12 @@ def test_semantic_edit_rung():
 
 Register it in that file's `TESTS` list.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cd backend && ../.venv/bin/python -m ai.test_intent`
 Expected: FAIL — `cannot import name '_check_semantic_edit'`
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add to `backend/ai/intent.py`, below `_check_mesh_boolean`:
 
@@ -955,13 +966,13 @@ immediately **after** the `_check_absolute_size` block and **before** `_check_sc
             return semantic_intent, (time.perf_counter() - t0) * 1000
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cd backend && ../.venv/bin/python -m ai.test_intent`
 Expected: all pass. **In particular the existing mesh-boolean and absolute-size tests must
 still pass** — that is the regression this ordering protects.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add backend/ai/intent.py backend/ai/test_intent.py
@@ -981,7 +992,7 @@ git commit -m "Route selection-backed sculpt edits to semantic_edit"
 There is no unit test for this task — it is Three.js and WebXR wiring, which this repo tests
 by hand. Keep the logic in `viewCapture.js` (already tested) and keep `main.js` thin.
 
-- [ ] **Step 1: Add the capture helper to `main.js`**
+- [x] **Step 1: Add the capture helper to `main.js`**
 
 ```js
 /**
@@ -1034,7 +1045,7 @@ Add the import beside the other interaction imports:
 import { ndcToPixels, circleRadiusPx, clampCircle } from "./interaction/viewCapture.js";
 ```
 
-- [ ] **Step 2: Add the POST to `PercyAssistant.js`**
+- [x] **Step 2: Add the POST to `PercyAssistant.js`**
 
 Beside `postParamUpdate`:
 
@@ -1061,7 +1072,7 @@ Beside `postParamUpdate`:
 Reuse whatever the Composio pull path already uses to poll `job_id`; if that helper has a
 different name than `_pollJob`, use that name here rather than adding a second poller.
 
-- [ ] **Step 3: Handle `action === "semantic_edit"` in the command response**
+- [x] **Step 3: Handle `action === "semantic_edit"` in the command response**
 
 Where `main.js` handles `data.action === "ui_mode"` (around `main.js:630`), add a branch that
 calls `captureViewWithCircle(currentSelection)` and then
@@ -1069,12 +1080,12 @@ calls `captureViewWithCircle(currentSelection)` and then
 returned response goes through the normal model-swap path, exactly like any other
 `rebuilt=true` response.
 
-- [ ] **Step 4: Verify the client builds**
+- [x] **Step 4: Verify the client builds**
 
 Run: `cd web-client && npm run build`
 Expected: `✓ built in …`, no errors.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web-client/src/main.js web-client/src/voice/PercyAssistant.js
@@ -1085,23 +1096,23 @@ git commit -m "Wire the headset capture and semantic-edit upload"
 
 ### Task 7: Full-suite gate and docs
 
-- [ ] **Step 1: Run everything**
+- [x] **Step 1: Run everything**
 
 Run: `./run_tests.sh`
 Expected: `✓ ALL TEST SUITES PASSED`, with `mesh.test_edit` in the list.
 
-- [ ] **Step 2: Build the client**
+- [x] **Step 2: Build the client**
 
 Run: `cd web-client && npm run build`
 Expected: no errors.
 
-- [ ] **Step 3: Update the invariants note**
+- [x] **Step 3: Update the invariants note**
 
 `ai-docs/09-invariants.md` (git-excluded, main checkout only): `clarify_mesh` narrows again —
 semantic edits on a sculpt with a selection are now supported, alongside the Phase 4
 booleans.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add -A
