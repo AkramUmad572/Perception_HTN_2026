@@ -33,7 +33,8 @@ tests.
 
 ## Global Constraints
 
-- **Commits must NOT contain a `Co-Authored-By: Claude` trailer or any Claude attribution.**
+- **Commits must NOT carry any AI-assistant attribution: no `Co-Authored-By` trailer, no
+  "generated with" line, no tool name in the message or the author field.**
 - Python: use `/Users/dimural/Perception_HTN_2026/.venv/bin/python` (3.12). Run backend tests
   from `backend/` as `python -m <pkg>.test_<x>`.
 - Test style matches the repo: plain scripts with a `__main__` runner that prints
